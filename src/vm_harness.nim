@@ -22,6 +22,9 @@ import ./vm_harness/auto
 import ./vm_harness/orchestrator
 import ./vm_harness/guest_scripts
 import ./vm_harness/backends/noop
+import ./vm_harness/backends/process_helpers
+import ./vm_harness/backends/hyperv
+import ./vm_harness/backends/wsl
 
 export types
 export output
@@ -29,3 +32,6 @@ export auto
 export orchestrator
 export guest_scripts
 export noop
+export process_helpers
+export hyperv
+export wsl

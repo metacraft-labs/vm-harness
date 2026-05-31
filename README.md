@@ -12,24 +12,35 @@ Rust port lives at `agent-harbor/main/crates/ah-vm/` (M17 of the
 
 ## Status
 
-**M0 — scaffolding** is the current milestone. Today the repo ships:
+**M1 — Hyper-V + WSL backends** is the current milestone. Today the
+repo ships:
 
 - The `VmBackend` concept and supporting types (`docs/design.md` §3.2).
 - A `NoopBackend` reference fixture for testing the harness scaffolding
   without any real hypervisor — the only allowed mock per the test
   methodology in `docs/design.md` §9.
+- A **`HyperVBackend`** adapter (`src/vm_harness/backends/hyperv.nim`)
+  that drives Hyper-V via PowerShell Direct over VMBus and wraps
+  reprobuild's existing `run-hyperv-m69-system.ps1` /
+  `provision-base-vm.ps1` for the reprobuild-specific orchestration.
+- A **`WslBackend`** adapter (`src/vm_harness/backends/wsl.nim`) that
+  drives WSL2 via `wsl --import` / `wsl <distro> --exec` /
+  `wsl --unregister`, and wraps reprobuild's existing
+  `run-wsl-m69-posix.ps1` for the reprobuild-specific orchestration.
 - The Tier-1 in-guest scripts (`guest-scripts/posix.sh`,
   `guest-scripts/windows.ps1`) embedded into the library via
   `staticRead` (design choice #1 in `docs/design.md` §12).
 - The standardized output envelope writer (`00-provision.log`,
   `02-<cmd>-run.txt`, `RESULT.txt`, `DONE`).
 - The CLI dispatcher (`vm-harness {provision,run,probe,shell,backends}`)
-  with `--backend auto` selection per (host OS, guest OS).
+  with `--backend auto` selection per (host OS, guest OS); the
+  `--backend hyperv` and `--backend wsl` selectors are now wired
+  through the registry.
 - The `try/finally` orchestrator that guarantees `stopAndCleanup` runs
   even on gate failure or SIGINT.
 
-Real backend implementations land in M1 (Hyper-V + WSL refactor), M2
-(Tart), M3 (UTM), M4 (libvirt/QEMU), M5 (Lima).
+Subsequent backend implementations land in M2 (Tart), M3 (UTM),
+M4 (libvirt/QEMU), M5 (Lima).
 
 ## Layout
 
@@ -48,7 +59,10 @@ vm-harness/
 │       ├── guest_scripts.nim
 │       └── backends/
 │           ├── noop.nim
-│           └── (hyperv, wsl, tart, utm, libvirt, lima — M1-M5)
+│           ├── process_helpers.nim   # shared PS / wsl.exe helpers (M1)
+│           ├── hyperv.nim            # M1
+│           ├── wsl.nim               # M1
+│           └── (tart, utm, libvirt, lima — M2-M5)
 ├── guest-scripts/
 │   ├── posix.sh
 │   └── windows.ps1

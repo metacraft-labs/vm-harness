@@ -15,6 +15,17 @@
 
 import std/[json, os, sequtils, strformat, strutils, tables, terminal]
 import ./types, ./output, ./auto, ./orchestrator
+# Import every backend module so its registerBackend bootstrap runs.
+# Each import is a static side-effect: the backend's factory lands in
+# auto.factoryRegistry at module-init time. The CLI itself only ever
+# touches the registry through ``newBackend(id)`` / ``newBackendForGuest``,
+# so the imports themselves look "unused" to the compiler — silence the
+# warning with ``{.warning[UnusedImport]: off.}`` for this block.
+{.push warning[UnusedImport]: off.}
+import ./backends/noop
+import ./backends/hyperv
+import ./backends/wsl
+{.pop.}
 
 type
   LogFormat* = enum

@@ -38,27 +38,34 @@ suite "e2e_vm_harness_auto_backend_selection":
       discard autoSelectBackendId(hpLinux, goMacos)
 
   test "newBackend(noopFallback=true) yields a backend tagged with the requested ID":
-    # For every (host, guest) cell that is *not* the current host's real
-    # backend, we expect newBackend to fall back to NoopBackend and tag
-    # the result with the auto-selected ID. This lets the M0 test pass
-    # on any CI runner without needing real Tart/UTM/Hyper-V installed.
+    # For every (host, guest) cell, newBackend should either:
+    #   (a) construct the real backend if its factory is registered and
+    #       the underlying tool is available on this host, OR
+    #   (b) fall back to NoopBackend tagged with the requested ID.
+    # The M0 contract is that the *dispatch* always succeeds; the M0
+    # smoke lifecycle exercise (provision/revert/exec) is only run
+    # against backends that probe as available — the per-backend
+    # lifecycle is covered by each backend's own integration tests
+    # under tests/integration/.
     for cell in dispatchTable:
       let (id, backend) = newBackendForGuest(cell.host, cell.guest,
                                             noopFallback = true)
       check id == cell.expected
       check backend.id == cell.expected
-      # Even though the backend is structurally a NoopBackend, it
-      # advertises itself as the auto-selected ID.
       check backend != nil
-      # Sanity: the masquerading NoopBackend can still execute a full
-      # lifecycle (this is exactly the property the CLI relies on for
-      # the auto-selection smoke run).
-      backend.provisionBaseline(BaselineSpec(name: "auto-cell-baseline"))
-      let vm = backend.revertToBaseline("auto-cell-baseline")
-      let r = backend.execInGuest(vm, initTable[string, string](),
-                                  @["/bin/echo", $cell.host, $cell.guest])
-      check r.exitCode == 0
-      backend.stopAndCleanup(vm)
+      # Lifecycle exercise: only run it against backends that can
+      # actually serve I/O on the current host. NoopBackend always
+      # can; M1+ backends advertise via probeAvailability.
+      let canExercise =
+        backend.id == biNoop or
+        (try: backend.probeAvailability() except CatchableError: false)
+      if canExercise:
+        backend.provisionBaseline(BaselineSpec(name: "auto-cell-baseline"))
+        let vm = backend.revertToBaseline("auto-cell-baseline")
+        let r = backend.execInGuest(vm, initTable[string, string](),
+                                    @["/bin/echo", $cell.host, $cell.guest])
+        check r.exitCode == 0
+        backend.stopAndCleanup(vm)
 
   test "auto-selection drives the full CLI run subcommand without errors":
     # End-to-end: parseCliOpts → resolveBackend(auto) → runGate.
