@@ -1,0 +1,14 @@
+# Build artifacts
+build/
+nimcache/
+*.exe
+*.dylib
+*.so
+
+# Direnv cache
+.direnv/
+.envrc.cache
+
+# Test scratch
+tests/**/*.tmp
+tests/**/nimcache/
