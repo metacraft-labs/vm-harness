@@ -74,3 +74,33 @@ suite "NoopBackend lifecycle":
     b.stopAndCleanup(vm)
     b.stopAndCleanup(vm)
     check b.activeVms.len == 0
+
+  # M30: snapshot/restore parity primitives. The default base implementations
+  # raise BackendUnavailableError; the NoopBackend override records snapshots
+  # in an in-memory table so CLI dispatch and orchestrator code can exercise
+  # the full surface without a real hypervisor.
+  test "snapshot create + list + restore roundtrip":
+    let b = newNoopBackend()
+    let snapId = b.snapshot("myvm", "clean")
+    check snapId == "clean"
+    let snaps = b.listSnapshots("myvm")
+    check snaps == @["clean"]
+    # Restore succeeds when the snapshot exists.
+    b.restoreSnapshot("myvm", "clean")
+    check "snapshot:myvm:clean" in b.calls
+    check "restoreSnapshot:myvm:clean" in b.calls
+
+  test "restoreSnapshot raises for missing snapshot":
+    let b = newNoopBackend()
+    expect VmHarnessError:
+      b.restoreSnapshot("myvm", "no-such-snap")
+
+  test "snapshot raises for duplicate name":
+    let b = newNoopBackend()
+    discard b.snapshot("myvm", "clean")
+    expect VmHarnessError:
+      discard b.snapshot("myvm", "clean")
+
+  test "listSnapshots returns empty for unknown VM":
+    let b = newNoopBackend()
+    check b.listSnapshots("never-seen").len == 0

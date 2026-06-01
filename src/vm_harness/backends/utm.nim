@@ -711,6 +711,46 @@ method stopAndCleanup*(b: UtmBackend, vm: VmHandle, deleteVm: bool = true) =
     discard
 
 # ---------------------------------------------------------------------------
+# M30: snapshot/restore via ``utmctl clone``. UTM has no incremental snapshot
+# mechanism either; we mirror the Tart pattern so consumers see uniform
+# semantics across the Mac-host backends. The Rust port in
+# ``ah-vm::backends::utm`` uses the same naming convention.
+
+method snapshot*(b: UtmBackend, vmName: string, snapshotName: string): string =
+  let snapId = vmName & "-snap-" & snapshotName
+  for v in b.listUtmVms():
+    if v.name == snapId:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "utm snapshot '" & snapId & "' already exists")
+  b.cloneUtmVm(vmName, snapId)
+  snapId
+
+method restoreSnapshot*(b: UtmBackend, vmName: string, snapshotName: string) =
+  let derived = vmName & "-snap-" & snapshotName
+  let entries = b.listUtmVms()
+  var snapId = ""
+  for v in entries:
+    if v.name == snapshotName:
+      snapId = snapshotName
+      break
+    elif v.name == derived:
+      snapId = derived
+      break
+  if snapId.len == 0:
+    raise newVmHarnessError($b.id, lpRevert,
+      "utm snapshot '" & snapshotName & "' not found for VM '" & vmName & "'")
+  b.stopUtmVm(vmName)
+  sleep(500)
+  b.deleteUtmVm(vmName)
+  b.cloneUtmVm(snapId, vmName)
+
+method listSnapshots*(b: UtmBackend, vmName: string): seq[string] =
+  let prefix = vmName & "-snap-"
+  for v in b.listUtmVms():
+    if v.name.startsWith(prefix):
+      result.add(v.name[prefix.len .. ^1])
+
+# ---------------------------------------------------------------------------
 # Backend registration. One factory — the UTM backend always targets
 # Windows-ARM guests on Mac hosts; there's no dual-guest pattern like
 # Tart's (where one binary can host both macOS and Linux ARM).

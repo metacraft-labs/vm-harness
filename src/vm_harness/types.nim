@@ -193,6 +193,33 @@ method stopAndCleanup*(b: VmBackend, vm: VmHandle, deleteVm: bool = true) {.base
   discard
 
 # ---------------------------------------------------------------------------
+# M30: Snapshot/Restore primitives. These mirror the
+# ``snapshot`` / ``restore_snapshot`` / ``list_snapshots`` trait methods on
+# the Rust ``ah-vm::VmOrchestrator`` side. The default base implementations
+# raise ``BackendUnavailableError`` so backends that lack snapshot support
+# remain fully conformant. Each backend that *does* support snapshots (Tart,
+# UTM, Lima, libvirt, hyperv, wsl) overrides them.
+#
+# Snapshot naming convention (matches the Rust port):
+#   - Tart/UTM (clone-based)  : `<vm>-snap-<name>`
+#   - libvirt (native)        : virsh-managed name
+#   - hyperv  (native)        : Restore-VMCheckpoint name
+#   - Lima/WSL (record-based) : files in a side directory
+# Returned identifiers are opaque strings that ``restoreSnapshot`` accepts.
+
+method snapshot*(b: VmBackend, vmName: string, snapshotName: string): string {.base.} =
+  raise newException(BackendUnavailableError,
+    "snapshot not implemented for backend " & $b.id)
+
+method restoreSnapshot*(b: VmBackend, vmName: string, snapshotName: string) {.base.} =
+  raise newException(BackendUnavailableError,
+    "restoreSnapshot not implemented for backend " & $b.id)
+
+method listSnapshots*(b: VmBackend, vmName: string): seq[string] {.base.} =
+  raise newException(BackendUnavailableError,
+    "listSnapshots not implemented for backend " & $b.id)
+
+# ---------------------------------------------------------------------------
 # Helpers used by the CLI dispatcher and the docs.
 
 proc selectBackendId*(host: HostPlatform, guest: GuestOs): BackendId =

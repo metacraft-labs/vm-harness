@@ -27,6 +27,7 @@ type
     activeVms*: seq[string]
     cleanedVms*: seq[string]
     shims*: Table[string, string]  ## binary name -> trace log path
+    snapshots*: Table[string, seq[string]] ## vm-name -> snapshot names (M30)
 
 proc newNoopBackend*(rootDir: string = ""): NoopBackend =
   ## Construct a fresh NoopBackend. If ``rootDir`` is empty a temp dir is
@@ -44,7 +45,8 @@ proc newNoopBackend*(rootDir: string = ""): NoopBackend =
     rootDir: dir,
     calls: @[],
     available: true,
-    shims: initTable[string, string]())
+    shims: initTable[string, string](),
+    snapshots: initTable[string, seq[string]]())
 
 method probeAvailability*(b: NoopBackend): bool =
   b.calls.add("probeAvailability")
@@ -140,3 +142,27 @@ method stopAndCleanup*(b: NoopBackend, vm: VmHandle, deleteVm: bool = true) =
         removeDir(vmDir)
   except CatchableError:
     discard
+
+# ---------------------------------------------------------------------------
+# M30: in-memory snapshot store. Useful for CLI-dispatch and orchestrator
+# tests that exercise the snapshot subcommand without a real hypervisor.
+
+method snapshot*(b: NoopBackend, vmName: string, snapshotName: string): string =
+  b.calls.add("snapshot:" & vmName & ":" & snapshotName)
+  if not b.snapshots.hasKey(vmName):
+    b.snapshots[vmName] = @[]
+  if snapshotName in b.snapshots[vmName]:
+    raise newVmHarnessError($b.id, lpProvisioning,
+      "snapshot '" & snapshotName & "' already exists for VM '" & vmName & "'")
+  b.snapshots[vmName].add(snapshotName)
+  snapshotName
+
+method restoreSnapshot*(b: NoopBackend, vmName: string, snapshotName: string) =
+  b.calls.add("restoreSnapshot:" & vmName & ":" & snapshotName)
+  if not b.snapshots.hasKey(vmName) or snapshotName notin b.snapshots[vmName]:
+    raise newVmHarnessError($b.id, lpRevert,
+      "snapshot '" & snapshotName & "' not found for VM '" & vmName & "'")
+
+method listSnapshots*(b: NoopBackend, vmName: string): seq[string] =
+  b.calls.add("listSnapshots:" & vmName)
+  if b.snapshots.hasKey(vmName): b.snapshots[vmName] else: @[]

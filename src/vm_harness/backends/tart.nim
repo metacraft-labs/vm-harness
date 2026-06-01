@@ -650,6 +650,42 @@ method stopAndCleanup*(b: TartBackend, vm: VmHandle, deleteVm: bool = true) =
     discard
 
 # ---------------------------------------------------------------------------
+# M30: snapshot/restore. Tart has no incremental snapshot mechanism; the
+# cross-backend convention is "snapshot = `tart clone`" and "restore = stop +
+# delete + re-clone". Snapshot ids are derived as ``<vm>-snap-<name>`` so
+# callers can list them by scanning ``tart list``. This mirrors the Rust
+# ``ah-vm::backends::tart`` implementation byte-for-byte.
+
+method snapshot*(b: TartBackend, vmName: string, snapshotName: string): string =
+  let snapId = vmName & "-snap-" & snapshotName
+  if snapId in b.listTartVms():
+    raise newVmHarnessError($b.id, lpProvisioning,
+      "tart snapshot '" & snapId & "' already exists")
+  b.cloneTartVm(vmName, snapId)
+  snapId
+
+method restoreSnapshot*(b: TartBackend, vmName: string, snapshotName: string) =
+  # Accept either the user-friendly snapshot name or the full snap id.
+  let derived = vmName & "-snap-" & snapshotName
+  let vms = b.listTartVms()
+  let snapId =
+    if snapshotName in vms: snapshotName
+    elif derived in vms: derived
+    else:
+      raise newVmHarnessError($b.id, lpRevert,
+        "tart snapshot '" & snapshotName & "' not found for VM '" & vmName & "'")
+  b.stopTartVm(vmName)
+  sleep(500)
+  b.deleteTartVm(vmName)
+  b.cloneTartVm(snapId, vmName)
+
+method listSnapshots*(b: TartBackend, vmName: string): seq[string] =
+  let prefix = vmName & "-snap-"
+  for v in b.listTartVms():
+    if v.startsWith(prefix):
+      result.add(v[prefix.len .. ^1])
+
+# ---------------------------------------------------------------------------
 # Backend registration. Each registered factory captures its target
 # guest OS so ``newBackend(biTartMacos)`` produces a macOS-configured
 # instance and ``newBackend(biTartLinuxArm)`` produces the Linux one.

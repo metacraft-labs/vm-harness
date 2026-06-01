@@ -59,11 +59,16 @@ const HelpText = """
 vm-harness <subcommand> [flags]
 
 Subcommands:
-  provision    Ensure a baseline image exists (idempotent).
-  run          One-shot revert + exec + harvest + cleanup.
-  probe        Print available backends as JSON.
-  shell        (placeholder) Open an interactive shell into a baseline.
-  backends     Tabular listing of every known backend.
+  provision               Ensure a baseline image exists (idempotent).
+  run                     One-shot revert + exec + harvest + cleanup.
+  probe                   Print available backends as JSON.
+  shell                   (placeholder) Open an interactive shell into a baseline.
+  backends                Tabular listing of every known backend.
+  snapshot create <vm> <name>
+                          Take a named snapshot of <vm> (M30).
+  snapshot restore <vm> <name>
+                          Restore <vm> from snapshot <name> (M30).
+  snapshot list <vm>      List snapshots for <vm> (M30).
 
 Common flags:
   --backend <auto|noop|hyperv|wsl|tart-macos|tart-linux-arm|
@@ -328,6 +333,57 @@ proc cmdShell(opts: CliOpts): int =
            {"backend": opts.backend, "baseline": opts.baseline})
   0
 
+proc cmdSnapshot(opts: CliOpts): int =
+  ## M30: dispatch ``snapshot create|restore|list <vm> [<name>]`` to the
+  ## resolved backend. Positional args land in ``opts.cmd``.
+  if opts.cmd.len < 2:
+    stderr.writeLine("vm-harness: snapshot requires <action> <vm> [<name>]")
+    stderr.writeLine("  actions: create, restore, list")
+    return 2
+  let action = opts.cmd[0]
+  let vmName = opts.cmd[1]
+  let (id, backend) = resolveBackend(opts)
+  case action
+  of "create":
+    if opts.cmd.len < 3:
+      stderr.writeLine("vm-harness: snapshot create requires <name>")
+      return 2
+    let snap = opts.cmd[2]
+    logEvent(opts.logFormat, "info",
+             "snapshot create",
+             {"backend": $id, "vm": vmName, "name": snap})
+    let returnedId = backend.snapshot(vmName, snap)
+    case opts.logFormat
+    of lfHuman: echo returnedId
+    of lfJson:  echo($(%*{"id": returnedId}))
+    0
+  of "restore":
+    if opts.cmd.len < 3:
+      stderr.writeLine("vm-harness: snapshot restore requires <name>")
+      return 2
+    let snap = opts.cmd[2]
+    logEvent(opts.logFormat, "info",
+             "snapshot restore",
+             {"backend": $id, "vm": vmName, "name": snap})
+    backend.restoreSnapshot(vmName, snap)
+    logEvent(opts.logFormat, "info", "snapshot restore complete",
+             {"backend": $id, "vm": vmName, "name": snap})
+    0
+  of "list":
+    let snaps = backend.listSnapshots(vmName)
+    case opts.logFormat
+    of lfHuman:
+      for s in snaps: echo s
+    of lfJson:
+      var arr = newJArray()
+      for s in snaps: arr.add(%s)
+      echo($arr)
+    0
+  else:
+    stderr.writeLine("vm-harness: unknown snapshot action '" & action & "'")
+    stderr.writeLine("  actions: create, restore, list")
+    2
+
 proc runCli*(args: seq[string]): int =
   var opts: CliOpts
   try:
@@ -346,6 +402,7 @@ proc runCli*(args: seq[string]): int =
   of "probe":     return cmdProbe(opts)
   of "backends":  return cmdBackends(opts)
   of "shell":     return cmdShell(opts)
+  of "snapshot":  return cmdSnapshot(opts)
   else:
     stderr.writeLine("vm-harness: unknown subcommand '" & opts.subcommand & "'")
     stderr.writeLine(HelpText)
