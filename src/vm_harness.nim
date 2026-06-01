@@ -27,6 +27,7 @@ import ./vm_harness/backends/hyperv
 import ./vm_harness/backends/wsl
 import ./vm_harness/backends/tart
 import ./vm_harness/backends/utm
+import ./vm_harness/backends/lima
 
 export types
 export output
@@ -39,3 +40,4 @@ export hyperv
 export wsl
 export tart
 export utm
+export lima

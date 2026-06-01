@@ -27,6 +27,7 @@ import ./backends/hyperv
 import ./backends/wsl
 import ./backends/tart
 import ./backends/utm
+import ./backends/lima
 {.pop.}
 
 type

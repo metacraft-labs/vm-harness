@@ -40,6 +40,12 @@ task test, "Run the vm-harness test suite":
   exec "nim r --hints:off tests/integration/t_utm_lifecycle.nim"
   exec "nim r --hints:off tests/e2e/t_vm_harness_utm_windows_arm_smoke.nim"
   exec "nim r --hints:off tests/e2e/t_vm_harness_utm_windows_dism_works_under_prism.nim"
+  # M5 integration + verification (auto-skip on non-macOS or when limactl is
+  # missing). The smoke + revert-budget tests perform real Lima boots; expect
+  # several minutes total wall-clock on a cold image cache.
+  exec "nim r --hints:off tests/integration/t_lima_lifecycle.nim"
+  exec "nim r --hints:off tests/e2e/t_vm_harness_lima_linux_smoke.nim"
+  exec "nim r --hints:off tests/e2e/t_vm_harness_lima_revert_under_30s.nim"
 
 task buildCli, "Build the vm-harness CLI binary":
   exec "nim c --hints:off -o:build/bin/vm-harness src/vm_harness/cli.nim"

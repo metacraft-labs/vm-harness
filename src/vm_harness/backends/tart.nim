@@ -572,35 +572,47 @@ method installArgvTraceShim*(b: TartBackend, vm: VmHandle,
       "sudo mkdir -p \"" & parentDirGuest & "\" && "
     else: ""
   let escapedLog = logPath.replace("\"", "\\\"")
+  let q = "\""
   # The shell snippet below is run as ``admin`` on the cirruslabs golden;
   # we use ``sudo`` for the privileged moves. Sudo is password-less on
   # the cirruslabs goldens.
-  let snippet = """set -eu
-""" & parentClause & """sudo touch """ & "\"" & escapedLog & "\"" & """
-sudo chmod 0666 """ & "\"" & escapedLog & "\"" & """
-REAL_PATH=""
-if command -v """ & bin & """ >/dev/null 2>&1; then
-  REAL_PATH=$(command -v """ & bin & """)
-fi
-if [ -z "$REAL_PATH" ]; then
-  echo "installArgvTraceShim: binary not found: """ & bin & """" >&2
-  exit 1
-fi
-BACKUP="${REAL_PATH}.real"
-if [ ! -e "$BACKUP" ]; then
-  sudo mv "$REAL_PATH" "$BACKUP"
-fi
-SHIM_PATH="/usr/local/bin/""" & bin & """"
-sudo mkdir -p /usr/local/bin
-sudo tee "$SHIM_PATH" >/dev/null <<'SHIMEOF'
-#!/bin/sh
-printf '%s\t%s\n' "$(date +%s%N 2>/dev/null || date +%s)" "$0 $*" >> """ & "\"" & escapedLog & "\"" & """
-exec "$BACKUP_PATH" "$@"
-SHIMEOF
-sudo sed -i.bak "s|\$BACKUP_PATH|$BACKUP|g" "$SHIM_PATH" || sudo sed -i "" "s|\$BACKUP_PATH|$BACKUP|g" "$SHIM_PATH"
-sudo rm -f "${SHIM_PATH}.bak"
-sudo chmod +x "$SHIM_PATH"
-"""
+  #
+  # Build line-by-line with explicit ``"\n"`` separators rather than via
+  # ``"""...""" & x & """..."""``. Nim's triple-quote literal strips the
+  # newline that immediately follows the opening ``"""``; the
+  # reopened-block pattern therefore swallows the first ``\n`` of every
+  # subsequent block and fuses adjacent shell statements onto a single
+  # line (rendered output was ``sudo touch "<log>"sudo chmod 0666 "<log>"
+  # REAL_PATH=""``). Discovered while implementing M5's LimaBackend,
+  # which uses the same line-by-line pattern (see ``lima.nim:
+  # renderShimSnippet``).
+  let shimBody = "#!/bin/sh\n" &
+                 "printf '%s\\t%s\\n' \"$(date +%s%N 2>/dev/null || date +%s)\" \"$0 $*\" >> " &
+                 q & escapedLog & q & "\n" &
+                 "exec \"$BACKUP_PATH\" \"$@\"\n"
+  let snippet = "set -eu\n" &
+                parentClause & "sudo touch " & q & escapedLog & q & "\n" &
+                "sudo chmod 0666 " & q & escapedLog & q & "\n" &
+                "REAL_PATH=\"\"\n" &
+                "if command -v " & bin & " >/dev/null 2>&1; then\n" &
+                "  REAL_PATH=$(command -v " & bin & ")\n" &
+                "fi\n" &
+                "if [ -z \"$REAL_PATH\" ]; then\n" &
+                "  echo \"installArgvTraceShim: binary not found: " & bin & "\" >&2\n" &
+                "  exit 1\n" &
+                "fi\n" &
+                "BACKUP=\"${REAL_PATH}.real\"\n" &
+                "if [ ! -e \"$BACKUP\" ]; then\n" &
+                "  sudo mv \"$REAL_PATH\" \"$BACKUP\"\n" &
+                "fi\n" &
+                "SHIM_PATH=\"/usr/local/bin/" & bin & "\"\n" &
+                "sudo mkdir -p /usr/local/bin\n" &
+                "sudo tee \"$SHIM_PATH\" >/dev/null <<'SHIMEOF'\n" &
+                shimBody &
+                "SHIMEOF\n" &
+                "sudo sed -i.bak \"s|\\$BACKUP_PATH|$BACKUP|g\" \"$SHIM_PATH\" || sudo sed -i \"\" \"s|\\$BACKUP_PATH|$BACKUP|g\" \"$SHIM_PATH\"\n" &
+                "sudo rm -f \"${SHIM_PATH}.bak\"\n" &
+                "sudo chmod +x \"$SHIM_PATH\"\n"
   let r = b.execInGuest(vm, initTable[string, string](),
                         @["/bin/sh", "-c", snippet], timeoutSec = 60)
   if r.exitCode != 0:
