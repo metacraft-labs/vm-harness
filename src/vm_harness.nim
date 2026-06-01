@@ -26,6 +26,7 @@ import ./vm_harness/backends/process_helpers
 import ./vm_harness/backends/hyperv
 import ./vm_harness/backends/wsl
 import ./vm_harness/backends/tart
+import ./vm_harness/backends/utm
 
 export types
 export output
@@ -37,3 +38,4 @@ export process_helpers
 export hyperv
 export wsl
 export tart
+export utm

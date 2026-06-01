@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  vm-harness Windows-on-ARM SysPrep answer file (M3).
+
+  Used by step 5 of the windows-arm-base recipe to generalize the
+  installed Windows image so subsequent UTM clones each get a fresh
+  SID + computer name without re-running the full OOBE.
+
+  Invoked manually from inside the guest (or via the Tier-1 windows.ps1
+  guest runner once the recipe is wired into CI):
+
+    C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown \
+        /mode:vm /unattend:C:\repro-sysprep.xml
+
+  The /shutdown flag stops the VM once SysPrep completes; the harness's
+  finalize-golden.sh then renames the bundle and removes the attached
+  ISOs.
+
+  This unattend.xml deliberately re-applies the same admin/admin auto-
+  logon + OpenSSH FirstLogonCommands so the *first boot after clone*
+  re-creates the admin user, re-enables sshd, and re-writes the
+  install-done sentinel. The OpenSSH capability install in the
+  FirstLogonCommands is idempotent on Win11 — Add-WindowsCapability
+  silently no-ops when the capability is already installed, which it
+  is, having survived generalize.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <ComputerName>*</ComputerName>
+      <TimeZone>UTC</TimeZone>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UILanguageFallback>en-US</UILanguageFallback>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <NetworkLocation>Work</NetworkLocation>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>admin</Name>
+            <Group>Administrators</Group>
+            <Description>vm-harness Windows-ARM golden admin user (post-SysPrep)</Description>
+            <Password>
+              <Value>repro-windows-arm</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+      <AutoLogon>
+        <Username>admin</Username>
+        <Password>
+          <Value>repro-windows-arm</Value>
+          <PlainText>true</PlainText>
+        </Password>
+        <Enabled>true</Enabled>
+        <LogonCount>9</LogonCount>
+      </AutoLogon>
+
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"</CommandLine>
+          <Description>Ensure OpenSSH Server capability is present</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Set-Service -Name sshd -StartupType Automatic; Start-Service sshd"</CommandLine>
+          <Description>Enable and start sshd</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <CommandLine>cmd.exe /c "echo install-done > C:\Windows\Temp\repro-install-done"</CommandLine>
+          <Description>Write install-done sentinel</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+
+      <RegisteredOwner>vm-harness</RegisteredOwner>
+      <RegisteredOrganization>Metacraft Labs</RegisteredOrganization>
+      <TimeZone>UTC</TimeZone>
+    </component>
+  </settings>
+
+</unattend>

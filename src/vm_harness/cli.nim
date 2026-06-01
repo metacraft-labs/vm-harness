@@ -26,6 +26,7 @@ import ./backends/noop
 import ./backends/hyperv
 import ./backends/wsl
 import ./backends/tart
+import ./backends/utm
 {.pop.}
 
 type

@@ -55,10 +55,22 @@ suite "e2e_vm_harness_auto_backend_selection":
       check backend != nil
       # Lifecycle exercise: only run it against backends that can
       # actually serve I/O on the current host. NoopBackend always
-      # can; M1+ backends advertise via probeAvailability.
-      let canExercise =
+      # can; M1+ backends advertise via probeAvailability. UTM
+      # additionally requires a pre-built golden bundle (the recipe
+      # under guest-recipes/windows-arm-base/ is a 30+ minute one-time
+      # build), so we skip its lifecycle exercise unless the golden
+      # exists — probeAvailability alone isn't enough.
+      var canExercise =
         backend.id == biNoop or
         (try: backend.probeAvailability() except CatchableError: false)
+      if canExercise and backend.id == biUtmWindowsArm:
+        # Only exercise UTM if the golden is registered with UTM.
+        let utm = cast[UtmBackend](backend)
+        var goldenPresent = false
+        for v in utm.listUtmVms():
+          if v.name == utm.goldenBundleName: goldenPresent = true
+        if not goldenPresent:
+          canExercise = false
       if canExercise:
         backend.provisionBaseline(BaselineSpec(name: "auto-cell-baseline"))
         let vm = backend.revertToBaseline("auto-cell-baseline")

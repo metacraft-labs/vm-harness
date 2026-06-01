@@ -19,6 +19,7 @@ task test, "Run the vm-harness test suite":
   exec "nim r --hints:off tests/unit/t_guest_scripts.nim"
   exec "nim r --hints:off tests/unit/t_hyperv_parsers.nim"
   exec "nim r --hints:off tests/unit/t_wsl_parsers.nim"
+  exec "nim r --hints:off tests/unit/t_utm_parsers.nim"
   # M0 integration / e2e (NoopBackend; runs on any platform).
   exec "nim r --hints:off tests/integration/t_noop_lifecycle.nim"
   exec "nim r --hints:off tests/e2e/t_vm_harness_smoke.nim"
@@ -34,6 +35,11 @@ task test, "Run the vm-harness test suite":
   exec "nim r --hints:off tests/e2e/t_vm_harness_tart_linux_arm_smoke.nim"
   exec "nim r --hints:off tests/e2e/t_vm_harness_tart_macos_smoke.nim"
   exec "nim r --hints:off tests/e2e/t_vm_harness_tart_cleanup_on_failure.nim"
+  # M3 integration + verification (auto-skip on non-macOS or when utmctl/sshpass
+  # missing or when the windows-arm golden bundle isn't registered).
+  exec "nim r --hints:off tests/integration/t_utm_lifecycle.nim"
+  exec "nim r --hints:off tests/e2e/t_vm_harness_utm_windows_arm_smoke.nim"
+  exec "nim r --hints:off tests/e2e/t_vm_harness_utm_windows_dism_works_under_prism.nim"
 
 task buildCli, "Build the vm-harness CLI binary":
   exec "nim c --hints:off -o:build/bin/vm-harness src/vm_harness/cli.nim"

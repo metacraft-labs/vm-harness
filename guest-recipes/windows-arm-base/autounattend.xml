@@ -1,0 +1,253 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  vm-harness Windows-on-ARM golden image autounattend.xml (M3).
+
+  Drives Windows 11 ARM64 Insider Preview Setup from first boot through
+  to a desktop with OpenSSH server enabled and admin auto-logon. Mirrors
+  the Hyper-V harness's Panther override pattern from
+    reprobuild/tools/hyperv-m69-system/provision-base-vm.ps1
+  (see New-PantherUnattendXml) but adapted for ISO-driven Setup rather
+  than VHDX-shipped customization.
+
+  Differences from the Hyper-V Panther approach:
+
+    - Includes the windowsPE pass (disk partition + Setup auto-accept)
+      because we're installing from ISO, not customizing a pre-baked
+      VHDX. The Panther approach assumes Setup has already extracted
+      the install; this approach drives Setup itself.
+    - processorArchitecture="arm64" everywhere (vs amd64).
+    - FirstLogonCommands installs OpenSSH Server via DISM (no Windows
+      Update dependency — DISM uses the in-box capability source).
+      The Hyper-V harness deliberately removes OpenSSH because its
+      transport is PSDirect; the UTM harness deliberately installs it
+      because SSH is the only available transport over user-mode NAT.
+    - Writes C:\Windows\Temp\repro-install-done as the "install
+      finished" sentinel so the recipe scripts can poll for completion.
+    - Copies repro-sysprep.xml to C:\ for the manual step-5 SysPrep
+      invocation (see README §5).
+
+  Credentials baked in:
+
+    - User: admin
+    - Password: repro-windows-arm
+    - Auto-logon enabled (so the FirstLogonCommands hook runs at first
+      boot without needing console input).
+
+  These match the UtmBackend defaults (newUtmBackend sshUser=admin,
+  sshPassword=repro-windows-arm). Override by setting
+  VMH_UTM_SSH_USER / VMH_UTM_SSH_PASSWORD in the test environment and
+  by editing this file before running the recipe.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <SetupUILanguage>
+        <UILanguage>en-US</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UILanguageFallback>en-US</UILanguageFallback>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order>
+              <Type>EFI</Type>
+              <Size>300</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order>
+              <Type>MSR</Type>
+              <Size>128</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>3</Order>
+              <Type>Primary</Type>
+              <Extend>true</Extend>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>1</PartitionID>
+              <Label>System</Label>
+              <Format>FAT32</Format>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order>
+              <PartitionID>2</PartitionID>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>3</Order>
+              <PartitionID>3</PartitionID>
+              <Label>Windows</Label>
+              <Letter>C</Letter>
+              <Format>NTFS</Format>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+      <ImageInstall>
+        <OSImage>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>3</PartitionID>
+          </InstallTo>
+          <!-- Pro is the most permissive SKU that ships in all Win11 ARM
+               Insider ISOs; the recipe scripts validate the available
+               image names and fall back to "Windows 11 Home" or
+               "Windows 11 ARM" if Pro isn't present in the ISO. -->
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/NAME</Key>
+              <Value>Windows 11 Pro</Value>
+            </MetaData>
+          </InstallFrom>
+        </OSImage>
+      </ImageInstall>
+      <UserData>
+        <ProductKey>
+          <!-- Generic ARM Pro product key — install-time only; Windows
+               must be activated against a real key post-install if the
+               recipe is used outside the disposable-per-gate context. -->
+          <Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key>
+          <WillShowUI>OnError</WillShowUI>
+        </ProductKey>
+        <AcceptEula>true</AcceptEula>
+        <FullName>repro-vm-harness</FullName>
+        <Organization>vm-harness</Organization>
+      </UserData>
+    </component>
+  </settings>
+
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <!-- Auto-generated by Setup so the golden bundle's clones each
+           get a fresh name without us having to plug one in. -->
+      <ComputerName>*</ComputerName>
+      <TimeZone>UTC</TimeZone>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UILanguageFallback>en-US</UILanguageFallback>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <NetworkLocation>Work</NetworkLocation>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>admin</Name>
+            <Group>Administrators</Group>
+            <Description>vm-harness Windows-ARM golden admin user</Description>
+            <Password>
+              <Value>repro-windows-arm</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+      <AutoLogon>
+        <Username>admin</Username>
+        <Password>
+          <Value>repro-windows-arm</Value>
+          <PlainText>true</PlainText>
+        </Password>
+        <Enabled>true</Enabled>
+        <LogonCount>9</LogonCount>
+      </AutoLogon>
+
+      <FirstLogonCommands>
+        <!-- 1. Install OpenSSH Server (in-box capability — no Windows
+             Update required). -->
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"</CommandLine>
+          <Description>Install OpenSSH Server capability</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 2. Configure sshd to start automatically and start it now. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Set-Service -Name sshd -StartupType Automatic; Start-Service sshd"</CommandLine>
+          <Description>Enable and start sshd</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 3. Set PowerShell as the default shell for SSH sessions.
+             The UTM backend's execInGuest currently routes through
+             `cmd /c "..."` so this isn't strictly required, but it's
+             a quality-of-life win for interactive `ssh admin@vm`
+             sessions and matches the Hyper-V harness's PSDirect default. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "New-ItemProperty -Path HKLM:\SOFTWARE\OpenSSH -Name DefaultShell -Value (Get-Command powershell.exe).Source -PropertyType String -Force"</CommandLine>
+          <Description>Set PowerShell as default SSH shell</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 4. Open inbound TCP/22 on the firewall (the OpenSSH
+             capability install does this, but we re-assert it
+             defensively in case future Insider builds change the
+             default rule shape). -->
+        <SynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) { New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 }"</CommandLine>
+          <Description>Ensure inbound TCP/22 is allowed</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 5. Copy the SysPrep answer file from the autounattend ISO
+             to C:\ so the manual step-5 SysPrep invocation finds it. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <CommandLine>cmd.exe /c "for %i in (D E F G H) do if exist %i:\repro-sysprep.xml copy /Y %i:\repro-sysprep.xml C:\repro-sysprep.xml"</CommandLine>
+          <Description>Stage repro-sysprep.xml on C:\</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 6. Marker file the recipe scripts poll for. Written last so
+             a poll-and-found check is sufficient evidence that every
+             earlier FirstLogonCommands step succeeded. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>6</Order>
+          <CommandLine>cmd.exe /c "echo install-done > C:\Windows\Temp\repro-install-done"</CommandLine>
+          <Description>Write install-done sentinel</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+
+      <RegisteredOwner>vm-harness</RegisteredOwner>
+      <RegisteredOrganization>Metacraft Labs</RegisteredOrganization>
+      <TimeZone>UTC</TimeZone>
+    </component>
+  </settings>
+
+</unattend>
