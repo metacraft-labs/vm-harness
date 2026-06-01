@@ -29,6 +29,11 @@ task test, "Run the vm-harness test suite":
   exec "nim r --hints:off tests/integration/t_wsl_lifecycle.nim"
   exec "nim r --hints:off tests/e2e/t_vm_harness_hyperv_m69_feature_capability_passes.nim"
   exec "nim r --hints:off tests/e2e/t_vm_harness_wsl_m69_passwd_user_passes.nim"
+  # M2 integration + verification (auto-skip on non-macOS or when tart/sshpass missing).
+  exec "nim r --hints:off tests/integration/t_tart_lifecycle.nim"
+  exec "nim r --hints:off tests/e2e/t_vm_harness_tart_linux_arm_smoke.nim"
+  exec "nim r --hints:off tests/e2e/t_vm_harness_tart_macos_smoke.nim"
+  exec "nim r --hints:off tests/e2e/t_vm_harness_tart_cleanup_on_failure.nim"
 
 task buildCli, "Build the vm-harness CLI binary":
   exec "nim c --hints:off -o:build/bin/vm-harness src/vm_harness/cli.nim"

@@ -25,6 +25,7 @@ import ./types, ./output, ./auto, ./orchestrator
 import ./backends/noop
 import ./backends/hyperv
 import ./backends/wsl
+import ./backends/tart
 {.pop.}
 
 type
