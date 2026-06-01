@@ -1,0 +1,5 @@
+step: revert  status: ok  elapsed_ms: <varies>
+step: copy-to:/tmp/fs-system-file-gate  status: ok  elapsed_ms: <varies>
+step: exec:sudo  status: ok  elapsed_ms: <varies>
+step: cleanup  status: ok  elapsed_ms: <varies>
+verdict: PASS
