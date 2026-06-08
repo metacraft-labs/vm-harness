@@ -111,6 +111,19 @@ suite "NoopBackend lifecycle":
   # tests can verify orchestrator dispatch + return-value contract without a
   # real hypervisor.
 
+  test "removeSnapshot drops the named entry and is idempotent":
+    let b = newNoopBackend()
+    discard b.snapshot("myvm", "a")
+    discard b.snapshot("myvm", "b")
+    check b.listSnapshots("myvm") == @["a", "b"]
+    b.removeSnapshot("myvm", "a")
+    check b.listSnapshots("myvm") == @["b"]
+    # Idempotent — removing a missing snapshot is a no-op.
+    b.removeSnapshot("myvm", "a")
+    check b.listSnapshots("myvm") == @["b"]
+    # Idempotent — removing from a VM that's never been seen is a no-op.
+    b.removeSnapshot("never-seen", "x")
+
   test "snapshotRunning records a distinct call tag from cold snapshot":
     let b = newNoopBackend()
     discard b.snapshotRunning("myvm", "hot")

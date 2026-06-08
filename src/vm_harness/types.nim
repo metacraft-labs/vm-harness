@@ -215,6 +215,18 @@ method restoreSnapshot*(b: VmBackend, vmName: string, snapshotName: string) {.ba
   raise newException(BackendUnavailableError,
     "restoreSnapshot not implemented for backend " & $b.id)
 
+method removeSnapshot*(b: VmBackend, vmName, snapshotName: string) {.base.} =
+  ## Remove a previously-created snapshot. The symmetric counterpart of
+  ## ``snapshot`` / ``snapshotRunning``. Backends that lack a separate
+  ## "delete" primitive (clone-based Tart, UTM today) implement this by
+  ## removing the named clone.
+  ##
+  ## Idempotent: removing a missing snapshot is a no-op, not an error.
+  ## This is required so test-harness teardown blocks can be safely
+  ## re-entered.
+  raise newException(BackendUnavailableError,
+    "removeSnapshot not implemented for backend " & $b.id)
+
 method snapshotRunning*(b: VmBackend, vmName, snapshotName: string): string {.base.} =
   ## Capture a snapshot of a **running** VM that includes the guest's
   ## RAM + CPU + device state, not just disk state. ``restoreSnapshot``

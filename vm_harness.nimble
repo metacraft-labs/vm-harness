@@ -49,3 +49,7 @@ task test, "Run the vm-harness test suite":
 
 task buildCli, "Build the vm-harness CLI binary":
   exec "nim c --hints:off -o:build/bin/vm-harness src/vm_harness/cli.nim"
+
+task buildBench, "Build the backend-agnostic snapshot-revert benchmark":
+  exec "nim c --hints:off --path:src -o:build/bin/vm-harness-bench-snapshot-revert " &
+       "tools/bench/snapshot_revert_bench.nim"

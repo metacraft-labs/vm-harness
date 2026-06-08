@@ -377,6 +377,27 @@ method uninstallArgvTraceShim*(b: HyperVBackend, vm: VmHandle,
   ## restores the snapshot's original binaries. We leave this as a no-op.
   discard
 
+method startAndAwaitReady*(b: HyperVBackend, vm: VmHandle, timeoutSec: int = 120) =
+  ## Poll PowerShell Direct until ``Invoke-Command -VMName { hostname }``
+  ## succeeds (the canonical "guest is ready for execInGuest" probe). The
+  ## current ``revertToBaseline`` returns once ``Start-VM`` has been
+  ## issued; the guest may still be in early Windows boot at that point.
+  ## Callers that need to wait for the guest to be reachable before
+  ## ``execInGuest`` should call this method.
+  when defined(windows):
+    let deadline = epochTime() + float(timeoutSec)
+    while epochTime() < deadline:
+      let r = pwshInvokeCommand(b, vm.name, "hostname", timeoutSec = 15)
+      if r.exitCode == 0 and r.stdout.strip().len > 0:
+        return
+      sleep(500)
+    raise newException(GuestBootFailureError,
+      "HyperVBackend.startAndAwaitReady: PSDirect on '" & vm.name &
+      "' did not become ready within " & $timeoutSec & "s")
+  else:
+    raise newException(BackendUnavailableError,
+      "HyperVBackend.startAndAwaitReady requires a Windows host")
+
 # ---------------------------------------------------------------------------
 # Snapshot / restore / list — M30 surface, native Hyper-V Checkpoint cmdlets.
 # `snapshot` takes a snapshot of the VM in its CURRENT state (the result is
@@ -469,6 +490,23 @@ Get-VMSnapshot -VMName '{vmName.replace("'", "''")}' | ForEach-Object {{ $_.Name
   else:
     raise newException(BackendUnavailableError,
       "HyperVBackend.listSnapshots requires a Windows host")
+
+method removeSnapshot*(b: HyperVBackend, vmName, snapshotName: string) =
+  when defined(windows):
+    let psBlock = &"""$ErrorActionPreference = 'Stop'
+Import-Module Hyper-V -ErrorAction Stop
+$snap = Get-VMSnapshot -VMName '{vmName.replace("'", "''")}' -Name '{snapshotName.replace("'", "''")}' -ErrorAction SilentlyContinue
+if ($snap) {{ Remove-VMSnapshot -VMSnapshot $snap -Confirm:$false }}
+"""
+    let cmd = @[$b.powershellLauncher, "-NoLogo", "-NoProfile",
+                "-ExecutionPolicy", "Bypass", "-Command", psBlock]
+    let r = runProcessCapture(cmd, timeoutSec = 300)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "Remove-VMSnapshot failed: " & r.stdout)
+  else:
+    raise newException(BackendUnavailableError,
+      "HyperVBackend.removeSnapshot requires a Windows host")
 
 method exportBaseline*(b: HyperVBackend, vmName, destDir: string;
                        baselineName: string = "") =

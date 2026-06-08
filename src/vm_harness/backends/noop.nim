@@ -167,6 +167,14 @@ method listSnapshots*(b: NoopBackend, vmName: string): seq[string] =
   b.calls.add("listSnapshots:" & vmName)
   if b.snapshots.hasKey(vmName): b.snapshots[vmName] else: @[]
 
+method removeSnapshot*(b: NoopBackend, vmName, snapshotName: string) =
+  b.calls.add("removeSnapshot:" & vmName & ":" & snapshotName)
+  if not b.snapshots.hasKey(vmName): return
+  var kept: seq[string] = @[]
+  for s in b.snapshots[vmName]:
+    if s != snapshotName: kept.add(s)
+  b.snapshots[vmName] = kept
+
 method snapshotRunning*(b: NoopBackend, vmName, snapshotName: string): string =
   ## NoopBackend has no actual VM state to capture, so the running-state
   ## variant behaves identically to `snapshot` from the test's point of
