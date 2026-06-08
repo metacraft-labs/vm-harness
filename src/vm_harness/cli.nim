@@ -54,6 +54,7 @@ type
     logFormat*: LogFormat
     allowNoopFallback*: bool
     timeoutSec*: int
+    running*: bool               ## `--running` flag for `snapshot create`.
 
 const HelpText = """
 vm-harness <subcommand> [flags]
@@ -64,11 +65,23 @@ Subcommands:
   probe                   Print available backends as JSON.
   shell                   (placeholder) Open an interactive shell into a baseline.
   backends                Tabular listing of every known backend.
-  snapshot create <vm> <name>
-                          Take a named snapshot of <vm> (M30).
+  snapshot create [--running] <vm> <name>
+                          Take a named snapshot of <vm>. With --running, the
+                          snapshot includes memory + CPU + device state and
+                          restore is a memory load rather than a fresh boot
+                          (Hyper-V: Standard Checkpoint; Tart: tart suspend
+                          — planned).
   snapshot restore <vm> <name>
-                          Restore <vm> from snapshot <name> (M30).
-  snapshot list <vm>      List snapshots for <vm> (M30).
+                          Restore <vm> from snapshot <name>.
+  snapshot list <vm>      List snapshots for <vm>.
+  baseline export <vm> <dest-dir> [--baseline <name>]
+                          Export a baseline VM (and its snapshot tree) to
+                          <dest-dir> as a self-contained, transferable
+                          artifact. --baseline asserts the named snapshot
+                          exists before exporting.
+  baseline import <src-dir>
+                          Import a previously-exported baseline bundle.
+                          Prints the snapshot names now available.
 
 Common flags:
   --backend <auto|noop|hyperv|wsl|tart-macos|tart-linux-arm|
@@ -178,6 +191,9 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i
     of "--allow-noop-fallback":
       result.allowNoopFallback = true
+      inc i
+    of "--running":
+      result.running = true
       inc i
     of "-h", "--help":
       result.subcommand = "help"
@@ -349,13 +365,16 @@ proc cmdSnapshot(opts: CliOpts): int =
       stderr.writeLine("vm-harness: snapshot create requires <name>")
       return 2
     let snap = opts.cmd[2]
+    let mode = if opts.running: "running" else: "stopped"
     logEvent(opts.logFormat, "info",
              "snapshot create",
-             {"backend": $id, "vm": vmName, "name": snap})
-    let returnedId = backend.snapshot(vmName, snap)
+             {"backend": $id, "vm": vmName, "name": snap, "mode": mode})
+    let returnedId =
+      if opts.running: backend.snapshotRunning(vmName, snap)
+      else: backend.snapshot(vmName, snap)
     case opts.logFormat
     of lfHuman: echo returnedId
-    of lfJson:  echo($(%*{"id": returnedId}))
+    of lfJson:  echo($(%*{"id": returnedId, "mode": mode}))
     0
   of "restore":
     if opts.cmd.len < 3:
@@ -384,6 +403,50 @@ proc cmdSnapshot(opts: CliOpts): int =
     stderr.writeLine("  actions: create, restore, list")
     2
 
+proc cmdBaseline(opts: CliOpts): int =
+  ## Dispatch `baseline export <vm> <dest-dir> [--baseline <name>]`
+  ## or `baseline import <src-dir>` to the resolved backend.
+  if opts.cmd.len < 2:
+    stderr.writeLine("vm-harness: baseline requires <action> <vm-or-srcdir> [...]")
+    stderr.writeLine("  actions: export, import")
+    return 2
+  let action = opts.cmd[0]
+  let (id, backend) = resolveBackend(opts)
+  case action
+  of "export":
+    if opts.cmd.len < 3:
+      stderr.writeLine("vm-harness: baseline export requires <vm> <dest-dir>")
+      return 2
+    let vmName = opts.cmd[1]
+    let destDir = opts.cmd[2]
+    logEvent(opts.logFormat, "info",
+             "baseline export",
+             {"backend": $id, "vm": vmName, "dest": destDir,
+              "baseline": opts.baseline})
+    backend.exportBaseline(vmName, destDir, opts.baseline)
+    case opts.logFormat
+    of lfHuman: echo destDir
+    of lfJson:  echo($(%*{"dest": destDir}))
+    0
+  of "import":
+    let srcDir = opts.cmd[1]
+    logEvent(opts.logFormat, "info",
+             "baseline import",
+             {"backend": $id, "src": srcDir})
+    let imported = backend.importBaseline(srcDir)
+    case opts.logFormat
+    of lfHuman:
+      for s in imported: echo s
+    of lfJson:
+      var arr = newJArray()
+      for s in imported: arr.add(%s)
+      echo($arr)
+    0
+  else:
+    stderr.writeLine("vm-harness: unknown baseline action '" & action & "'")
+    stderr.writeLine("  actions: export, import")
+    2
+
 proc runCli*(args: seq[string]): int =
   var opts: CliOpts
   try:
@@ -403,6 +466,7 @@ proc runCli*(args: seq[string]): int =
   of "backends":  return cmdBackends(opts)
   of "shell":     return cmdShell(opts)
   of "snapshot":  return cmdSnapshot(opts)
+  of "baseline":  return cmdBaseline(opts)
   else:
     stderr.writeLine("vm-harness: unknown subcommand '" & opts.subcommand & "'")
     stderr.writeLine(HelpText)

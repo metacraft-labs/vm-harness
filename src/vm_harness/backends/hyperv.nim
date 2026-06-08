@@ -377,6 +377,184 @@ method uninstallArgvTraceShim*(b: HyperVBackend, vm: VmHandle,
   ## restores the snapshot's original binaries. We leave this as a no-op.
   discard
 
+# ---------------------------------------------------------------------------
+# Snapshot / restore / list — M30 surface, native Hyper-V Checkpoint cmdlets.
+# `snapshot` takes a snapshot of the VM in its CURRENT state (the result is
+# cold if the VM is Off, hot if Running — the Standard CheckpointType captures
+# memory + CPU + device state when the VM is running). `snapshotRunning` adds
+# a precondition assertion that the VM must be in the Running state, so the
+# caller's intent is explicit and an accidental cold snapshot is surfaced as
+# an error rather than silently returning a snapshot that won't fast-revert.
+
+method snapshot*(b: HyperVBackend, vmName, snapshotName: string): string =
+  when defined(windows):
+    let psBlock = &"""$ErrorActionPreference = 'Stop'
+Import-Module Hyper-V -ErrorAction Stop
+Checkpoint-VM -Name '{vmName.replace("'", "''")}' -SnapshotName '{snapshotName.replace("'", "''")}'
+"""
+    let cmd = @[$b.powershellLauncher, "-NoLogo", "-NoProfile",
+                "-ExecutionPolicy", "Bypass", "-Command", psBlock]
+    let r = runProcessCapture(cmd, timeoutSec = 300)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "Checkpoint-VM failed: " & r.stdout)
+    result = snapshotName
+  else:
+    raise newException(BackendUnavailableError,
+      "HyperVBackend.snapshot requires a Windows host")
+
+method snapshotRunning*(b: HyperVBackend, vmName, snapshotName: string): string =
+  ## Take a hot Standard Checkpoint that captures memory + CPU + device
+  ## state of the running VM. Fails if the VM is not in the Running state
+  ## — the caller is expected to have started the VM and waited for
+  ## guest readiness (PSDirect / SSH up) BEFORE calling this method.
+  when defined(windows):
+    let psBlock = &"""$ErrorActionPreference = 'Stop'
+Import-Module Hyper-V -ErrorAction Stop
+$vm = Get-VM -Name '{vmName.replace("'", "''")}' -ErrorAction Stop
+if ($vm.State -ne 'Running') {{
+  throw "snapshotRunning requires VM state Running; got $($vm.State)"
+}}
+$cfgType = (Get-VM -Name '{vmName.replace("'", "''")}').CheckpointType
+if ($cfgType -ne 'Standard') {{
+  # Standard checkpoints capture memory; Production checkpoints do not.
+  # Flip the per-VM CheckpointType for the duration of this call.
+  Set-VM -Name '{vmName.replace("'", "''")}' -CheckpointType Standard
+}}
+Checkpoint-VM -Name '{vmName.replace("'", "''")}' -SnapshotName '{snapshotName.replace("'", "''")}'
+"""
+    let cmd = @[$b.powershellLauncher, "-NoLogo", "-NoProfile",
+                "-ExecutionPolicy", "Bypass", "-Command", psBlock]
+    let r = runProcessCapture(cmd, timeoutSec = 300)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "Checkpoint-VM (running) failed: " & r.stdout)
+    result = snapshotName
+  else:
+    raise newException(BackendUnavailableError,
+      "HyperVBackend.snapshotRunning requires a Windows host")
+
+method restoreSnapshot*(b: HyperVBackend, vmName, snapshotName: string) =
+  when defined(windows):
+    let psBlock = &"""$ErrorActionPreference = 'Stop'
+Import-Module Hyper-V -ErrorAction Stop
+Restore-VMCheckpoint -VMName '{vmName.replace("'", "''")}' -Name '{snapshotName.replace("'", "''")}' -Confirm:$false
+"""
+    let cmd = @[$b.powershellLauncher, "-NoLogo", "-NoProfile",
+                "-ExecutionPolicy", "Bypass", "-Command", psBlock]
+    let r = runProcessCapture(cmd, timeoutSec = 300)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpRevert,
+        "Restore-VMCheckpoint failed: " & r.stdout)
+  else:
+    raise newException(BackendUnavailableError,
+      "HyperVBackend.restoreSnapshot requires a Windows host")
+
+method listSnapshots*(b: HyperVBackend, vmName: string): seq[string] =
+  when defined(windows):
+    let psBlock = &"""$ErrorActionPreference = 'Stop'
+Import-Module Hyper-V -ErrorAction Stop
+Get-VMSnapshot -VMName '{vmName.replace("'", "''")}' | ForEach-Object {{ $_.Name }}
+"""
+    let cmd = @[$b.powershellLauncher, "-NoLogo", "-NoProfile",
+                "-ExecutionPolicy", "Bypass", "-Command", psBlock]
+    let r = runProcessCapture(cmd, timeoutSec = 60)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "Get-VMSnapshot failed: " & r.stdout)
+    result = @[]
+    for line in r.stdout.splitLines():
+      let s = line.strip()
+      if s.len > 0: result.add(s)
+  else:
+    raise newException(BackendUnavailableError,
+      "HyperVBackend.listSnapshots requires a Windows host")
+
+method exportBaseline*(b: HyperVBackend, vmName, destDir: string;
+                       baselineName: string = "") =
+  ## Hyper-V's ``Export-VM`` exports the whole VM tree including every
+  ## snapshot. ``destDir`` ends up containing
+  ## ``<vmName>/Virtual Machines/*.vmcx`` for the current state and
+  ## ``<vmName>/Snapshots/*.vmcx`` + ``*.VMRS`` for each snapshot's
+  ## memory-state image. ``baselineName`` is an optional sanity-check
+  ## hint — if non-empty, the export aborts if no snapshot of that name
+  ## exists.
+  ##
+  ## See ``docs/per-backend-notes/hyperv-snapshot-benchmarks.md`` for the
+  ## cross-host transfer payload analysis (same-volume export uses
+  ## reflinks; cross-host transfer payload is ~10 GB for a typical
+  ## Windows guest + 0.7 GB per hot checkpoint).
+  when defined(windows):
+    let saneName = baselineName.replace("'", "''")
+    let preCheck =
+      if baselineName.len == 0: ""
+      else: &"""$snap = Get-VMSnapshot -VMName '{vmName.replace("'", "''")}' -Name '{saneName}' -ErrorAction SilentlyContinue
+if (-not $snap) {{ throw "exportBaseline: snapshot '{saneName}' not found on VM '{vmName.replace("'", "''")}'" }}
+"""
+    let psBlock = &"""$ErrorActionPreference = 'Stop'
+Import-Module Hyper-V -ErrorAction Stop
+{preCheck}if (-not (Test-Path '{destDir.replace("'", "''")}')) {{
+  New-Item -ItemType Directory -Path '{destDir.replace("'", "''")}' -Force | Out-Null
+}}
+$vm = Get-VM -Name '{vmName.replace("'", "''")}' -ErrorAction Stop
+if ($vm.State -ne 'Off') {{
+  Stop-VM -Name '{vmName.replace("'", "''")}' -TurnOff -Force -ErrorAction SilentlyContinue
+}}
+Export-VM -Name '{vmName.replace("'", "''")}' -Path '{destDir.replace("'", "''")}'
+"""
+    let cmd = @[$b.powershellLauncher, "-NoLogo", "-NoProfile",
+                "-ExecutionPolicy", "Bypass", "-Command", psBlock]
+    let r = runProcessCapture(cmd, timeoutSec = 1800)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "Export-VM failed: " & r.stdout)
+  else:
+    raise newException(BackendUnavailableError,
+      "HyperVBackend.exportBaseline requires a Windows host")
+
+method importBaseline*(b: HyperVBackend, srcDir: string): seq[string] =
+  ## Locate ``<srcDir>/<exported-vm-name>/Virtual Machines/*.vmcx`` and
+  ## ``Import-VM -Path <vmcx> -Copy -GenerateNewId``. Returns the snapshot
+  ## names that ended up attached to the newly-imported VM.
+  ##
+  ## Hyper-V's export layout puts the live-state config under
+  ## ``Virtual Machines/`` and one config per snapshot under
+  ## ``Snapshots/``. Importing a snapshot's vmcx would import that
+  ## snapshot's state as the VM root, dropping the snapshot tree — so
+  ## we glob explicitly under ``Virtual Machines/``.
+  when defined(windows):
+    let psBlock = &"""$ErrorActionPreference = 'Stop'
+Import-Module Hyper-V -ErrorAction Stop
+$src = '{srcDir.replace("'", "''")}'
+if (-not (Test-Path $src)) {{ throw "importBaseline: srcDir '$src' does not exist" }}
+# Find Virtual Machines/*.vmcx anywhere under $src (depth 1 or 2).
+$vmcx = Get-ChildItem -Path $src -Recurse -Filter '*.vmcx' |
+  Where-Object {{ $_.DirectoryName -match '\\Virtual Machines$' }} |
+  Select-Object -First 1
+if (-not $vmcx) {{ throw "importBaseline: no 'Virtual Machines/*.vmcx' found under $src" }}
+$importedVmRoot = Join-Path $src 'imported-vm'
+$importedVhds   = Join-Path $src 'imported-vhds'
+$importedSnaps  = Join-Path $src 'imported-snapshots'
+$imp = Import-VM -Path $vmcx.FullName -Copy -GenerateNewId `
+  -VirtualMachinePath $importedVmRoot `
+  -VhdDestinationPath $importedVhds `
+  -SnapshotFilePath   $importedSnaps
+Get-VMSnapshot -VMName $imp.Name | ForEach-Object {{ $_.Name }}
+"""
+    let cmd = @[$b.powershellLauncher, "-NoLogo", "-NoProfile",
+                "-ExecutionPolicy", "Bypass", "-Command", psBlock]
+    let r = runProcessCapture(cmd, timeoutSec = 1800)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "Import-VM failed: " & r.stdout)
+    result = @[]
+    for line in r.stdout.splitLines():
+      let s = line.strip()
+      if s.len > 0: result.add(s)
+  else:
+    raise newException(BackendUnavailableError,
+      "HyperVBackend.importBaseline requires a Windows host")
+
 method stopAndCleanup*(b: HyperVBackend, vm: VmHandle, deleteVm: bool = true) =
   ## Always ``Stop-VM -TurnOff -Force`` — never ``Save-VM`` (a
   ## saved-state revert desyncs the snapshot, per the reprobuild

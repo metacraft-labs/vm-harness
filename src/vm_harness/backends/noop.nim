@@ -166,3 +166,62 @@ method restoreSnapshot*(b: NoopBackend, vmName: string, snapshotName: string) =
 method listSnapshots*(b: NoopBackend, vmName: string): seq[string] =
   b.calls.add("listSnapshots:" & vmName)
   if b.snapshots.hasKey(vmName): b.snapshots[vmName] else: @[]
+
+method snapshotRunning*(b: NoopBackend, vmName, snapshotName: string): string =
+  ## NoopBackend has no actual VM state to capture, so the running-state
+  ## variant behaves identically to `snapshot` from the test's point of
+  ## view. The call is tagged separately so tests can verify the
+  ## orchestrator dispatched to the correct method.
+  b.calls.add("snapshotRunning:" & vmName & ":" & snapshotName)
+  if not b.snapshots.hasKey(vmName):
+    b.snapshots[vmName] = @[]
+  if snapshotName in b.snapshots[vmName]:
+    raise newVmHarnessError($b.id, lpProvisioning,
+      "snapshot '" & snapshotName & "' already exists for VM '" & vmName & "'")
+  b.snapshots[vmName].add(snapshotName)
+  snapshotName
+
+method exportBaseline*(b: NoopBackend, vmName, destDir: string;
+                       baselineName: string = "") =
+  ## In-memory export: write a one-line manifest into ``destDir`` with the
+  ## VM name and recorded snapshot list so an in-process import can
+  ## restore the state. Real backends produce binary blobs; this is just
+  ## enough fidelity to round-trip the test's expectations.
+  b.calls.add("exportBaseline:" & vmName & ":" & destDir & ":" & baselineName)
+  if baselineName.len > 0:
+    let existing = if b.snapshots.hasKey(vmName): b.snapshots[vmName] else: @[]
+    if baselineName notin existing:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "exportBaseline: baseline '" & baselineName &
+        "' not found on VM '" & vmName & "'")
+  createDir(destDir)
+  let snaps =
+    if b.snapshots.hasKey(vmName): b.snapshots[vmName].join(",")
+    else: ""
+  writeFile(destDir / "noop-baseline.manifest",
+            "vm=" & vmName & "\nsnapshots=" & snaps & "\n")
+
+method importBaseline*(b: NoopBackend, srcDir: string): seq[string] =
+  ## Read the manifest written by ``exportBaseline`` and register the
+  ## snapshot list against the imported VM name. Returns the imported
+  ## snapshot names so callers can assert round-trip fidelity.
+  b.calls.add("importBaseline:" & srcDir)
+  let manifest = srcDir / "noop-baseline.manifest"
+  if not fileExists(manifest):
+    raise newVmHarnessError($b.id, lpProvisioning,
+      "importBaseline: manifest not found at " & manifest)
+  var vm = ""
+  var snaps: seq[string] = @[]
+  for line in readFile(manifest).splitLines():
+    if line.startsWith("vm="):
+      vm = line["vm=".len .. ^1]
+    elif line.startsWith("snapshots="):
+      let rest = line["snapshots=".len .. ^1]
+      if rest.len > 0:
+        for s in rest.split(","):
+          if s.len > 0: snaps.add(s)
+  if vm.len == 0:
+    raise newVmHarnessError($b.id, lpProvisioning,
+      "importBaseline: malformed manifest (no 'vm=' line) at " & manifest)
+  b.snapshots[vm] = snaps
+  result = snaps

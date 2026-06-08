@@ -215,6 +215,60 @@ method restoreSnapshot*(b: VmBackend, vmName: string, snapshotName: string) {.ba
   raise newException(BackendUnavailableError,
     "restoreSnapshot not implemented for backend " & $b.id)
 
+method snapshotRunning*(b: VmBackend, vmName, snapshotName: string): string {.base.} =
+  ## Capture a snapshot of a **running** VM that includes the guest's
+  ## RAM + CPU + device state, not just disk state. ``restoreSnapshot``
+  ## to such a snapshot resumes the guest from the saved memory image
+  ## rather than performing a fresh boot, which on Hyper-V cuts per-revert
+  ## wall-clock from 28-46 s down to ~5 s — see
+  ## ``docs/per-backend-notes/hyperv-snapshot-benchmarks.md``.
+  ##
+  ## Backends that lack a memory-state snapshot primitive (the M30
+  ## clone-based Tart/UTM implementations, today) raise
+  ## ``BackendUnavailableError``. Tart's ``tart suspend`` + ``tart run``
+  ## is the planned implementation path (see ``docs/design.md`` running-
+  ## state snapshots note); Hyper-V uses ``Checkpoint-VM`` with the VM
+  ## in the ``Running`` state and ``CheckpointType = Standard``.
+  ##
+  ## ``vmName`` must refer to a VM that is currently running. The
+  ## returned identifier is the same opaque string ``restoreSnapshot``
+  ## accepts, identical in shape to the cold ``snapshot`` return value.
+  raise newException(BackendUnavailableError,
+    "snapshotRunning not implemented for backend " & $b.id)
+
+method exportBaseline*(b: VmBackend, vmName, destDir: string;
+                       baselineName: string = "") {.base.} =
+  ## Export a previously-provisioned baseline VM (and its snapshot tree)
+  ## to ``destDir`` as a self-contained, transferable artifact. Used by
+  ## CI artifact-caching workflows where one "warmer" host pays the
+  ## cold-boot cost once and the resulting image is then consumed by
+  ## every other runner.
+  ##
+  ## On backends that store snapshots inside a VM (Hyper-V, libvirt) the
+  ## export includes the full snapshot tree. ``baselineName`` is then an
+  ## optional sanity-check hint — if non-empty, the export operation
+  ## verifies the named snapshot exists before writing. On clone-based
+  ## backends (Tart, UTM) the export is the single named clone.
+  ##
+  ## ``destDir`` may be on the same volume as the VM's storage (in which
+  ## case the backend may use reflinks/hardlinks for VHDX or qcow2
+  ## content) or on a different volume (in which case a byte copy occurs).
+  raise newException(BackendUnavailableError,
+    "exportBaseline not implemented for backend " & $b.id)
+
+method importBaseline*(b: VmBackend, srcDir: string): seq[string] {.base.} =
+  ## Import a previously-exported baseline bundle into the receiving
+  ## backend. Returns the list of baseline / snapshot names now available
+  ## via ``revertToBaseline`` and ``restoreSnapshot``.
+  ##
+  ## The bundle layout is backend-specific (Hyper-V's ``Export-VM``
+  ## produces a folder with ``Virtual Machines/*.vmcx``; Tart's clone is
+  ## an OCI layer; libvirt uses ``virsh save`` + ``virsh restore``).
+  ## ``srcDir`` must contain the layout produced by the *same* backend's
+  ## ``exportBaseline`` call — cross-backend portability is out of scope.
+  raise newException(BackendUnavailableError,
+    "importBaseline not implemented for backend " & $b.id)
+
 method listSnapshots*(b: VmBackend, vmName: string): seq[string] {.base.} =
   raise newException(BackendUnavailableError,
     "listSnapshots not implemented for backend " & $b.id)
