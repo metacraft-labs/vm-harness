@@ -241,6 +241,34 @@ Cleanup *never raises* — `stopAndCleanup` swallows errors and logs them. Every
 - **Auth**: cirruslabs golden defaults to admin/admin password SSH. AH-branded goldens (M15-M17) may flip to key-only.
 - **Cleanup**: `tart stop <ephemeral> && tart delete <ephemeral>` in `finally`. Stale-ephemeral cleanup at session start: `tart list` and delete any `repro-vm-*` left from prior aborted runs.
 
+#### 4.3.1 Running-state snapshots (planned, future milestone)
+
+`tart suspend <vm>` writes the running VM's RAM + CPU state to disk
+and exits. A subsequent `tart run <vm>` resumes from that state in
+<1s instead of paying the 30–60s cold-boot cost. For test harnesses
+that re-clone many ephemeral VMs per session, this is a major
+latency win.
+
+The harness should expose this through:
+
+- `provisionRunning(VmName) -> RunningSnapshot` — pull/clone a golden,
+  boot it, wait for SSH-ready, then `tart suspend`. Output is a
+  named snapshot that clones in <1s.
+- `revertToRunning(Ephemeral, RunningSnapshot)` — clone from the
+  running snapshot + `tart run`. The ephemeral comes up SSH-ready
+  with no boot wait.
+
+This pairs with the four-layer image taxonomy described in
+[metacraft/ah-vm-image-templates/docs/layered-image-architecture.md](https://github.com/agent-harbor/ah-vm-image-templates/blob/main/docs/layered-image-architecture.md):
+every layer is published in two flavors (`<name>` and
+`<name>-running`); vm-harness consumes whichever the caller asks for.
+
+The same shape applies to Tart's Linux-ARM golden and the M15 Rust
+port. UTM, libvirt/QEMU support equivalent operations via different
+primitives; the trait-level method names should be backend-agnostic.
+
+Tracked as a future vm-harness milestone (not yet numbered).
+
 ### 4.4 UTM (HostPlatform: hpMacosArm; Guests: goWindows ARM64)
 
 - **Transport**: SSH over UTM's user-mode networking. `utmctl ip <name>` to get the IP. Windows OpenSSH on the guest side.
