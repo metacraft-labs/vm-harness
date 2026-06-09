@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+      - name: Run tests
+        # The nimble test task runs ALL tests in vm_harness.nimble. On
+        # ubuntu-latest, the cross-platform suite runs in full; the
+        # Tart / UTM / Hyper-V backend-specific tests auto-skip
+        # because their CLIs aren't present. The NoopBackend lifecycle,
+        # parsers, output envelope, auto selection, and snapshot
+        # primitives ARE exercised on every push.
+        run: nix develop --command nimble test
+
+  build-cli:
+    name: Build CLI (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+      - name: Build CLI binary
+        run: nix develop --command nimble buildCli
+      - name: Build benchmark binary
+        # The bench is backend-agnostic at the build level (auto-skips
+        # unimplemented backends at runtime); ensuring it links proves
+        # the whole snapshot / restoreSnapshot / snapshotRunning /
+        # exportBaseline / importBaseline / removeSnapshot surface
+        # compiles cleanly.
+        run: nix develop --command nimble buildBench
+
+  nix-build:
+    name: Nix Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+      - name: Build default package
+        run: nix build .#default
