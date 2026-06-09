@@ -49,7 +49,13 @@
           src = ./.;
           nativeBuildInputs = [ pkgs.nim ];
           buildPhase = ''
-            nim c --hints:off --opt:speed -o:vm-harness src/vm_harness/cli.nim
+            # Nix sandboxes HOME to /homeless-shelter — Nim's default
+            # nimcache at ~/.cache/nim/ is not writable. Direct nimcache
+            # to the build dir (always writable) so the build doesn't
+            # fail with `cannot create directory: /homeless-shelter/...`.
+            nim c --hints:off --opt:speed \
+              --nimcache:$TMPDIR/nimcache \
+              -o:vm-harness src/vm_harness/cli.nim
           '';
           installPhase = ''
             mkdir -p $out/bin $out/share/vm-harness/guest-scripts
