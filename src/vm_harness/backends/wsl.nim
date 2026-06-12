@@ -28,6 +28,7 @@ when defined(windows):
 import ../types
 import ../auto
 import ../output
+import ../serial
 import ./process_helpers
 
 type
@@ -350,10 +351,229 @@ method stopAndCleanup*(b: WslBackend, vm: VmHandle, deleteVm: bool = true) =
       b.terminateDistro(vm.name)
       if deleteVm:
         b.unregisterDistro(vm.name)
-        let dir = b.installRootDir / vm.name
-        if dirExists(dir):
-          try: removeDir(dir)
+        let dir = vm.extra.getOrDefault("installDir")
+        let effectiveDir = if dir.len > 0: dir else: b.installRootDir / vm.name
+        if dirExists(effectiveDir):
+          try: removeDir(effectiveDir)
           except CatchableError: discard
+    except CatchableError:
+      discard
+  else:
+    discard
+
+# ---------------------------------------------------------------------------
+# M1.5 — bootFromMedia + serial-stream primitives for WSL2.
+#
+# WSL2 has no traditional serial console; we emulate the contract by
+# spawning ``wsl -d <distro> --user root -- /bin/sh`` and treating its
+# stdout/stderr as the "serial" stream. ``serialSend`` writes to its
+# stdin. The boot-test driver (R1 Path A) uses this to interactively
+# probe the systemd-mode distro for ``systemctl is-system-running`` etc.
+#
+# The R1 ``bootFromMedia`` pattern (port of recipes/reproos-ref-iso/
+# boot-test.py phase 1):
+#  1. ``wsl --import <name> <dir> <rootfs.tar>``.
+#  2. Run a post-import setup script (apt install systemd + write
+#     /etc/wsl.conf with [boot] systemd=true).
+#  3. ``wsl --terminate <name>`` so the next exec re-enters as systemd
+#     PID 1.
+# The VmHandle's ``extra`` table carries the post-import-setup script
+# under key ``postImportSetup`` when the caller supplies it via
+# BootMediaSpec.extra["postImportSetup"]; otherwise the default
+# expected.json sequence is used.
+
+const DefaultBootDistroPrefix* = "repro-test-boot-wsl"
+const DefaultPostImportSetup* =
+  "apt-get update && " &
+  "apt-get install -y --no-install-recommends systemd dbus systemd-sysv && " &
+  "printf '%s\\n' '[boot]' 'systemd=true' > /etc/wsl.conf"
+
+type
+  WslSerialStream* = ref object of SerialStream
+    buf*: SerialLineBuffer
+    shellProc: Process
+    reader: PipeReader
+    wslBackend: WslBackend
+
+proc newBootDistroName(prefix: string = DefaultBootDistroPrefix): string =
+  result = prefix & "-" & toHex(int64(epochTime() * 1000.0) and 0xFFFFFF'i64, 6).toLowerAscii()
+
+method bootFromMedia*(b: WslBackend, spec: BootMediaSpec): VmHandle =
+  ## Implements the R1 Path A boot pattern: import rootfs tarball, apt-
+  ## install systemd + write wsl.conf, terminate. The returned VmHandle
+  ## points at a distro whose next ``wsl -d <name>`` exec will boot
+  ## under systemd PID 1. Use ``captureSerial`` next.
+  when defined(windows):
+    if spec.kind != bmkRootfsTar:
+      raise newException(BackendUnavailableError,
+        "WslBackend.bootFromMedia only supports bmkRootfsTar; got " &
+        $spec.kind)
+    if spec.mediaPath.len == 0:
+      raise newException(ValueError, "BootMediaSpec.mediaPath is empty")
+    if not fileExists(spec.mediaPath):
+      raise newException(IOError,
+        "BootMediaSpec.mediaPath does not exist: " & spec.mediaPath)
+    let distroName = if spec.name.len > 0: spec.name else: newBootDistroName()
+    if not distroName.startsWith("repro-test-boot-"):
+      raise newException(ValueError,
+        "WslBackend.bootFromMedia: distro name must start with " &
+        "'repro-test-boot-' for safety sweep coverage (got '" &
+        distroName & "')")
+    let installDir = b.installRootDir / distroName
+    createDir(installDir)
+    let importInv = WslImportInvocation(distroName: distroName,
+                                        installDir: installDir,
+                                        rootfsTarball: spec.mediaPath,
+                                        version: 2)
+    let rImport = runProcessCapture(buildWslImportArgs(importInv),
+                                    timeoutSec = 300)
+    if rImport.exitCode != 0:
+      try:
+        discard runProcessCapture(buildWslUnregisterArgs(distroName),
+                                  timeoutSec = 60)
+        if dirExists(installDir): removeDir(installDir)
+      except CatchableError: discard
+      raise newVmHarnessError($b.id, lpStartup,
+        "WslBackend.bootFromMedia: wsl --import failed: " & rImport.stdout)
+
+    # Run the post-import setup script via /bin/sh -c. We accept it as
+    # the BootMediaSpec.extra["postImportSetup"] or default to the
+    # canonical R1 sequence.
+    let setupScript = if spec.extra.getOrDefault("postImportSetup").len > 0:
+                       spec.extra["postImportSetup"]
+                     else:
+                       DefaultPostImportSetup
+    let setupInv = WslExecInvocation(
+      distro: distroName,
+      user: "root",
+      shell: "/bin/sh",
+      command: setupScript)
+    # apt-get update + install can take several minutes on a slow link.
+    let rSetup = runProcessCapture(buildWslExecArgs(setupInv),
+                                   timeoutSec = 600)
+    if rSetup.exitCode != 0:
+      try:
+        discard runProcessCapture(buildWslTerminateArgs(distroName),
+                                  timeoutSec = 30)
+        discard runProcessCapture(buildWslUnregisterArgs(distroName),
+                                  timeoutSec = 60)
+        if dirExists(installDir): removeDir(installDir)
+      except CatchableError: discard
+      raise newVmHarnessError($b.id, lpStartup,
+        "WslBackend.bootFromMedia: post-import setup failed (exit " &
+        $rSetup.exitCode & "): " & rSetup.stdout)
+
+    # Sanity-check /etc/wsl.conf contains systemd=true.
+    let checkInv = WslExecInvocation(
+      distro: distroName, user: "root", shell: "/bin/sh",
+      command: "cat /etc/wsl.conf")
+    let rCheck = runProcessCapture(buildWslExecArgs(checkInv),
+                                   timeoutSec = 15)
+    if "systemd=true" notin rCheck.stdout:
+      try:
+        discard runProcessCapture(buildWslTerminateArgs(distroName),
+                                  timeoutSec = 30)
+        discard runProcessCapture(buildWslUnregisterArgs(distroName),
+                                  timeoutSec = 60)
+        if dirExists(installDir): removeDir(installDir)
+      except CatchableError: discard
+      raise newVmHarnessError($b.id, lpStartup,
+        "WslBackend.bootFromMedia: /etc/wsl.conf did not contain " &
+        "systemd=true after setup: " & rCheck.stdout)
+
+    # Terminate so the next launch picks up the new wsl.conf.
+    discard runProcessCapture(buildWslTerminateArgs(distroName),
+                              timeoutSec = 30)
+    var extra = initTable[string, string]()
+    extra["installDir"] = installDir
+    extra["serialLogPath"] = if spec.serialLogPath.len > 0: spec.serialLogPath
+                             else: getTempDir() / "repro-boot-harness" /
+                                   (distroName & ".serial.log")
+    result = VmHandle(
+      backend: b,
+      name: distroName,
+      baseline: "<boot-from-media>",
+      ipAddress: none(string),
+      sshPort: 0,
+      sshUser: "root",
+      sshAuth: SshAuth(kind: saNone),
+      extra: extra)
+  else:
+    raise newException(BackendUnavailableError,
+      "WslBackend.bootFromMedia requires a Windows host")
+
+method captureSerial*(b: WslBackend, vm: VmHandle): SerialStream =
+  ## Spawn an interactive ``wsl -d <distro> --user root -- /bin/sh`` and
+  ## treat its stdout (interleaved with stderr) as the serial stream.
+  ## ``serialSend`` writes to its stdin.
+  when defined(windows):
+    let logPath = vm.extra.getOrDefault("serialLogPath")
+    if logPath.len > 0:
+      try: createDir(parentDir(logPath))
+      except CatchableError: discard
+    # We do NOT use ``--exec`` because under systemd-mode WSL the exec
+    # path bypasses the systemd init we just enabled. The default
+    # ``wsl -d <name> -- <cmd>`` enters via the systemd-mode session.
+    let argv = @["wsl.exe", "-d", vm.name, "--user", "root", "--",
+                 "/bin/sh"]
+    let p = startProcess(argv[0], args = argv[1 .. ^1],
+                         options = {poUsePath, poStdErrToStdOut})
+    let buf = newSerialLineBuffer(logPath)
+    let reader = startPipeReader(p, buf)
+    let stream = WslSerialStream(
+      vm: vm,
+      logPath: logPath,
+      buf: buf,
+      shellProc: p,
+      reader: reader,
+      wslBackend: b)
+    result = stream
+  else:
+    raise newException(BackendUnavailableError,
+      "WslBackend.captureSerial requires a Windows host")
+
+method expectLine*(b: WslBackend, stream: SerialStream,
+                  pattern: string, timeoutSec: int = 60): SerialMatch =
+  when defined(windows):
+    let s = WslSerialStream(stream)
+    return expectLineImpl(s.buf, pattern, timeoutSec * 1000, 100, nil)
+  else:
+    raise newException(BackendUnavailableError,
+      "WslBackend.expectLine requires a Windows host")
+
+method serialSend*(b: WslBackend, stream: SerialStream, text: string) =
+  when defined(windows):
+    let s = WslSerialStream(stream)
+    if s.shellProc == nil:
+      raise newException(ValueError, "serialSend: stream not started")
+    try:
+      let inStream = s.shellProc.inputStream
+      if inStream != nil:
+        inStream.write(text)
+        inStream.flush()
+    except CatchableError as e:
+      raise newVmHarnessError($b.id, lpExec,
+        "WslBackend.serialSend failed: " & e.msg)
+  else:
+    raise newException(BackendUnavailableError,
+      "WslBackend.serialSend requires a Windows host")
+
+method closeSerial*(b: WslBackend, stream: SerialStream) =
+  when defined(windows):
+    let s = WslSerialStream(stream)
+    try:
+      if s.shellProc != nil and s.shellProc.running:
+        try: s.shellProc.terminate()
+        except CatchableError: discard
+        try: discard s.shellProc.waitForExit(timeout = 3000)
+        except CatchableError: discard
+      if s.reader != nil:
+        try: stopPipeReader(s.reader)
+        except CatchableError: discard
+      if s.shellProc != nil:
+        try: s.shellProc.close()
+        except CatchableError: discard
+      s.buf.close()
     except CatchableError:
       discard
   else:

@@ -21,6 +21,8 @@ import ./vm_harness/output
 import ./vm_harness/auto
 import ./vm_harness/orchestrator
 import ./vm_harness/guest_scripts
+import ./vm_harness/serial
+import ./vm_harness/cloud_init_seed
 import ./vm_harness/backends/noop
 import ./vm_harness/backends/process_helpers
 import ./vm_harness/backends/hyperv
@@ -34,6 +36,8 @@ export output
 export auto
 export orchestrator
 export guest_scripts
+export serial
+export cloud_init_seed
 export noop
 export process_helpers
 export hyperv

@@ -38,6 +38,7 @@ when defined(windows):
 import ../types
 import ../auto
 import ../output
+import ../serial
 import ./process_helpers
 
 type
@@ -593,25 +594,402 @@ Get-VMSnapshot -VMName $imp.Name | ForEach-Object {{ $_.Name }}
     raise newException(BackendUnavailableError,
       "HyperVBackend.importBaseline requires a Windows host")
 
-method stopAndCleanup*(b: HyperVBackend, vm: VmHandle, deleteVm: bool = true) =
-  ## Always ``Stop-VM -TurnOff -Force`` — never ``Save-VM`` (a
-  ## saved-state revert desyncs the snapshot, per the reprobuild
-  ## runner's safety comment). Never raises.
+# ---------------------------------------------------------------------------
+# M1.5 — bootFromMedia + serial-stream primitives for Hyper-V.
+#
+# Distinct from the baseline-oriented revertToBaseline lifecycle: these
+# primitives spin up a transient Gen-2 UEFI VM around a VHDX or ISO,
+# wire COM1 to a named pipe, and stream the serial bytes through a
+# background reader process. The implementation is the Nim port of
+# reprobuild/tools/boot-harness/{hyperv/new-boot-vm.ps1, hyperv/start-
+# boot-vm.ps1, hyperv/stop-boot-vm.ps1, lib/backends/hyperv.py}.
+#
+# Safety: every transient VM name MUST start with ``repro-test-boot-``
+# so the standing sweep covers it (matches the R0 / R1 contract).
+
+const BootVmNamePrefix* = "repro-test-boot-"
+
+type
+  HyperVSerialStream* = ref object of SerialStream
+    ## Hyper-V concrete serial stream.
+    buf*: SerialLineBuffer
+    pipeName*: string                  ## \\.\pipe\<this>
+    serialProc: Process                ## background reader/writer process
+    reader: PipeReader                 ## dedicated reader thread
+    serialBackend: HyperVBackend       ## back-ref so close() can call stop-boot-vm
+
+proc psQuote(s: string): string {.inline.} =
+  ## Single-quote-escape a string for PowerShell single-quoted interp.
+  s.replace("'", "''")
+
+proc newBootVmName(prefix: string = BootVmNamePrefix): string =
+  ## Generate a fresh ``repro-test-boot-<hex>`` name. The hex suffix
+  ## uses the low bits of epochTime() so two concurrent harness sessions
+  ## don't collide.
+  result = prefix & toHex(int64(epochTime() * 1000.0) and 0xFFFFFF'i64, 6).toLowerAscii()
+
+proc buildNewBootVmCommand(b: HyperVBackend, spec: BootMediaSpec,
+                           vmName, pipeName, scratchVhdxPath: string): string =
+  ## Render the PowerShell that creates the transient Gen-2 UEFI VM,
+  ## wires COM1 to the named pipe, attaches the boot media + optional
+  ## seed ISO, and (for non-DryRun) leaves the VM Off ready for
+  ## Start-VM. Returns the PS source as one string ready for
+  ## ``-Command``.
+  let kindStr =
+    case spec.kind
+    of bmkVhdx: "vhdx"
+    of bmkIso:  "iso"
+    of bmkQcow2: "vhdx" # qcow2 isn't directly bootable on Hyper-V; the consumer
+                      # must convert to VHDX first and pass mediaPath as the VHDX.
+                      # We accept it here so the caller's mistake produces a
+                      # clear "file not found" error rather than a type panic.
+    of bmkRootfsTar:
+      raise newException(BackendUnavailableError,
+        "HyperVBackend.bootFromMedia: bmkRootfsTar is WSL-specific; " &
+        "use WslBackend for tarball boots")
+  let memMB = if spec.memoryMB > 0: spec.memoryMB else: 2048
+  let cpus  = if spec.cpus > 0: spec.cpus else: 2
+  let generation = if spec.generation > 0: spec.generation else: 2
+  let secureBoot = if spec.secureBootEnabled: "On" else: "Off"
+  let mediaPath = spec.mediaPath
+  let seedIsoPath = spec.secondaryIsoPath
+  result = &"""$ErrorActionPreference = 'Stop'
+Import-Module Hyper-V -ErrorAction Stop
+$vmName  = '{psQuote(vmName)}'
+$pipe    = '\\.\pipe\{psQuote(pipeName)}'
+$mediaPath = '{psQuote(mediaPath)}'
+$seedIso = '{psQuote(seedIsoPath)}'
+$scratchVhdx = '{psQuote(scratchVhdxPath)}'
+$gen     = {generation}
+$memMB   = {memMB}
+$cpus    = {cpus}
+$kind    = '{kindStr}'
+$secureBoot = '{secureBoot}'
+
+if (-not $vmName.StartsWith('{psQuote(BootVmNamePrefix)}')) {{
+  throw "SAFETY: refusing to create boot VM with name $vmName (must start with '{psQuote(BootVmNamePrefix)}')"
+}}
+if (Get-VM -Name $vmName -ErrorAction SilentlyContinue) {{
+  throw "boot VM $vmName already exists; refusing to clobber"
+}}
+
+# Resolve boot disk: for VHDX kind the mediaPath IS the boot disk; for ISO
+# kind we create a transient blank dynamic VHDX as the boot disk and
+# attach the ISO as the first boot device.
+$bootVhdx = if ($kind -eq 'vhdx') {{ $mediaPath }} else {{ $scratchVhdx }}
+
+if ($kind -ne 'vhdx') {{
+  if (-not (Test-Path -LiteralPath $mediaPath)) {{
+    throw "bmkIso requires mediaPath to exist: $mediaPath"
+  }}
+  $dir = Split-Path -Parent $scratchVhdx
+  if (-not (Test-Path $dir)) {{ New-Item -ItemType Directory -Force -Path $dir | Out-Null }}
+  New-VHD -Path $scratchVhdx -SizeBytes 8GB -Dynamic | Out-Null
+}} else {{
+  if (-not (Test-Path -LiteralPath $bootVhdx)) {{
+    throw "bmkVhdx requires mediaPath (used as boot disk) to exist: $bootVhdx"
+  }}
+}}
+
+$mem = [int64]$memMB * 1MB
+New-VM -Name $vmName -Generation $gen -MemoryStartupBytes $mem -VHDPath $bootVhdx | Out-Null
+if ($cpus -gt 0) {{ Set-VMProcessor -VMName $vmName -Count $cpus }}
+# Isolate: boot-from-media VMs don't need network.
+try {{ Get-VMNetworkAdapter -VMName $vmName -ErrorAction SilentlyContinue | Remove-VMNetworkAdapter -ErrorAction SilentlyContinue }} catch {{}}
+if ($gen -eq 2) {{
+  try {{ Set-VMFirmware -VMName $vmName -EnableSecureBoot $secureBoot }}
+  catch {{ Write-Warning "Set-VMFirmware -EnableSecureBoot $secureBoot failed: $($_.Exception.Message)" }}
+}}
+
+Set-VMComPort -VMName $vmName -Number 1 -Path $pipe
+
+# Path B (ISO) attaches the ISO as DVD #1 + first boot device.
+if ($kind -eq 'iso') {{
+  Add-VMDvdDrive -VMName $vmName -Path $mediaPath
+  if ($gen -eq 2) {{
+    $dvd = Get-VMDvdDrive -VMName $vmName | Select-Object -First 1
+    if ($dvd) {{ Set-VMFirmware -VMName $vmName -FirstBootDevice $dvd }}
+  }}
+}}
+
+# Optional cloud-init seed ISO as secondary DVD; ensure the VHDX is first
+# in the boot order so we boot the disk, not the seed.
+if ($seedIso -and ($seedIso.Length -gt 0)) {{
+  if (-not (Test-Path -LiteralPath $seedIso)) {{ throw "secondaryIsoPath not found: $seedIso" }}
+  Add-VMDvdDrive -VMName $vmName -Path $seedIso
+  if ($gen -eq 2 -and $kind -eq 'vhdx') {{
+    $diskDrive = Get-VMHardDiskDrive -VMName $vmName | Select-Object -First 1
+    if ($diskDrive) {{ Set-VMFirmware -VMName $vmName -FirstBootDevice $diskDrive }}
+  }}
+}}
+Write-Host "CREATED $vmName"
+"""
+
+proc buildStartBootVmAndPipeReaderCommand(pipeName, vmName: string): string =
+  ## PS script that starts the VM (idempotent) and forwards the named
+  ## pipe to its OWN stdout (and stdin to the pipe). The Nim-side reader
+  ## thread captures stdout and tees to the host-side log; the
+  ## PowerShell side never touches the disk so there's no double-open
+  ## hazard.
+  &"""$ErrorActionPreference = 'Stop'
+$vmName   = '{psQuote(vmName)}'
+$pipeName = '{psQuote(pipeName)}'
+
+if (-not $vmName.StartsWith('{psQuote(BootVmNamePrefix)}')) {{
+  throw "SAFETY: refusing to start boot VM $vmName"
+}}
+$vm = Get-VM -Name $vmName -ErrorAction Stop
+if ($vm.State -ne 'Running') {{ Start-VM -Name $vmName | Out-Null }}
+
+$pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', $pipeName,
+  [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::Asynchronous)
+$pipe.Connect(30000)
+
+$stdout = [Console]::OpenStandardOutput()
+$stdin  = [Console]::OpenStandardInput()
+
+$buf = New-Object byte[] 4096
+
+$ps = [PowerShell]::Create()
+$null = $ps.AddScript({{
+  param($pipe, $stdin)
+  try {{
+    $buf = New-Object byte[] 4096
+    while ($true) {{
+      $n = $stdin.Read($buf, 0, $buf.Length)
+      if ($n -le 0) {{ break }}
+      $pipe.Write($buf, 0, $n)
+      $pipe.Flush()
+    }}
+  }} catch {{}}
+}}).AddArgument($pipe).AddArgument($stdin)
+$async = $ps.BeginInvoke()
+
+try {{
+  while ($true) {{
+    $n = $pipe.Read($buf, 0, $buf.Length)
+    if ($n -le 0) {{ break }}
+    $stdout.Write($buf, 0, $n); $stdout.Flush()
+  }}
+}} catch {{}}
+finally {{
+  try {{ $pipe.Dispose() }} catch {{}}
+  try {{ $ps.Stop(); $ps.Dispose() }} catch {{}}
+}}
+"""
+
+proc spawnPwshBackground(b: HyperVBackend, psScript: string): Process =
+  ## Spawn a background ``pwsh -Command`` process so the Nim side can
+  ## read stdout (the tailed serial bytes) and write stdin (guest input).
+  ## We deliberately do NOT use ``poStdErrToStdOut`` so stderr surfaces
+  ## as a diagnostic on assertion failure.
+  let argv = @[$b.powershellLauncher, "-NoLogo", "-NoProfile",
+               "-ExecutionPolicy", "Bypass", "-NonInteractive",
+               "-Command", psScript]
+  result = startProcess(argv[0], args = argv[1 .. ^1],
+                        options = {poUsePath, poStdErrToStdOut})
+
+method bootFromMedia*(b: HyperVBackend, spec: BootMediaSpec): VmHandle =
+  ## Create a transient Gen-2 UEFI VM around the given VHDX (kind=vhdx)
+  ## or ISO (kind=iso). The VM is left in the Off state; call
+  ## ``captureSerial`` to start it AND begin tailing COM1.
   when defined(windows):
+    if spec.kind == bmkRootfsTar:
+      raise newException(BackendUnavailableError,
+        "HyperVBackend.bootFromMedia does not support bmkRootfsTar; " &
+        "use WslBackend for tarball boots")
+    if spec.mediaPath.len == 0:
+      raise newException(ValueError, "BootMediaSpec.mediaPath is empty")
+    if not fileExists(spec.mediaPath):
+      raise newException(IOError,
+        "BootMediaSpec.mediaPath does not exist: " & spec.mediaPath)
+    let vmName = if spec.name.len > 0: spec.name else: newBootVmName()
+    if not vmName.startsWith(BootVmNamePrefix):
+      raise newException(ValueError,
+        "BootMediaSpec.name must start with '" & BootVmNamePrefix &
+        "' (got '" & vmName & "')")
+    let pipeName = if spec.serialPipeName.len > 0: spec.serialPipeName
+                   else: vmName & "-com1"
+    let baseTmp = getTempDir() / "repro-boot-harness" / vmName
+    createDir(baseTmp)
+    let scratchVhdx = baseTmp / (vmName & ".scratch.vhdx")
+    let psCreate = buildNewBootVmCommand(b, spec, vmName, pipeName, scratchVhdx)
+    let cmd = @[$b.powershellLauncher, "-NoLogo", "-NoProfile",
+                "-ExecutionPolicy", "Bypass", "-Command", psCreate]
+    let r = runProcessCapture(cmd, timeoutSec = 180)
+    if r.exitCode != 0:
+      # Best-effort cleanup of any half-built VM + scratch dir.
+      try:
+        let psCleanup = &"""try {{ Remove-VM -Name '{psQuote(vmName)}' -Force -ErrorAction SilentlyContinue | Out-Null }} catch {{}}"""
+        discard runProcessCapture(@[$b.powershellLauncher, "-NoLogo",
+                                    "-NoProfile", "-ExecutionPolicy",
+                                    "Bypass", "-Command", psCleanup],
+                                  timeoutSec = 30)
+        if dirExists(baseTmp): removeDir(baseTmp)
+      except CatchableError: discard
+      raise newVmHarnessError($b.id, lpStartup,
+        "HyperVBackend.bootFromMedia: VM creation failed: " & r.stdout)
+    var extra = initTable[string, string]()
+    extra["pipeName"] = pipeName
+    extra["scratchVhdx"] = scratchVhdx
+    extra["bootMediaPath"] = spec.mediaPath
+    extra["seedIsoPath"] = spec.secondaryIsoPath
+    extra["scratchDir"] = baseTmp
+    extra["serialLogPath"] = if spec.serialLogPath.len > 0: spec.serialLogPath
+                             else: baseTmp / (vmName & ".serial.log")
+    result = VmHandle(
+      backend: b,
+      name: vmName,
+      baseline: "<boot-from-media>",
+      ipAddress: none(string),
+      sshPort: 0,
+      sshUser: "",
+      sshAuth: SshAuth(kind: saNone),
+      extra: extra)
+  else:
+    raise newException(BackendUnavailableError,
+      "HyperVBackend.bootFromMedia requires a Windows host")
+
+method captureSerial*(b: HyperVBackend, vm: VmHandle): SerialStream =
+  ## Start the VM and spawn a background ``pwsh`` that tails the named
+  ## pipe to its stdout (and forwards its stdin to the pipe). The Nim
+  ## side reads/writes the child's stdio. Returns a HyperVSerialStream
+  ## that ``expectLine`` / ``serialSend`` / ``closeSerial`` operate on.
+  when defined(windows):
+    let pipeName = vm.extra.getOrDefault("pipeName")
+    if pipeName.len == 0:
+      raise newException(ValueError,
+        "captureSerial: VmHandle missing pipeName (was it created via " &
+        "bootFromMedia?)")
+    let logPath = vm.extra.getOrDefault("serialLogPath")
+    let psStart = buildStartBootVmAndPipeReaderCommand(pipeName, vm.name)
+    let p = spawnPwshBackground(b, psStart)
+    let buf = newSerialLineBuffer(logPath)
+    let reader = startPipeReader(p, buf)
+    let stream = HyperVSerialStream(
+      vm: vm,
+      logPath: logPath,
+      buf: buf,
+      pipeName: pipeName,
+      serialProc: p,
+      reader: reader,
+      serialBackend: b)
+    result = stream
+  else:
+    raise newException(BackendUnavailableError,
+      "HyperVBackend.captureSerial requires a Windows host")
+
+method expectLine*(b: HyperVBackend, stream: SerialStream,
+                  pattern: string, timeoutSec: int = 60): SerialMatch =
+  when defined(windows):
+    let s = HyperVSerialStream(stream)
+    # The reader thread feeds bytes into ``s.buf`` asynchronously; we
+    # just poll the buffer here without ever blocking on the pipe.
+    return expectLineImpl(s.buf, pattern, timeoutSec * 1000, 100, nil)
+  else:
+    raise newException(BackendUnavailableError,
+      "HyperVBackend.expectLine requires a Windows host")
+
+method serialSend*(b: HyperVBackend, stream: SerialStream, text: string) =
+  when defined(windows):
+    let s = HyperVSerialStream(stream)
+    if s.serialProc == nil:
+      raise newException(ValueError, "serialSend: stream not started")
     try:
-      let psBlock = &"""try {{
+      let inStream = s.serialProc.inputStream
+      if inStream != nil:
+        inStream.write(text)
+        inStream.flush()
+    except CatchableError as e:
+      raise newVmHarnessError($b.id, lpExec,
+        "HyperVBackend.serialSend failed: " & e.msg)
+  else:
+    raise newException(BackendUnavailableError,
+      "HyperVBackend.serialSend requires a Windows host")
+
+method closeSerial*(b: HyperVBackend, stream: SerialStream) =
+  when defined(windows):
+    let s = HyperVSerialStream(stream)
+    try:
+      if s.serialProc != nil and s.serialProc.running:
+        try: s.serialProc.terminate()
+        except CatchableError: discard
+        try: discard s.serialProc.waitForExit(timeout = 3000)
+        except CatchableError: discard
+      if s.reader != nil:
+        try: stopPipeReader(s.reader)
+        except CatchableError: discard
+      if s.serialProc != nil:
+        try: s.serialProc.close()
+        except CatchableError: discard
+      s.buf.close()
+    except CatchableError:
+      discard
+  else:
+    discard
+
+# stopAndCleanup override specifically for boot-from-media handles: when
+# the VmHandle was created by ``bootFromMedia`` we need to tear down the
+# TRANSIENT VM (whose name is the per-call generated ``repro-test-boot-
+# <hex>``), NOT the long-lived ``b.vmName`` the baseline-mode override
+# targets. We detect the boot-from-media case via vm.baseline ==
+# "<boot-from-media>" and route accordingly. The previous override stays
+# the default for baseline handles.
+
+# The {.base.} method already exists; we replace it with a dispatching
+# version. Nim's multi-method resolution allows us to keep two overrides
+# distinguished by the VmHandle.baseline sentinel.
+
+proc destroyBootVm(b: HyperVBackend, vm: VmHandle) =
+  when defined(windows):
+    let scratchDir = vm.extra.getOrDefault("scratchDir")
+    let scratchVhdx = vm.extra.getOrDefault("scratchVhdx")
+    let psBlock = &"""try {{
   Import-Module Hyper-V -ErrorAction Stop
-  $vm = Get-VM -Name '{b.vmName.replace("'", "''")}' -ErrorAction SilentlyContinue
+  $vm = Get-VM -Name '{psQuote(vm.name)}' -ErrorAction SilentlyContinue
+  if ($vm) {{
+    if ($vm.State -ne 'Off') {{ Stop-VM -Name '{psQuote(vm.name)}' -TurnOff -Force -ErrorAction SilentlyContinue | Out-Null }}
+    Remove-VM -Name '{psQuote(vm.name)}' -Force -ErrorAction SilentlyContinue | Out-Null
+  }}
+}} catch {{ Write-Host "destroyBootVm swallowed: $_" }}
+"""
+    let cmd = @[$b.powershellLauncher, "-NoLogo", "-NoProfile",
+                "-ExecutionPolicy", "Bypass", "-Command", psBlock]
+    try:
+      discard runProcessCapture(cmd, timeoutSec = 120)
+    except CatchableError: discard
+    if scratchVhdx.len > 0 and fileExists(scratchVhdx):
+      try: removeFile(scratchVhdx)
+      except CatchableError: discard
+    if scratchDir.len > 0 and dirExists(scratchDir):
+      try: removeDir(scratchDir)
+      except CatchableError: discard
+
+method stopAndCleanup*(b: HyperVBackend, vm: VmHandle, deleteVm: bool = true) =
+  ## Dispatches based on whether the VmHandle was minted by
+  ## ``bootFromMedia`` (baseline sentinel ``<boot-from-media>``, transient
+  ## VM) or by ``revertToBaseline`` (long-lived ``b.vmName``). The
+  ## boot-from-media path force-stops AND removes the transient VM and
+  ## its scratch dir; the baseline path only force-stops (the snapshot
+  ## tree must survive for the next revert).
+  when defined(windows):
+    if vm.baseline == "<boot-from-media>":
+      destroyBootVm(b, vm)
+    else:
+      try:
+        let psBlock = &"""try {{
+  Import-Module Hyper-V -ErrorAction Stop
+  $vm = Get-VM -Name '{psQuote(b.vmName)}' -ErrorAction SilentlyContinue
   if ($vm -and $vm.State -ne 'Off') {{
-    Stop-VM -Name '{b.vmName.replace("'", "''")}' -TurnOff -Force -ErrorAction SilentlyContinue
+    Stop-VM -Name '{psQuote(b.vmName)}' -TurnOff -Force -ErrorAction SilentlyContinue
   }}
 }} catch {{ Write-Host "stopAndCleanup swallowed: $_" }}
 """
-      let cmd = @[$b.powershellLauncher, "-NoLogo", "-NoProfile",
-                  "-ExecutionPolicy", "Bypass", "-Command", psBlock]
-      discard runProcessCapture(cmd, timeoutSec = 120)
-    except CatchableError:
-      discard
+        let cmd = @[$b.powershellLauncher, "-NoLogo", "-NoProfile",
+                    "-ExecutionPolicy", "Bypass", "-Command", psBlock]
+        discard runProcessCapture(cmd, timeoutSec = 120)
+      except CatchableError:
+        discard
   else:
     discard
 

@@ -112,6 +112,55 @@ type
     hostPlatform*: HostPlatform
     supportedGuests*: set[GuestOs]
 
+  # -------------------------------------------------------------------------
+  # M1.5: bootFromMedia + serial-stream primitives.
+  #
+  # Distinct from the BaselineSpec / revertToBaseline contract: BaselineSpec
+  # provisions a long-lived known-good guest and revert spins up a fast clone
+  # ready for ``execInGuest``. BootMediaSpec spins up a TRANSIENT VM around
+  # a specific bootable artifact (VHDX / ISO / rootfs tarball) to capture
+  # serial output during OS bring-up itself — before the guest is "ready"
+  # enough for ``execInGuest`` to work. Motivated by ReproOS-MVP R0/R1: the
+  # campaign needs to assert on systemd's serial output during a real boot.
+
+  BootMediaKind* = enum
+    bmkIso = "iso"             ## boot from CD/DVD (Hyper-V SCSI DVD drive)
+    bmkVhdx = "vhdx"           ## boot from existing VHDX/VHD (no baseline)
+    bmkQcow2 = "qcow2"         ## boot from qcow2 (libvirt/QEMU)
+    bmkRootfsTar = "rootfs-tar" ## boot from tarball rootfs (WSL2)
+
+  BootMediaSpec* = object
+    ## Direct-boot media for testing OS bring-up itself (not test-in-guest).
+    ## Distinct from BaselineSpec: BaselineSpec provisions a long-lived
+    ## known-good guest; BootMediaSpec spins up a transient VM around a
+    ## specific bootable artifact to capture serial output during boot.
+    name*: string                   ## ephemeral VM name (backend-prefixed)
+    kind*: BootMediaKind
+    mediaPath*: string              ## primary boot media (VHDX/ISO/tar path)
+    secondaryIsoPath*: string       ## optional second ISO (e.g. cloud-init seed)
+    cpus*: int                      ## defaults to 2 when zero
+    memoryMB*: int                  ## defaults to 2048 when zero
+    generation*: int                ## Hyper-V: 1 or 2 (UEFI); defaults to 2
+    secureBootEnabled*: bool        ## defaults to false (most test ISOs unsigned)
+    serialPipeName*: string         ## backend may override; otherwise auto-generated
+    serialLogPath*: string          ## host-side path where serial bytes are logged
+    extra*: Table[string, string]   ## backend-specific scratch (post-import scripts...)
+
+  SerialMatch* = object
+    ## Result of a single boot-time assertion.
+    matched*: bool
+    matchedText*: string            ## the line that matched
+    elapsedMs*: int                 ## ms from assertion start to match (or timeout)
+    timedOut*: bool
+
+  SerialStream* = ref object of RootObj
+    ## Backend-owned stream interface. The base type is an abstract handle;
+    ## each backend constructs its own concrete subtype carrying the
+    ## handle/pipe/process state it needs internally. Methods below dispatch
+    ## via the owning backend.
+    vm*: VmHandle                   ## owning VM (cyclic but safe)
+    logPath*: string                ## host-side path of the captured serial log
+
 # ---------------------------------------------------------------------------
 # Concept methods. Every backend implements these by inheriting from
 # ``VmBackend`` and using ``method ... of <Backend>`` overrides.
@@ -284,6 +333,58 @@ method importBaseline*(b: VmBackend, srcDir: string): seq[string] {.base.} =
 method listSnapshots*(b: VmBackend, vmName: string): seq[string] {.base.} =
   raise newException(BackendUnavailableError,
     "listSnapshots not implemented for backend " & $b.id)
+
+# ---------------------------------------------------------------------------
+# M1.5 — bootFromMedia + serial-stream primitives. Distinct from the
+# baseline-oriented lifecycle (provisionBaseline + revertToBaseline +
+# execInGuest): these primitives spin up a transient VM directly around a
+# bootable artifact (VHDX/ISO/rootfs tar) and capture serial output during
+# OS bring-up. The returned VmHandle must be paired with ``stopAndCleanup``
+# in a try/finally; the orchestrator's ``runGate`` does this for the
+# consumer.
+
+method bootFromMedia*(b: VmBackend, spec: BootMediaSpec): VmHandle {.base.} =
+  ## Boot a transient VM directly from media (VHDX/ISO/rootfs tar). The
+  ## returned VmHandle is connected; the guest may still be booting. Call
+  ## ``captureSerial`` on the returned handle to drive boot-time assertions
+  ## via the SerialStream.
+  ##
+  ## Distinct from ``revertToBaseline``: no baseline lookup, no
+  ## provision step, ephemeral by design. The handle MUST be passed to
+  ## ``stopAndCleanup`` when done (the try/finally orchestrator already
+  ## does this for the consumer).
+  ##
+  ## Backends that lack direct-boot support raise BackendUnavailableError.
+  raise newException(BackendUnavailableError,
+    "bootFromMedia not implemented for backend " & $b.id)
+
+method captureSerial*(b: VmBackend, vm: VmHandle): SerialStream {.base.} =
+  ## Open the serial console stream for boot-time pattern assertions. The
+  ## backend writes the captured bytes to ``result.logPath`` AND returns
+  ## a stream the consumer can ``expectLine`` / ``serialSend`` /
+  ## ``captureUntil`` on.
+  ##
+  ## Pre-condition: ``vm`` was returned by ``bootFromMedia`` (or by a
+  ## backend that explicitly documents serial-after-revertToBaseline).
+  raise newException(BackendUnavailableError,
+    "captureSerial not implemented for backend " & $b.id)
+
+method expectLine*(b: VmBackend, stream: SerialStream,
+                  pattern: string, timeoutSec: int = 60): SerialMatch {.base.} =
+  ## Block until ``pattern`` (Perl-flavoured regex) matches a line in the
+  ## serial stream, or ``timeoutSec`` elapses. Returns the match outcome.
+  raise newException(BackendUnavailableError,
+    "expectLine not implemented for backend " & $b.id)
+
+method serialSend*(b: VmBackend, stream: SerialStream, text: string) {.base.} =
+  ## Write ``text`` to the guest's serial input (e.g. a login response).
+  ## Newlines must be explicit (caller provides ``\n`` where wanted).
+  raise newException(BackendUnavailableError,
+    "serialSend not implemented for backend " & $b.id)
+
+method closeSerial*(b: VmBackend, stream: SerialStream) {.base.} =
+  ## Close the serial connection. Safe in finally blocks; never raises.
+  discard
 
 # ---------------------------------------------------------------------------
 # Helpers used by the CLI dispatcher and the docs.
