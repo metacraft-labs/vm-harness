@@ -96,8 +96,12 @@ const ForeignAssertions = @[
     command: "vim --version | head -1",
     pattern: r"VIM - Vi IMproved 2:9\.0\.1378"),
   ForeignAssertion(name: "python3",
-    command: "python3 -c 'print(\"hi\")'",
-    pattern: r"^hi$"),
+    # Echo a unique sentinel side-by-side with the python3 output so
+    # the assertion regex can pin it without relying on ^/$ anchors;
+    # std/re's default mode treats them as start/end of the entire
+    # accumulated buffer which never matches in a busy serial stream.
+    command: "python3 -c 'print(\"D1PY3 hi STOP\")'",
+    pattern: r"D1PY3 hi STOP"),
   ForeignAssertion(name: "curl",
     command: "curl --version | head -1",
     pattern: r"curl 7\.88\.1"),
@@ -123,8 +127,16 @@ proc runBootScenario(backend: HyperVBackend, isoPath, perVmDir, vmName: string) 
 
   let totalStart = epochTime()
   let vm = backend.bootFromMedia(spec)
+  let logKeepDir = getEnv("D1_MVP_KEEP_SERIAL", "")
   defer:
     backend.stopAndCleanup(vm, deleteVm = true)
+    if logKeepDir.len > 0:
+      createDir(logKeepDir)
+      let src = perVmDir / (vmName & ".serial.log")
+      if fileExists(src):
+        let dst = logKeepDir / (vmName & ".serial.log")
+        try: copyFile(src, dst); echo "[diag] serial log preserved at ", dst
+        except CatchableError: discard
     if dirExists(perVmDir):
       try: removeDir(perVmDir)
       except CatchableError: discard
@@ -157,14 +169,32 @@ proc runBootScenario(backend: HyperVBackend, isoPath, perVmDir, vmName: string) 
     return
 
   # If the prompt is a login: rather than an autologin shell, send the
-  # credentials. The MVP config sets up agetty --autologin root so this
-  # block is normally a no-op.
+  # credentials. The MVP config sets up agetty --autologin root so we
+  # MUST wait for the shell prompt before sending anything — otherwise
+  # our "root\n" gets eaten by the autologin in flight and the
+  # subsequent commands hit the shell as stale input.
   if login.matchedText.contains("login:"):
-    backend.serialSend(serial, "root\n")
-    discard backend.expectLine(serial,
-      r"(password|Password|\$|#)", timeoutSec = LoginTimeout)
-    backend.serialSend(serial, "reproos\n")
-    discard backend.expectLine(serial, r"(\$|#)", timeoutSec = LoginTimeout)
+    let prompt = backend.expectLine(serial, r"(~ #|root@.*[\$#])",
+      timeoutSec = LoginTimeout)
+    if not prompt.matched:
+      # The configured agetty did not autologin; fall back to manual.
+      backend.serialSend(serial, "root\n")
+      discard backend.expectLine(serial, r"(password|Password|\$|#)",
+        timeoutSec = LoginTimeout)
+      backend.serialSend(serial, "reproos\n")
+      discard backend.expectLine(serial, r"(\$|#)", timeoutSec = LoginTimeout)
+
+  # Phase B+: diagnostic listing — surface the C3 overlay tree so
+  # failures distinguish "stub not on disk" (initramfs missing) from
+  # "stub fails at exec" (sandbox issue).
+  if getEnv("D1_MVP_DIAGNOSTIC", "") == "1":
+    backend.serialSend(serial,
+      "echo D1_DIAG_BEGIN; ls -la /usr/local/bin/ 2>&1; " &
+      "ls /opt/reproos-foreign/ 2>&1; " &
+      "ls -la /opt/reproos-foreign/git/ 2>&1; " &
+      "head -20 /opt/reproos-foreign/git/launcher.manifest 2>&1; " &
+      "echo D1_DIAG_END\n")
+    discard backend.expectLine(serial, r"D1_DIAG_END", timeoutSec = CmdTimeout)
 
   # Phase C: run the 5 foreign-package assertions.
   var passed = 0
