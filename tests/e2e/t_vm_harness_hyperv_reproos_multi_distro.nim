@@ -81,13 +81,18 @@ type
     pattern*: string
 
 const ForeignAssertions = @[
-  # apt — 5 assertions; reuses the D1 banner patterns.
+  # apt — 5 assertions. X1 mode: real upstream binaries. The Debian
+  # epoch (1:, 2:) only appears in package metadata; the actual binary
+  # prints just the version (e.g. "git version 2.39.5"). The per-distro
+  # disambiguation no longer comes from the binary banner; the shim
+  # path (apt-htop / dnf-htop / pacman-htop) selects which root binary
+  # the launcher invokes.
   ForeignAssertion(name: "apt-git",
     command: "git --version",
-    pattern: r"git version 1:2\.39\.5"),
+    pattern: r"git version 2\.39\.5"),
   ForeignAssertion(name: "apt-vim",
     command: "vim --version | head -1",
-    pattern: r"VIM - Vi IMproved 2:9\.0\.1378"),
+    pattern: r"VIM - Vi IMproved 9\.0"),
   ForeignAssertion(name: "apt-python3",
     command: "python3 -c 'print(\"D2PY3 hi STOP\")'",
     pattern: r"D2PY3 hi STOP"),
@@ -96,22 +101,21 @@ const ForeignAssertions = @[
     pattern: r"curl 7\.88\.1"),
   ForeignAssertion(name: "apt-htop",
     command: "apt-htop --version",
-    pattern: r"htop 3\.2\.2.*\(apt\)"),
-  # dnf — 2 assertions; the dnf-htop and dnf-neovim shims invoke the
-  # Fedora-flavored stubs whose --version banner includes "(dnf)".
+    pattern: r"htop 3\.2\.2"),
+  # dnf — 2 assertions; root binaries from kojipkgs.fedoraproject.org.
   ForeignAssertion(name: "dnf-htop",
     command: "dnf-htop --version",
-    pattern: r"htop 3\.3\.0-1\.fc39.*\(dnf\)"),
+    pattern: r"htop 3\.3\.0"),
   ForeignAssertion(name: "dnf-neovim",
     command: "dnf-neovim --version",
-    pattern: r"NVIM v0\.10\.2-1\.fc39.*\(dnf\)"),
-  # pacman — 2 assertions.
+    pattern: r"NVIM v0\.10\.2"),
+  # pacman — 2 assertions; root binaries from archive.archlinux.org.
   ForeignAssertion(name: "pacman-htop",
     command: "pacman-htop --version",
-    pattern: r"htop 3\.3\.0-1.*\(pacman\)"),
+    pattern: r"htop 3\.3\.0"),
   ForeignAssertion(name: "pacman-fzf",
     command: "pacman-fzf --version",
-    pattern: r"0\.55\.0-1.*\(pacman\)"),
+    pattern: r"0\.55\.0"),
 ]
 
 proc runBootScenario(backend: HyperVBackend, isoPath, perVmDir, vmName: string) =
