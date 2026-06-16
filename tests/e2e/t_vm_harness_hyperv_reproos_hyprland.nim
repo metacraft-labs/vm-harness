@@ -212,6 +212,17 @@ proc runBootScenario(backend: HyperVBackend, isoPath, perVmDir, vmName: string) 
     probe("cat /etc/profile.d/xkb-data.sh /etc/profile.d/glvnd.sh 2>&1")
     probe("command -v sway swaymsg foot 2>&1")
     probe("systemctl status dbus.service dbus.socket 2>&1 | head -10")
+    # DE-H2 cascade F diagnostics: surface why systemd-logind failed
+    # (boot log "Failed to start User Login Management" without a
+    # follow-on cause was the cascade E blocker). Three probes:
+    #   1. systemctl status to see ExecStart, last exit code, last
+    #      ExecStart timestamp.
+    #   2. journalctl -u to extract the actual stderr/error from the
+    #      crashed logind invocation.
+    #   3. ls /var/lib/systemd to confirm state dirs exist.
+    probe("systemctl status systemd-logind.service 2>&1 | head -30")
+    probe("journalctl -u systemd-logind.service --no-pager -n 50 2>&1")
+    probe("ls -la /var/lib/systemd/ 2>&1")
     probe("ls -la /run/user/1000 2>&1")
     backend.serialSend(serial, "echo DE_H_DIAG_END\n")
     discard backend.expectLine(serial, r"DE_H_DIAG_END",
