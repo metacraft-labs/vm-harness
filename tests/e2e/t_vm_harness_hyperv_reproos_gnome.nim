@@ -240,6 +240,35 @@ proc runBootScenario(backend: HyperVBackend, isoPath, perVmDir, vmName: string) 
     probe("journalctl -u systemd-logind.service --no-pager -n 50 2>&1")
     probe("ls -la /var/lib/systemd/ /var/lib/gdm3/ 2>&1")
     probe("ls -la /run/user/1000 2>&1")
+    # Cascade G investigation probes (2026-06-16): dbus.socket non-activation.
+    # We need to distinguish: (1) systemd's UnitPath not seeing the symlink,
+    # (2) systemd demoting the unit due to NTFS-via-WSL perms, (3) Alias=
+    # strict reject. List-sockets reveals whether dbus.socket was even
+    # enumerated; status reveals load state + LoadError; analyze verify
+    # surfaces parse-time complaints; ls of the .wants/ dirs lets us
+    # cross-check that the symlinks survived overlay->initramfs->boot.
+    probe("echo '=== CASCADE-G ==='")
+    probe("systemd-analyze --version 2>&1 | head -1")
+    probe("systemctl list-sockets --all --no-pager 2>&1 | head -40")
+    probe("systemctl status dbus.socket --no-pager 2>&1 | head -25")
+    probe("systemctl status dbus.service --no-pager 2>&1 | head -25")
+    probe("systemctl is-enabled dbus.socket dbus.service 2>&1")
+    probe("ls -la /etc/systemd/system/sockets.target.wants/ 2>&1")
+    probe("ls -la /etc/systemd/system/multi-user.target.wants/ 2>&1")
+    probe("ls -la /lib/systemd/system/dbus.socket /lib/systemd/system/dbus.service /lib/systemd/system/dbus-broker.service 2>&1")
+    probe("stat -c '%n %a %U:%G %F' /etc/systemd/system/sockets.target.wants/dbus.socket /lib/systemd/system/dbus.socket /lib/systemd/system/dbus-broker.service 2>&1")
+    probe("readlink /etc/systemd/system/sockets.target.wants/dbus.socket /etc/systemd/system/dbus.service /etc/systemd/system/multi-user.target.wants/dbus.service 2>&1")
+    probe("journalctl -u dbus.socket -u dbus.service -u dbus-broker.service --no-pager -n 80 2>&1 | head -50")
+    probe("systemd-analyze verify dbus.socket 2>&1 | head -20")
+    probe("systemd-analyze verify dbus.service 2>&1 | head -20")
+    probe("systemctl show -p UnitPath 2>&1 | head -3")
+    probe("systemctl show dbus.socket -p LoadState -p ActiveState -p SubState -p LoadError -p FragmentPath -p TriggeredBy -p Wants -p WantedBy 2>&1")
+    probe("systemctl show dbus.service -p LoadState -p ActiveState -p SubState -p LoadError -p FragmentPath -p Alias -p Names 2>&1")
+    probe("systemctl show sockets.target -p Wants -p After -p Before 2>&1 | head -5")
+    probe("ss -lnxp 2>&1 | grep -E 'dbus|system_bus_socket' | head")
+    probe("ls -la /run/dbus/ 2>&1")
+    probe("dmesg 2>&1 | grep -iE 'dbus|socket|systemd' | head -30")
+    probe("echo '=== END-CASCADE-G ==='")
     backend.serialSend(serial, "echo DE_G_DIAG_END\n")
     discard backend.expectLine(serial, r"DE_G_DIAG_END",
       timeoutSec = CmdTimeout)
