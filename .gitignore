@@ -12,3 +12,14 @@ nimcache/
 # Test scratch
 tests/**/*.tmp
 tests/**/nimcache/
+
+# D4 / W4 diagnostic serial logs + per-run scratch directories that land
+# at repo root during local iteration.
+/_d4-coldinit-diag.log
+/_d4-fix*-serial/
+/_d4-fix*-diag-serial/
+/_d4_run_*.log
+/_w4_diag/
+/x1-e2e-test*.log
+/x1-review-rerun.log
+/x1-serial-logs*/
