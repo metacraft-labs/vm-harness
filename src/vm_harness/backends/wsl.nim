@@ -22,7 +22,7 @@
 ## the module compiles cleanly on any host, but the methods raise
 ## ``BackendUnavailableError`` when called on a non-Windows host.
 
-import std/[os, osproc, streams, strtabs, tables, times]
+import std/[os, osproc, streams, strtabs, strutils, tables, times]
 when defined(windows):
   import std/[options, strutils]
 import ../types
