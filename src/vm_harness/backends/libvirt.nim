@@ -589,27 +589,46 @@ method provisionBaseline*(b: LibvirtBackend, spec: BaselineSpec) =
                     of goMacos:
                       raise newException(BackendUnavailableError,
                         "LibvirtBackend: macOS guests are not supported")
-    # Resolve companion ISOs from spec.extra or the recipe build dir.
-    # The README in guest-recipes/windows-x64-base/ documents how
-    # these get built.
-    let recipeBuildDir = getCurrentDir() / "guest-recipes" /
-                         "windows-x64-base" / "build"
-    let unattendIso = (
-      if "autounattendIso" in (@["autounattendIso", "virtioWinIso"]) and
-         spec.guestOs == goWindows: ""  # placeholder, see below
-      else: "")
-    # BaselineSpec doesn't carry an `extra` table today (M4 Phase B
-    # would add one to mirror BootMediaSpec.extra), so we fall back to
-    # convention-over-config: companion ISOs live next to the source.
-    let unattendCandidate =
-      if unattendIso.len > 0: unattendIso
-      else: recipeBuildDir / "autounattend.iso"
+    # Per-call network-bridge override: the canonical libvirt M4 command
+    # threads --network-bridge through BaselineSpec.networkBridge. Keep
+    # the backend's configured default when unset.
+    if spec.networkBridge.len > 0:
+      b.networkBridge = spec.networkBridge
+    # Recipe directory resolution: prefer spec.recipeDir (the CLI
+    # resolves --recipe at parse time and threads the absolute path
+    # through); fall back to the historical convention-over-config
+    # location for in-tree invocations that pre-date --recipe.
+    let recipeDir =
+      if spec.recipeDir.len > 0: spec.recipeDir
+      else: getCurrentDir() / "guest-recipes" / "windows-x64-base"
+    let recipeBuildDir = recipeDir / "build"
+    # When the operator passed --first-boot-script, invoke the recipe's
+    # build-autounattend-iso.sh helper (idempotent — it overwrites
+    # build/autounattend.iso) before virt-install. This is what makes
+    # the canonical libvirt M4 command work end-to-end: the script
+    # embeds the operator's bootstrap into the ISO that Setup reads at
+    # first boot.
+    if spec.firstBootScript.len > 0:
+      let builder = recipeDir / "build-autounattend-iso.sh"
+      if not fileExists(builder):
+        raise newException(IOError,
+          "LibvirtBackend.provisionBaseline: --first-boot-script was " &
+          "supplied but the recipe at " & recipeDir & " doesn't have a " &
+          "build-autounattend-iso.sh helper (looked at " & builder & ")")
+      let buildArgv = @[builder, "--first-boot-script", spec.firstBootScript]
+      let br = runProcessCapture(buildArgv, cwd = recipeDir, timeoutSec = 120)
+      if br.exitCode != 0:
+        raise newVmHarnessError($b.id, lpProvisioning,
+          "build-autounattend-iso.sh failed (exit " & $br.exitCode &
+          "): " & br.stdout)
+    let unattendCandidate = recipeBuildDir / "autounattend.iso"
     let virtioWinCandidate = recipeBuildDir / "virtio-win.iso"
     if not fileExists(unattendCandidate):
       raise newException(IOError,
         "LibvirtBackend.provisionBaseline: autounattend.iso not found " &
         "at " & unattendCandidate & " — run " &
-        "guest-recipes/windows-x64-base/build-autounattend-iso.sh first")
+        "guest-recipes/windows-x64-base/build-autounattend-iso.sh first " &
+        "(or re-invoke vm-harness provision with --first-boot-script)")
     if spec.guestOs == goWindows and not fileExists(virtioWinCandidate):
       raise newException(IOError,
         "LibvirtBackend.provisionBaseline: virtio-win.iso not found at " &

@@ -54,6 +54,10 @@ task test, "Run the vm-harness test suite":
   # asserts argv shape + stub-method clarity without booting any VM).
   # Live-libvirtd lifecycle tests land with M4 Phase B.
   exec "nim r --hints:off tests/integration/t_libvirt_backend.nim"
+  # M4 libvirt slice — CLI flag plumbing for the canonical operator
+  # command (--recipe / --name / --vcpu / --memory-gb / --network-bridge
+  # / --first-boot-script). NoopBackend-style: no virsh, no libvirtd.
+  exec "nim r --hints:off tests/integration/t_cli_libvirt_flags.nim"
 
 task buildCli, "Build the vm-harness CLI binary":
   exec "nim c --hints:off -o:build/bin/vm-harness src/vm_harness/cli.nim"

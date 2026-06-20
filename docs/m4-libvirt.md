@@ -78,6 +78,20 @@ vm-harness provision \
 
 Wall-clock: 25-50 minutes on first run (mostly Win11 Setup).
 
+The flags `--recipe`, `--name`, `--vcpu`, `--memory-gb`,
+`--network-bridge`, and `--first-boot-script` are the canonical
+libvirt-slice surface — `parseCliOpts` resolves them at parse time
+(see `src/vm_harness/cli.nim`) and threads them through into
+`BaselineSpec.recipeDir / firstBootScript / networkBridge`. The
+`LibvirtBackend.provisionBaseline` method then invokes the recipe's
+`build-autounattend-iso.sh --first-boot-script <path>` before
+`virt-install`, so a single invocation produces the per-VM
+autounattend ISO and starts the install in one step.
+
+Aliases preserved for compatibility with the historical vm-harness
+surface: `--vcpu` ≡ `--cpus`, `--memory-gb` ≡ `--memory-mb` (× 1024),
+`--name` ≡ `--baseline` (must agree if both are passed).
+
 ### Run a one-shot command in the guest
 
 ```bash

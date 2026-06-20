@@ -56,6 +56,24 @@ type
     allowNoopFallback*: bool
     timeoutSec*: int
     running*: bool               ## `--running` flag for `snapshot create`.
+    # M4 libvirt-slice canonical-command flags. See
+    # docs/m4-libvirt.md → "Operator command examples" for the
+    # invocation these wire up.
+    recipe*: string              ## ``--recipe <id>`` — selects a recipe
+                                 ## directory under ``guest-recipes/<id>/``.
+                                 ## Resolved to ``recipeDir`` in CliOpts and
+                                 ## threaded into ``BaselineSpec.recipeDir``.
+    recipeDir*: string           ## resolved absolute path to the recipe dir
+                                 ## (parseCliOpts performs the lookup so the
+                                 ## error surfaces at parse time).
+    name*: string                ## ``--name <vm>`` — alias for ``--baseline``
+                                 ## per the canonical libvirt M4 command.
+                                 ## When both are passed the values must match.
+    networkBridge*: string       ## ``--network-bridge <name>`` — libvirt-only
+                                 ## override for the guest's primary NIC.
+    firstBootScript*: string     ## ``--first-boot-script <path>`` — file the
+                                 ## recipe's build-autounattend-iso.sh wraps
+                                 ## into the per-VM autounattend ISO.
 
 const HelpText = """
 vm-harness <subcommand> [flags]
@@ -88,11 +106,25 @@ Common flags:
   --backend <auto|noop|hyperv|wsl|tart-macos|tart-linux-arm|
              utm-windows-arm|libvirt|lima>
   --guest <linux|windows|macos>   Required when --backend auto.
-  --baseline <name>
+  --baseline <name>               Logical baseline tag (== libvirt domain name).
+  --name <vm>                     Alias for --baseline (canonical libvirt M4
+                                  command shape; see docs/m4-libvirt.md).
+  --recipe <id>                   Selects guest-recipes/<id>/ as the source of
+                                  per-baseline artifacts (autounattend.xml,
+                                  build-autounattend-iso.sh, ...). Required by
+                                  backends that consume recipe-shaped inputs.
   --source-image <ref>
-  --cpus <int>
+  --cpus <int>                    Backend default applies when omitted.
+  --vcpu <int>                    Alias for --cpus (canonical libvirt M4 shape).
   --memory-mb <int>
+  --memory-gb <int>               Alias for --memory-mb, expressed in GiB.
   --disk-gb <int>
+  --network-bridge <name>         libvirt-only: host bridge for the guest NIC
+                                  (default: backend's configured value, e.g.
+                                  virbr0). Ignored by other backends.
+  --first-boot-script <path>      libvirt-only: host path to a script the
+                                  recipe wraps into the per-VM autounattend
+                                  ISO. Requires --recipe.
   --output-dir <path>
   --env KEY=VAL                   (repeatable)
   --copy-to host:guest            (repeatable)
@@ -120,6 +152,41 @@ proc parseGuest(s: string): GuestOs =
   for g in GuestOs:
     if $g == s.toLowerAscii: return g
   raise newException(ValueError, &"Unknown guest OS: '{s}'")
+
+proc resolveRecipeDir*(recipeId: string): string =
+  ## Resolve ``--recipe <id>`` to an absolute directory under
+  ## ``guest-recipes/<id>/``. The search order is:
+  ##
+  ##   1. ``$VMH_RECIPES_DIR/<id>``        (operator escape hatch)
+  ##   2. ``<cwd>/guest-recipes/<id>``     (running from a repo checkout)
+  ##   3. ``<exe-dir>/../guest-recipes/<id>``
+  ##   4. ``<exe-dir>/../../guest-recipes/<id>``
+  ##                                       (installed binary under build/bin/)
+  ##
+  ## Raises ``ValueError`` when the directory doesn't exist anywhere — the
+  ## parse-time error surfaces the typo immediately instead of failing
+  ## later inside a backend method.
+  if recipeId.len == 0:
+    raise newException(ValueError, "--recipe requires a non-empty id")
+  # No path separators allowed — the id picks one directory by name, not
+  # a relative path that could escape guest-recipes/.
+  if '/' in recipeId or '\\' in recipeId or recipeId.startsWith("."):
+    raise newException(ValueError,
+      &"--recipe expects a bare id (e.g. 'windows-x64-base'), got '{recipeId}'")
+  var candidates: seq[string] = @[]
+  let envOverride = getEnv("VMH_RECIPES_DIR")
+  if envOverride.len > 0:
+    candidates.add(envOverride / recipeId)
+  candidates.add(getCurrentDir() / "guest-recipes" / recipeId)
+  let exeDir = getAppDir()
+  candidates.add(exeDir / ".." / "guest-recipes" / recipeId)
+  candidates.add(exeDir / ".." / ".." / "guest-recipes" / recipeId)
+  for c in candidates:
+    if dirExists(c):
+      return absolutePath(c)
+  raise newException(ValueError,
+    &"--recipe '{recipeId}': directory not found. Searched: " &
+    candidates.join(", "))
 
 proc parseCliOpts*(args: seq[string]): CliOpts =
   ## Minimal hand-rolled parser. Keeps the binary dependency-free.
@@ -149,14 +216,38 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.guest = parseGuest(args[i]); result.guestSet = true; inc i
     of "--baseline":
       inc i; result.baseline = args[i]; inc i
+    of "--name":
+      # Canonical libvirt-M4 alias for --baseline. The dispatch code
+      # resolves precedence in ``parseCliOpts``'s post-loop block so
+      # both can be passed (they must agree) and `applyDefaults`
+      # always sees a single source of truth.
+      inc i; result.name = args[i]; inc i
+    of "--recipe":
+      inc i
+      result.recipe = args[i]
+      result.recipeDir = resolveRecipeDir(args[i])
+      inc i
     of "--source-image":
       inc i; result.sourceImage = args[i]; inc i
-    of "--cpus":
+    of "--cpus", "--vcpu":
+      # ``--vcpu`` is the canonical libvirt M4 spelling; ``--cpus`` is
+      # the historical vm-harness spelling. Both produce the same
+      # internal field. We deliberately accept either without a
+      # deprecation warning because both spellings show up in active
+      # docs (design.md uses --cpus; m4-libvirt.md uses --vcpu).
       inc i; result.cpus = parseInt(args[i]); inc i
     of "--memory-mb":
       inc i; result.memoryMB = parseInt(args[i]); inc i
+    of "--memory-gb":
+      # Convenience: libvirt operators think in GiB, vm-harness's
+      # historical surface in MiB. Convert once at parse time.
+      inc i; result.memoryMB = parseInt(args[i]) * 1024; inc i
     of "--disk-gb":
       inc i; result.diskGB = parseInt(args[i]); inc i
+    of "--network-bridge":
+      inc i; result.networkBridge = args[i]; inc i
+    of "--first-boot-script":
+      inc i; result.firstBootScript = args[i]; inc i
     of "--output-dir":
       inc i; result.outputDir = args[i]; inc i
     of "--timeout-sec":
@@ -207,6 +298,28 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
         result.cmd.add(a)
         inc i
 
+  # Post-loop reconciliation for the libvirt M4 ``--name`` alias.
+  # The canonical command uses ``--name <vm>`` rather than ``--baseline
+  # <name>``; downstream code only sees ``baseline``. Resolve precedence
+  # here so the rest of the CLI doesn't have to know about the alias.
+  if result.name.len > 0:
+    if result.baseline.len == 0:
+      result.baseline = result.name
+    elif result.baseline != result.name:
+      raise newException(ValueError,
+        &"--name '{result.name}' and --baseline '{result.baseline}' " &
+        "must match (they refer to the same logical VM)")
+  # --first-boot-script requires --recipe to know which script the
+  # recipe's build-autounattend-iso.sh wants. Fail fast at parse time.
+  if result.firstBootScript.len > 0 and result.recipeDir.len == 0:
+    raise newException(ValueError,
+      "--first-boot-script requires --recipe <id>; the script is wrapped " &
+      "into the per-VM autounattend ISO by the recipe's " &
+      "build-autounattend-iso.sh helper")
+  if result.firstBootScript.len > 0 and not fileExists(result.firstBootScript):
+    raise newException(ValueError,
+      &"--first-boot-script '{result.firstBootScript}': file not found")
+
 proc logEvent*(format: LogFormat, level: string, msg: string,
               fields: openArray[(string, string)] = []) =
   case format
@@ -248,6 +361,13 @@ proc applyDefaults(spec: var BaselineSpec, opts: CliOpts) =
   spec.diskGB = if opts.diskGB > 0: opts.diskGB else: 50
   if opts.guestSet:
     spec.guestOs = opts.guest
+  # M4 libvirt-slice canonical-command extensions. Backends that don't
+  # consume these fields ignore them (the contract is intentionally
+  # tolerant — see types.nim's BaselineSpec docstrings).
+  spec.recipeDir = opts.recipeDir
+  spec.firstBootScript = opts.firstBootScript
+  spec.networkBridge = opts.networkBridge
+  spec.backendOptions = initTable[string, string]()
 
 proc cmdProvision(opts: CliOpts): int =
   let (id, backend) = resolveBackend(opts)
