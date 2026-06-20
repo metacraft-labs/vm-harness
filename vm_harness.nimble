@@ -50,6 +50,10 @@ task test, "Run the vm-harness test suite":
   exec "nim r --hints:off tests/integration/t_lima_lifecycle.nim"
   exec "nim r --hints:off tests/e2e/t_vm_harness_lima_linux_smoke.nim"
   exec "nim r --hints:off tests/e2e/t_vm_harness_lima_revert_under_30s.nim"
+  # M4 libvirt slice — no-live-virsh smoke test (compiles on any host;
+  # asserts argv shape + stub-method clarity without booting any VM).
+  # Live-libvirtd lifecycle tests land with M4 Phase B.
+  exec "nim r --hints:off tests/integration/t_libvirt_backend.nim"
 
 task buildCli, "Build the vm-harness CLI binary":
   exec "nim c --hints:off -o:build/bin/vm-harness src/vm_harness/cli.nim"

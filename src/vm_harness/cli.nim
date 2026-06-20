@@ -28,6 +28,7 @@ import ./backends/wsl
 import ./backends/tart
 import ./backends/utm
 import ./backends/lima
+import ./backends/libvirt
 {.pop.}
 
 type

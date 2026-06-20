@@ -30,6 +30,7 @@ import ./vm_harness/backends/wsl
 import ./vm_harness/backends/tart
 import ./vm_harness/backends/utm
 import ./vm_harness/backends/lima
+import ./vm_harness/backends/libvirt
 
 export types
 export output
@@ -45,3 +46,4 @@ export wsl
 export tart
 export utm
 export lima
+export libvirt

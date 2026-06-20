@@ -1,0 +1,297 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  vm-harness Windows-on-x86_64 golden image autounattend.xml (M4
+  libvirt slice, Phase A).
+
+  Drives Windows 11 Pro 24H2 (amd64) Setup from first boot through
+  to a desktop with OpenSSH server enabled and admin auto-logon.
+  Adapted from guest-recipes/windows-arm-base/autounattend.xml:
+
+    - processorArchitecture is "amd64" everywhere (vs "arm64").
+    - The WindowsPE pass includes a <DriverPaths> block that pulls
+      the virtio-blk + virtio-net storage/network drivers from the
+      virtio-win driver disk that the libvirt backend's virt-install
+      argv attaches as a second sata CD. Without this Windows Setup
+      cannot see the virtio-blk system disk on the q35 board and
+      stalls at "Select where to install Windows".
+    - The autounattend is intended to be attached as a removable
+      CD-ROM (FAT12/ISO9660 labelled AUTOUNATTEND); Windows Setup
+      scans every attached removable medium at first boot.
+    - The Win11 Pro install key (VK7JG-NPHTM-C97JM-9MPGT-3V66T) is
+      the generic install key — Windows is unactivated post-install
+      until the consumer applies a real key (out of scope for this
+      recipe). For the windows-runner-001 prototype Windows runs in
+      the 30-day grace period; productionization would activate via
+      KMS or MAK.
+
+  Differences from the Hyper-V Panther approach (and from
+  windows-arm-base):
+
+    - Includes the windowsPE pass with DiskConfiguration so Setup
+      partitions disk 0 unattended.
+    - <DriverPaths> wires in two paths under D: (the virtio-win CD
+      that libvirt presents as the second sata drive — drive letters
+      under WindowsPE are assigned by enumeration order, so the
+      Windows install CD lands on E: and the virtio-win CD on D:
+      with the q35 sata bus layout the libvirt backend uses).
+    - FirstLogonCommands installs OpenSSH Server via DISM (no
+      Windows Update dependency), enables sshd, and writes the
+      install-done sentinel.
+
+  Credentials baked in:
+
+    - User: admin
+    - Password: repro-windows-x64
+    - Auto-logon enabled (so the FirstLogonCommands hook runs at
+      first boot without needing console input).
+
+  These match the LibvirtBackend defaults (newLibvirtBackend
+  sshUser=admin, sshPassword=repro-windows-x64). Override by editing
+  this file before running the recipe AND by constructing the
+  backend with explicit sshUser/sshPassword.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <SetupUILanguage>
+        <UILanguage>en-US</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UILanguageFallback>en-US</UILanguageFallback>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-PnpCustomizationsWinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <!-- Inject virtio storage + network drivers in the WindowsPE
+           phase so Setup can see the virtio-blk system disk and the
+           virtio-net adapter that virt-install attached. Without
+           this Setup stops at "We couldn't find any drives".
+
+           The libvirt backend always attaches the virtio-win driver
+           disk as a sata CD. Under WindowsPE drive letters are
+           assigned in attach order; the layout the backend produces
+           is: D: virtio-win.iso, E: Windows install ISO. If you
+           change the bus order in the backend, update these paths. -->
+      <DriverPaths>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="vio-storage">
+          <Path>D:\amd64\w11</Path>
+        </PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="vio-net">
+          <Path>D:\NetKVM\w11\amd64</Path>
+        </PathAndCredentials>
+      </DriverPaths>
+    </component>
+
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order>
+              <Type>EFI</Type>
+              <Size>300</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order>
+              <Type>MSR</Type>
+              <Size>128</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>3</Order>
+              <Type>Primary</Type>
+              <Extend>true</Extend>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>1</PartitionID>
+              <Label>System</Label>
+              <Format>FAT32</Format>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order>
+              <PartitionID>2</PartitionID>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>3</Order>
+              <PartitionID>3</PartitionID>
+              <Label>Windows</Label>
+              <Letter>C</Letter>
+              <Format>NTFS</Format>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+      <ImageInstall>
+        <OSImage>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>3</PartitionID>
+          </InstallTo>
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/NAME</Key>
+              <Value>Windows 11 Pro</Value>
+            </MetaData>
+          </InstallFrom>
+        </OSImage>
+      </ImageInstall>
+      <UserData>
+        <ProductKey>
+          <!-- Generic Win11 Pro install-time key — Windows must be
+               activated against a real key post-install if the
+               recipe is used outside the disposable-per-gate
+               context. -->
+          <Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key>
+          <WillShowUI>OnError</WillShowUI>
+        </ProductKey>
+        <AcceptEula>true</AcceptEula>
+        <FullName>repro-vm-harness</FullName>
+        <Organization>vm-harness</Organization>
+      </UserData>
+    </component>
+  </settings>
+
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <ComputerName>*</ComputerName>
+      <TimeZone>UTC</TimeZone>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UILanguageFallback>en-US</UILanguageFallback>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <NetworkLocation>Work</NetworkLocation>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>admin</Name>
+            <Group>Administrators</Group>
+            <Description>vm-harness Windows-x64 libvirt golden admin user</Description>
+            <Password>
+              <Value>repro-windows-x64</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+      <AutoLogon>
+        <Username>admin</Username>
+        <Password>
+          <Value>repro-windows-x64</Value>
+          <PlainText>true</PlainText>
+        </Password>
+        <Enabled>true</Enabled>
+        <LogonCount>9</LogonCount>
+      </AutoLogon>
+
+      <FirstLogonCommands>
+        <!-- 1. Install OpenSSH Server (in-box capability — no
+             Windows Update required). -->
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"</CommandLine>
+          <Description>Install OpenSSH Server capability</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 2. Configure sshd to start automatically and start it now. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Set-Service -Name sshd -StartupType Automatic; Start-Service sshd"</CommandLine>
+          <Description>Enable and start sshd</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 3. Open inbound TCP/22 on the firewall (the OpenSSH
+             capability install does this, but we re-assert it
+             defensively). -->
+        <SynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) { New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 }"</CommandLine>
+          <Description>Ensure inbound TCP/22 is allowed</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 4. Install the virtio-win guest tools (qemu-ga +
+             paravirt drivers MSI). The autounattend ISO carries the
+             helper at A:\install-virtio-guest-tools.cmd; we run it
+             so the libvirt host can query the guest's IP via the
+             qemu-guest-agent channel post-install. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <CommandLine>cmd.exe /c "for %i in (D E F G H) do if exist %i:\virtio-win-guest-tools.exe %i:\virtio-win-guest-tools.exe /quiet /norestart"</CommandLine>
+          <Description>Install virtio-win guest tools (qemu-ga, paravirt MSI)</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 5. Stage the harness's first-boot bootstrap script onto C:\.
+             The autounattend ISO carries first-boot.ps1 (when the
+             operator supplied --first-boot-script ./bootstrap.ps1 to
+             build-autounattend-iso.sh). The CMD-side `for` loop
+             searches removable drives for it because drive letters
+             under OOBE depend on the device attach order. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <CommandLine>cmd.exe /c "for %i in (D E F G H) do if exist %i:\first-boot.ps1 copy /Y %i:\first-boot.ps1 C:\first-boot.ps1"</CommandLine>
+          <Description>Stage first-boot.ps1 on C:\</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 6. Run the first-boot script if present (idempotent —
+             the script itself is responsible for not re-running
+             work on subsequent boots; the libvirt backend's
+             startAndAwaitReady polling ensures this command's exit
+             code doesn't gate boot completion). -->
+        <SynchronousCommand wcm:action="add">
+          <Order>6</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "if (Test-Path C:\first-boot.ps1) { &amp; C:\first-boot.ps1 *&gt; C:\Windows\Temp\first-boot.log }"</CommandLine>
+          <Description>Run first-boot.ps1 if present</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 7. Marker file the recipe scripts (and the libvirt
+             backend's startAndAwaitReady) poll for. Written last so
+             a poll-and-found check is sufficient evidence that
+             every earlier FirstLogonCommands step succeeded. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>7</Order>
+          <CommandLine>cmd.exe /c "echo install-done > C:\Windows\Temp\repro-install-done"</CommandLine>
+          <Description>Write install-done sentinel</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+
+      <RegisteredOwner>vm-harness</RegisteredOwner>
+      <RegisteredOrganization>Metacraft Labs</RegisteredOrganization>
+      <TimeZone>UTC</TimeZone>
+    </component>
+  </settings>
+
+</unattend>
