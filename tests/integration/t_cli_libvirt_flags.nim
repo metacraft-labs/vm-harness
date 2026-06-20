@@ -40,6 +40,7 @@ proc applyDefaultsForTest(opts: CliOpts): BaselineSpec =
     result.guestOs = opts.guest
   result.recipeDir = opts.recipeDir
   result.firstBootScript = opts.firstBootScript
+  result.controllerPubKey = opts.controllerPubKey
   result.networkBridge = opts.networkBridge
   result.backendOptions = initTable[string, string]()
 
@@ -196,6 +197,53 @@ suite "CLI libvirt M4 canonical-command flag plumbing":
         "provision",
         "--recipe", "windows-x64-base",
         "--first-boot-script", "/definitely/not/a/real/file.ps1"
+      ])
+
+  test "--controller-pubkey lands in CliOpts and threads through BaselineSpec":
+    let prevCwd = getCurrentDir()
+    defer: setCurrentDir(prevCwd)
+    var search = currentSourcePath().parentDir
+    for _ in 0 .. 5:
+      if dirExists(search / "guest-recipes"):
+        setCurrentDir(search)
+        break
+      search = search.parentDir
+    # Use the running test binary as a stand-in for the pubkey path
+    # (file existence is the only thing parseCliOpts checks).
+    let pub = getAppFilename()
+    let opts = parseCliOpts(@[
+      "provision",
+      "--backend", "libvirt",
+      "--recipe", "windows-x64-base",
+      "--name", "windows-runner-001",
+      "--controller-pubkey", pub
+    ])
+    check opts.controllerPubKey == pub
+    let spec = applyDefaultsForTest(opts)
+    check spec.controllerPubKey == pub
+
+  test "--controller-pubkey without --recipe is rejected at parse time":
+    let pub = getAppFilename()
+    expect ValueError:
+      discard parseCliOpts(@[
+        "provision",
+        "--controller-pubkey", pub
+      ])
+
+  test "--controller-pubkey with non-existent path is rejected at parse time":
+    let prevCwd = getCurrentDir()
+    defer: setCurrentDir(prevCwd)
+    var search = currentSourcePath().parentDir
+    for _ in 0 .. 5:
+      if dirExists(search / "guest-recipes"):
+        setCurrentDir(search)
+        break
+      search = search.parentDir
+    expect ValueError:
+      discard parseCliOpts(@[
+        "provision",
+        "--recipe", "windows-x64-base",
+        "--controller-pubkey", "/definitely/not/a/real/id_ed25519.pub"
       ])
 
   test "BaselineSpec accepts the new fields and round-trips through libvirt":

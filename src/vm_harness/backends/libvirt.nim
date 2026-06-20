@@ -608,14 +608,25 @@ method provisionBaseline*(b: LibvirtBackend, spec: BaselineSpec) =
     # the canonical libvirt M4 command work end-to-end: the script
     # embeds the operator's bootstrap into the ISO that Setup reads at
     # first boot.
-    if spec.firstBootScript.len > 0:
+    if spec.firstBootScript.len > 0 or spec.controllerPubKey.len > 0:
       let builder = recipeDir / "build-autounattend-iso.sh"
       if not fileExists(builder):
         raise newException(IOError,
-          "LibvirtBackend.provisionBaseline: --first-boot-script was " &
-          "supplied but the recipe at " & recipeDir & " doesn't have a " &
-          "build-autounattend-iso.sh helper (looked at " & builder & ")")
-      let buildArgv = @[builder, "--first-boot-script", spec.firstBootScript]
+          "LibvirtBackend.provisionBaseline: --first-boot-script / " &
+          "--controller-pubkey was supplied but the recipe at " & recipeDir &
+          " doesn't have a build-autounattend-iso.sh helper (looked at " &
+          builder & ")")
+      var buildArgv = @[builder]
+      if spec.firstBootScript.len > 0:
+        buildArgv.add("--first-boot-script")
+        buildArgv.add(spec.firstBootScript)
+      if spec.controllerPubKey.len > 0:
+        # The pubkey is wrapped into the autounattend ISO alongside the
+        # first-boot script; the autounattend.xml's FirstLogonCommands
+        # block reads it from the removable medium and writes it into
+        # authorized_keys before the controller first touches the guest.
+        buildArgv.add("--controller-pubkey")
+        buildArgv.add(spec.controllerPubKey)
       let br = runProcessCapture(buildArgv, cwd = recipeDir, timeoutSec = 120)
       if br.exitCode != 0:
         raise newVmHarnessError($b.id, lpProvisioning,

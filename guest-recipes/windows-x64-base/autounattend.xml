@@ -251,37 +251,55 @@
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 5. Stage the harness's first-boot bootstrap script onto C:\.
+        <!-- 5. Install the controller's SSH public key into the admin
+             user's authorized_keys, when build-autounattend-iso.sh was
+             invoked with --controller-pubkey. The pubkey is staged at
+             the root of the autounattend ISO as controller.pub; the
+             PowerShell snippet scans removable drives for it (same
+             reason the first-boot.ps1 lookup below does), copies it
+             into C:\Users\admin\.ssh\authorized_keys, and tightens the
+             ACL so only admin + SYSTEM can read it. Without this step
+             the controller can't SSH into the guest on first boot and
+             the operator has to paste the key in by hand via the
+             console — see the M4 windows-runner-001 bootstrap notes. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Continue'; foreach ($d in 'D','E','F','G','H') { $p = $d + ':\controller.pub'; if (Test-Path $p) { $ssh = 'C:\Users\admin\.ssh'; New-Item -ItemType Directory -Force -Path $ssh | Out-Null; $auth = Join-Path $ssh 'authorized_keys'; $key = (Get-Content -Raw $p).Trim(); if (-not (Test-Path $auth) -or -not ((Get-Content -Raw $auth -ErrorAction SilentlyContinue) -match [regex]::Escape($key))) { Add-Content -Path $auth -Value $key }; icacls $ssh /inheritance:r /grant:r admin:F SYSTEM:F | Out-Null; icacls $auth /inheritance:r /grant:r admin:F SYSTEM:F | Out-Null; break } }"</CommandLine>
+          <Description>Install controller SSH pubkey into authorized_keys</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 6. Stage the harness's first-boot bootstrap script onto C:\.
              The autounattend ISO carries first-boot.ps1 (when the
              operator supplied --first-boot-script ./bootstrap.ps1 to
              build-autounattend-iso.sh). The CMD-side `for` loop
              searches removable drives for it because drive letters
              under OOBE depend on the device attach order. -->
         <SynchronousCommand wcm:action="add">
-          <Order>5</Order>
+          <Order>6</Order>
           <CommandLine>cmd.exe /c "for %i in (D E F G H) do if exist %i:\first-boot.ps1 copy /Y %i:\first-boot.ps1 C:\first-boot.ps1"</CommandLine>
           <Description>Stage first-boot.ps1 on C:\</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 6. Run the first-boot script if present (idempotent —
+        <!-- 7. Run the first-boot script if present (idempotent —
              the script itself is responsible for not re-running
              work on subsequent boots; the libvirt backend's
              startAndAwaitReady polling ensures this command's exit
              code doesn't gate boot completion). -->
         <SynchronousCommand wcm:action="add">
-          <Order>6</Order>
+          <Order>7</Order>
           <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "if (Test-Path C:\first-boot.ps1) { &amp; C:\first-boot.ps1 *&gt; C:\Windows\Temp\first-boot.log }"</CommandLine>
           <Description>Run first-boot.ps1 if present</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 7. Marker file the recipe scripts (and the libvirt
+        <!-- 8. Marker file the recipe scripts (and the libvirt
              backend's startAndAwaitReady) poll for. Written last so
              a poll-and-found check is sufficient evidence that
              every earlier FirstLogonCommands step succeeded. -->
         <SynchronousCommand wcm:action="add">
-          <Order>7</Order>
+          <Order>8</Order>
           <CommandLine>cmd.exe /c "echo install-done > C:\Windows\Temp\repro-install-done"</CommandLine>
           <Description>Write install-done sentinel</Description>
           <RequiresUserInput>false</RequiresUserInput>

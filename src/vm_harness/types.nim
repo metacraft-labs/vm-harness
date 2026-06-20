@@ -72,6 +72,15 @@ type
                                  ## (e.g. ``./bootstrap-windows-runner-001.ps1``)
                                  ## that the recipe wraps into the per-VM
                                  ## autounattend ISO at provision time.
+    controllerPubKey*: string    ## optional host path to an SSH public key
+                                 ## (typically ``id_ed25519.pub``) that the
+                                 ## recipe wraps into the per-VM autounattend
+                                 ## ISO. The autounattend's FirstLogonCommands
+                                 ## block reads it back inside the guest and
+                                 ## writes the key into
+                                 ## ``C:\Users\<sshUser>\.ssh\authorized_keys``
+                                 ## so the controller can reach the guest over
+                                 ## SSH on first boot without a manual paste.
     networkBridge*: string       ## libvirt-specific: name of the host bridge
                                  ## the guest's primary NIC attaches to
                                  ## (``virbr0`` for default NAT, ``br0`` for an

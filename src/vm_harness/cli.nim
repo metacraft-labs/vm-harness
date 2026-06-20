@@ -74,6 +74,13 @@ type
     firstBootScript*: string     ## ``--first-boot-script <path>`` — file the
                                  ## recipe's build-autounattend-iso.sh wraps
                                  ## into the per-VM autounattend ISO.
+    controllerPubKey*: string    ## ``--controller-pubkey <path>`` — SSH public
+                                 ## key (``id_ed25519.pub`` or similar) that
+                                 ## the recipe's build-autounattend-iso.sh
+                                 ## wraps into the per-VM autounattend ISO so
+                                 ## the guest's FirstLogonCommands can install
+                                 ## it in ``authorized_keys`` before the
+                                 ## controller first reaches out over SSH.
 
 const HelpText = """
 vm-harness <subcommand> [flags]
@@ -125,6 +132,11 @@ Common flags:
   --first-boot-script <path>      libvirt-only: host path to a script the
                                   recipe wraps into the per-VM autounattend
                                   ISO. Requires --recipe.
+  --controller-pubkey <path>      libvirt-only: SSH public key the recipe
+                                  bakes into the autounattend ISO so the
+                                  guest's FirstLogonCommands installs it in
+                                  authorized_keys before first boot.
+                                  Requires --recipe.
   --output-dir <path>
   --env KEY=VAL                   (repeatable)
   --copy-to host:guest            (repeatable)
@@ -248,6 +260,8 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.networkBridge = args[i]; inc i
     of "--first-boot-script":
       inc i; result.firstBootScript = args[i]; inc i
+    of "--controller-pubkey":
+      inc i; result.controllerPubKey = args[i]; inc i
     of "--output-dir":
       inc i; result.outputDir = args[i]; inc i
     of "--timeout-sec":
@@ -319,6 +333,18 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
   if result.firstBootScript.len > 0 and not fileExists(result.firstBootScript):
     raise newException(ValueError,
       &"--first-boot-script '{result.firstBootScript}': file not found")
+  # --controller-pubkey is wrapped into the autounattend ISO the same way as
+  # --first-boot-script, so we apply the same gating: it requires --recipe
+  # (only recipes that ship build-autounattend-iso.sh can pick it up) and
+  # the file must exist on the host.
+  if result.controllerPubKey.len > 0 and result.recipeDir.len == 0:
+    raise newException(ValueError,
+      "--controller-pubkey requires --recipe <id>; the pubkey is wrapped " &
+      "into the per-VM autounattend ISO by the recipe's " &
+      "build-autounattend-iso.sh helper")
+  if result.controllerPubKey.len > 0 and not fileExists(result.controllerPubKey):
+    raise newException(ValueError,
+      &"--controller-pubkey '{result.controllerPubKey}': file not found")
 
 proc logEvent*(format: LogFormat, level: string, msg: string,
               fields: openArray[(string, string)] = []) =
@@ -366,6 +392,7 @@ proc applyDefaults(spec: var BaselineSpec, opts: CliOpts) =
   # tolerant — see types.nim's BaselineSpec docstrings).
   spec.recipeDir = opts.recipeDir
   spec.firstBootScript = opts.firstBootScript
+  spec.controllerPubKey = opts.controllerPubKey
   spec.networkBridge = opts.networkBridge
   spec.backendOptions = initTable[string, string]()
 
