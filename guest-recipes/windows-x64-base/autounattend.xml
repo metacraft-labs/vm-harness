@@ -280,21 +280,43 @@
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 2. Install OpenSSH Server (in-box capability — needs the
-             default-route wait above so Add-WindowsCapability can
-             resolve its source endpoint). -->
+        <!-- 2. Install OpenSSH Server from the official PowerShell
+             Win32-OpenSSH GitHub release. We deliberately do NOT use
+             `Add-WindowsCapability -Online -Name OpenSSH.Server~~~~`
+             here, even though that's the documented "in-box"
+             install path: in practice the capability resolver hits
+             the public Microsoft Update endpoint (fe2cr.update.
+             microsoft.com), and on our libvirt-NAT'd guest with a
+             first-boot DNS state it routinely hangs for 30+ minutes
+             before either succeeding or silently failing. The
+             portable .zip from PowerShell/Win32-OpenSSH is the same
+             binaries Microsoft ships in the FOD; the .zip ships an
+             install-sshd.ps1 helper that registers the sshd service
+             and writes the SDDL the FOD install would have written.
+
+             Steps inline: download the v9.5.0.0p1-Beta release into
+             C:\Windows\Temp, expand it under C:\Program Files\OpenSSH,
+             run install-sshd.ps1, set sshd to Automatic, and start
+             it. We pin the GitHub release URL so the install is
+             reproducible against a specific binary. -->
         <SynchronousCommand wcm:action="add">
           <Order>2</Order>
-          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"</CommandLine>
-          <Description>Install OpenSSH Server capability</Description>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $u='https://github.com/PowerShell/Win32-OpenSSH/releases/download/v9.5.0.0p1-Beta/OpenSSH-Win64.zip'; $z='C:\Windows\Temp\OpenSSH-Win64.zip'; $d='C:\Program Files\OpenSSH'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri $u -OutFile $z -UseBasicParsing; Expand-Archive -LiteralPath $z -DestinationPath 'C:\Program Files' -Force; if (Test-Path 'C:\Program Files\OpenSSH-Win64') { Move-Item -Force 'C:\Program Files\OpenSSH-Win64' $d }; powershell.exe -ExecutionPolicy Bypass -File (Join-Path $d 'install-sshd.ps1')"</CommandLine>
+          <Description>Download + install Win32-OpenSSH from GitHub release</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 3. Configure sshd to start automatically and start it now. -->
+        <!-- 3. Configure sshd to start automatically and start it now.
+             Also rewrite the default sshd_config to grant
+             Administrators-group authorized_keys lookups (the FOD
+             default points at C:\ProgramData\ssh\administrators_
+             authorized_keys, which our autounattend step 6 doesn't
+             write — admin's authorized_keys lives under
+             C:\Users\admin\.ssh\authorized_keys). -->
         <SynchronousCommand wcm:action="add">
           <Order>3</Order>
-          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Set-Service -Name sshd -StartupType Automatic; Start-Service sshd"</CommandLine>
-          <Description>Enable and start sshd</Description>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Continue'; Set-Service -Name sshd -StartupType Automatic; $cfg='C:\ProgramData\ssh\sshd_config'; if (Test-Path $cfg) { $c = Get-Content $cfg; $c = $c -replace '^Match Group administrators.*','#Match Group administrators (commented by vm-harness autounattend)'; $c = $c -replace '^\s+AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys.*','#       AuthorizedKeysFile commented by vm-harness'; Set-Content -Path $cfg -Value $c -Encoding ASCII }; Start-Service sshd"</CommandLine>
+          <Description>Configure sshd auto-start, neutralise admin-keys override, start it</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
@@ -334,8 +356,8 @@
              bootstrap notes. -->
         <SynchronousCommand wcm:action="add">
           <Order>6</Order>
-          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Continue'; foreach ($d in 'D','E','F','G','H') { $p = $d + ':\controller.pub'; if (Test-Path $p) { $ssh = 'C:\Users\admin\.ssh'; New-Item -ItemType Directory -Force -Path $ssh | Out-Null; $auth = Join-Path $ssh 'authorized_keys'; $key = (Get-Content -Raw $p).Trim(); if (-not (Test-Path $auth) -or -not ((Get-Content -Raw $auth -ErrorAction SilentlyContinue) -match [regex]::Escape($key))) { Add-Content -Path $auth -Value $key }; icacls $ssh /inheritance:r /grant:r admin:F SYSTEM:F | Out-Null; icacls $auth /inheritance:r /grant:r admin:F SYSTEM:F | Out-Null; break } }"</CommandLine>
-          <Description>Install controller SSH pubkey into authorized_keys</Description>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Continue'; foreach ($d in 'D','E','F','G','H') { $p = $d + ':\controller.pub'; if (Test-Path $p) { $key = (Get-Content -Raw $p).Trim(); $ssh = 'C:\Users\admin\.ssh'; New-Item -ItemType Directory -Force -Path $ssh | Out-Null; $userAuth = Join-Path $ssh 'authorized_keys'; if (-not (Test-Path $userAuth) -or -not ((Get-Content -Raw $userAuth -ErrorAction SilentlyContinue) -match [regex]::Escape($key))) { Add-Content -Path $userAuth -Value $key -Encoding ASCII }; icacls $ssh /inheritance:r /grant:r admin:F SYSTEM:F | Out-Null; icacls $userAuth /inheritance:r /grant:r admin:F SYSTEM:F | Out-Null; $adminAuth = 'C:\ProgramData\ssh\administrators_authorized_keys'; $progDataSsh = Split-Path $adminAuth; New-Item -ItemType Directory -Force -Path $progDataSsh | Out-Null; if (-not (Test-Path $adminAuth) -or -not ((Get-Content -Raw $adminAuth -ErrorAction SilentlyContinue) -match [regex]::Escape($key))) { Add-Content -Path $adminAuth -Value $key -Encoding ASCII }; icacls $adminAuth /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null; break } }"</CommandLine>
+          <Description>Install controller SSH pubkey into user + administrators authorized_keys</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
