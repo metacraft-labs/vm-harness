@@ -75,17 +75,68 @@
            assigned in attach order; the layout the backend produces
            is: D: virtio-win.iso, E: Windows install ISO. If you
            change the bus order in the backend, update these paths. -->
+      <!-- We list BOTH D: and E: candidates for each virtio path
+           because WindowsPE's drive-letter assignment under q35 +
+           sata depends on whether the boot CD ends up in the
+           physical-drive list or gets re-mapped to X: as a RAM
+           disk. Tiny11 25H2's WinPE leaves the boot CD enumerated
+           — putting the Win11 install ISO on D: and the virtio-win
+           CD on E:. Earlier WinPE builds (and the windows-arm-base
+           recipe this was forked from) put the boot CD on X: and
+           the virtio-win disk on D:. Listing both keeps the recipe
+           working across either layout; PnpCustomizations skips
+           candidates that don't exist.
+
+           NB: removing this fallback in the past caused the install
+           to stall after 20+ min with ~5 MB written to the qcow2 —
+           Setup couldn't find virtio-blk drivers, so the
+           DiskConfiguration pass had nowhere to install to. -->
       <DriverPaths>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="vio-storage">
+        <PathAndCredentials wcm:action="add" wcm:keyValue="vio-storage-d">
           <Path>D:\amd64\w11</Path>
         </PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="vio-net">
+        <PathAndCredentials wcm:action="add" wcm:keyValue="vio-storage-e">
+          <Path>E:\amd64\w11</Path>
+        </PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="vio-net-d">
           <Path>D:\NetKVM\w11\amd64</Path>
+        </PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="vio-net-e">
+          <Path>E:\NetKVM\w11\amd64</Path>
         </PathAndCredentials>
       </DriverPaths>
     </component>
 
     <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <!-- Bypass Win11's system-requirements check. Required when the
+           host CPU is not on Microsoft's approved list (e.g. solunska's
+           Sandy Bridge Xeon E5-2650 is too old), when virtualised TPM
+           2.0 isn't exposed, or when SecureBoot can't be cleanly
+           proven. Without these LabConfig keys Setup halts with
+           "This PC can't run Windows 11" before partitioning the disk.
+           This is the same bypass Rufus and Tiny11 builders apply. -->
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassCPUCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassStorageCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
       <DiskConfiguration>
         <Disk wcm:action="add">
           <DiskID>0</DiskID>
@@ -253,15 +304,16 @@
 
         <!-- 5. Install the controller's SSH public key into the admin
              user's authorized_keys, when build-autounattend-iso.sh was
-             invoked with --controller-pubkey. The pubkey is staged at
-             the root of the autounattend ISO as controller.pub; the
-             PowerShell snippet scans removable drives for it (same
-             reason the first-boot.ps1 lookup below does), copies it
-             into C:\Users\admin\.ssh\authorized_keys, and tightens the
-             ACL so only admin + SYSTEM can read it. Without this step
-             the controller can't SSH into the guest on first boot and
-             the operator has to paste the key in by hand via the
-             console — see the M4 windows-runner-001 bootstrap notes. -->
+             invoked with the controller-pubkey flag. The pubkey is
+             staged at the root of the autounattend ISO as
+             controller.pub; the PowerShell snippet scans removable
+             drives for it (same reason the first-boot.ps1 lookup below
+             does), copies it into C:\Users\admin\.ssh\authorized_keys,
+             and tightens the ACL so only admin + SYSTEM can read it.
+             Without this step the controller can't SSH into the guest
+             on first boot and the operator has to paste the key in by
+             hand via the console — see the M4 windows-runner-001
+             bootstrap notes. -->
         <SynchronousCommand wcm:action="add">
           <Order>5</Order>
           <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Continue'; foreach ($d in 'D','E','F','G','H') { $p = $d + ':\controller.pub'; if (Test-Path $p) { $ssh = 'C:\Users\admin\.ssh'; New-Item -ItemType Directory -Force -Path $ssh | Out-Null; $auth = Join-Path $ssh 'authorized_keys'; $key = (Get-Content -Raw $p).Trim(); if (-not (Test-Path $auth) -or -not ((Get-Content -Raw $auth -ErrorAction SilentlyContinue) -match [regex]::Escape($key))) { Add-Content -Path $auth -Value $key }; icacls $ssh /inheritance:r /grant:r admin:F SYSTEM:F | Out-Null; icacls $auth /inheritance:r /grant:r admin:F SYSTEM:F | Out-Null; break } }"</CommandLine>
@@ -271,7 +323,7 @@
 
         <!-- 6. Stage the harness's first-boot bootstrap script onto C:\.
              The autounattend ISO carries first-boot.ps1 (when the
-             operator supplied --first-boot-script ./bootstrap.ps1 to
+             operator supplied the first-boot-script flag to
              build-autounattend-iso.sh). The CMD-side `for` loop
              searches removable drives for it because drive letters
              under OOBE depend on the device attach order. -->

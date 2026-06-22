@@ -133,11 +133,43 @@ const
   DefaultLibvirtWindowsSshUser* = "admin"
   DefaultLibvirtWindowsSshPassword* = "repro-windows-x64"
     ## Matches ``guest-recipes/windows-x64-base/autounattend.xml``.
-  DefaultLibvirtBootTimeoutSec* = 1800
-    ## Win11 autounattend installs can take 20-30 minutes on first
-    ## boot; this is the upper bound the harness waits before failing
-    ## a provision-from-ISO call.
+  DefaultLibvirtBootTimeoutSec* = 5400
+    ## Win11 autounattend installs typically take 20-30 minutes on
+    ## KVM, but slower hardware / disk-throughput-limited setups +
+    ## Tiny11's extra de-bloat phase can stretch close to an hour. We
+    ## give ample headroom (90 minutes) before failing a
+    ## provision-from-ISO call — an early failure here is far more
+    ## annoying than waiting a bit longer when the install is
+    ## actually progressing.
   DefaultLibvirtSshReadyTimeoutSec* = 300
+
+proc resolveLibvirtUri(libvirtUri: string): string =
+  ## Honour the standard ``LIBVIRT_DEFAULT_URI`` env var when the
+  ## caller didn't override the default. This is the convention
+  ## ``virsh``/``virt-install`` themselves follow, and it lets the
+  ## L3-REAL integration test redirect from ``qemu:///system`` to
+  ## ``qemu:///session`` (user-mode libvirt — sudo-free) without
+  ## changing the production registration.
+  if libvirtUri != DefaultLibvirtUri:
+    return libvirtUri
+  let envUri = getEnv("LIBVIRT_DEFAULT_URI")
+  if envUri.len > 0:
+    return envUri
+  return libvirtUri
+
+proc resolveImagePoolDir(libvirtUri, imagePoolDir: string): string =
+  ## When ``imagePoolDir`` is the system default but the URI is the
+  ## user-mode session, swap to the user-mode pool the libvirt
+  ## ``default`` storage-pool autocreates (``~/.local/share/libvirt/
+  ## images``). Otherwise honour what the caller passed.
+  if imagePoolDir != DefaultLibvirtImagePool:
+    return imagePoolDir
+  if libvirtUri == "qemu:///session" or libvirtUri.startsWith("qemu+") and
+     libvirtUri.endsWith("/session"):
+    let home = getEnv("HOME")
+    if home.len > 0:
+      return home / ".local" / "share" / "libvirt" / "images"
+  return imagePoolDir
 
 proc newLibvirtBackend*(virshCmd: string = "virsh",
                         virtInstallCmd: string = "virt-install",
@@ -158,6 +190,8 @@ proc newLibvirtBackend*(virshCmd: string = "virsh",
   ## windows-runner-001 prototype layout: ``qemu:///system``,
   ## ``virbr0`` NAT, qcow2 in ``/var/lib/libvirt/images``, Windows
   ## OpenSSH on TCP/22.
+  let effUri = resolveLibvirtUri(libvirtUri)
+  let effPool = resolveImagePoolDir(effUri, imagePoolDir)
   result = LibvirtBackend(
     id: biLibvirt,
     hostPlatform: hpLinux,
@@ -168,8 +202,8 @@ proc newLibvirtBackend*(virshCmd: string = "virsh",
     sshCmd: sshCmd,
     scpCmd: scpCmd,
     sshpassCmd: sshpassCmd,
-    libvirtUri: libvirtUri,
-    imagePoolDir: imagePoolDir,
+    libvirtUri: effUri,
+    imagePoolDir: effPool,
     networkBridge: networkBridge,
     sshUser: sshUser,
     sshPassword: sshPassword,
@@ -320,16 +354,32 @@ proc shutdownDomain*(b: LibvirtBackend, name: string,
   b.destroyDomain(name)
 
 proc undefineDomain*(b: LibvirtBackend, name: string,
-                     removeAllStorage: bool = true) =
-  ## ``virsh undefine --nvram [--remove-all-storage] <name>``. The
-  ## ``--nvram`` flag is required for UEFI domains (Win11 needs UEFI +
-  ## SecureBoot for the install to proceed); without it virsh refuses
-  ## to undefine the domain. Safe from finally blocks.
+                     removeAllStorage: bool = false) =
+  ## ``virsh undefine --nvram <name>``. The ``--nvram`` flag is
+  ## required for UEFI domains (Win11 needs UEFI + SecureBoot for the
+  ## install to proceed); without it virsh refuses to undefine the
+  ## domain. Safe from finally blocks.
+  ##
+  ## We deliberately do NOT pass ``--remove-all-storage`` here even
+  ## when the caller asks for it. virt-install attaches read-only
+  ## shared resources (the Windows install ISO, virtio-win.iso, the
+  ## per-run autounattend.iso) as block devices, and
+  ## ``--remove-all-storage`` treats *every* device on the domain as
+  ## VM-owned storage — including those shared paths. We saw it
+  ## silently delete ``/storage/iso/Win11_*.iso`` during a normal
+  ## teardown. Callers that want the qcow2 gone should use
+  ## ``deleteDomainDisk``.
   if not b.domainExists(name): return
-  var args = @["undefine", "--nvram", name]
-  if removeAllStorage:
-    args.add("--remove-all-storage")
-  discard b.runVirsh(args, timeoutSec = 60)
+  discard b.runVirsh(@["undefine", "--nvram", name], timeoutSec = 60)
+
+proc deleteDomainDisk*(b: LibvirtBackend, name: string) =
+  ## Delete only the per-VM qcow2 disk that ``bootFromMedia`` wrote
+  ## out, never any other libvirt-tracked storage attached to the
+  ## domain. See ``undefineDomain`` for the rationale.
+  let qcow2 = b.imagePoolDir / (name & ".qcow2")
+  if fileExists(qcow2):
+    try: removeFile(qcow2)
+    except CatchableError: discard
 
 proc autostartDomain*(b: LibvirtBackend, name: string,
                      enabled: bool = true) =
@@ -476,17 +526,31 @@ proc buildVirtInstallArgs*(b: LibvirtBackend, name: string,
     "--osinfo", osVariant,
     "--vcpus", $vcpus,
     "--memory", $memoryMB,
-    "--cpu", "host",
+    "--cpu", "host-model",
     "--machine", "q35",
     "--boot", "uefi",
     "--features", "smm.state=on",
     # Primary virtio-blk system disk (created on the default pool).
+    # boot_order=1 — UEFI tries the system disk first. On the very
+    # first boot it's empty, so BdsDxe falls through to boot_order=2
+    # (the install CD). On EVERY subsequent boot — including the
+    # mid-install reboots Windows Setup issues between WindowsPE
+    # phase 1, "specialize", and "oobeSystem" — the disk now has
+    # bootmgr written by Setup, so the firmware boots from it and
+    # Setup continues on the disk's installed copy instead of
+    # restarting from the CD. Without this, a Win11 ISO whose
+    # bootloader has been patched to ``efisys_noprompt.bin`` will
+    # loop forever: every reboot returns to firmware → CD → fresh
+    # Setup launch → reformat → reboot → ... .
     "--disk", "path=" & diskPath & ",size=" & $diskGB &
-              ",format=qcow2,bus=virtio",
+              ",format=qcow2,bus=virtio,boot_order=1",
     # Windows install media (sata CD-ROM — Win11 Setup can load
     # without virtio drivers; the autounattend uses the virtio-win
     # CD below to inject storage drivers in the WindowsPE phase).
-    "--disk", "device=cdrom,path=" & isoPath & ",bus=sata,readonly=on",
+    # boot_order=2 — only used on the very first boot when the
+    # primary disk has no bootloader yet.
+    "--disk", "device=cdrom,path=" & isoPath &
+              ",bus=sata,readonly=on,boot_order=2",
     # virtio-win driver disk (also sata; the autounattend's
     # <DriverPaths> entry pulls amd64\w11 from this CD).
     "--disk", "device=cdrom,path=" & virtioWinIsoPath &
@@ -494,7 +558,20 @@ proc buildVirtInstallArgs*(b: LibvirtBackend, name: string,
     # Autounattend CD.
     "--disk", "device=cdrom,path=" & unattendIsoPath &
               ",bus=sata,readonly=on",
-    "--network", "bridge=" & b.networkBridge & ",model=virtio",
+    # For qemu:///session we must use the SLIRP user-mode network — a
+    # regular user can't create kernel bridges. The L3-REAL integration
+    # test on a NixOS workstation runs this branch; production
+    # (qemu:///system on solunska) takes the bridge branch.
+    (if b.libvirtUri == "qemu:///session" or
+        (b.libvirtUri.startsWith("qemu+") and b.libvirtUri.endsWith("/session")):
+       "--network"
+     else:
+       "--network"),
+    (if b.libvirtUri == "qemu:///session" or
+        (b.libvirtUri.startsWith("qemu+") and b.libvirtUri.endsWith("/session")):
+       "user,model=virtio"
+     else:
+       "bridge=" & b.networkBridge & ",model=virtio"),
     "--graphics", "vnc,listen=127.0.0.1",
     "--video", "qxl",
     "--noautoconsole",
@@ -809,7 +886,9 @@ method stopAndCleanup*(b: LibvirtBackend, vm: VmHandle,
       try: b.shutdownDomain(vm.name)
       except CatchableError: discard
       if deleteVm:
-        try: b.undefineDomain(vm.name, removeAllStorage = true)
+        try: b.undefineDomain(vm.name)
+        except CatchableError: discard
+        try: b.deleteDomainDisk(vm.name)
         except CatchableError: discard
     except CatchableError:
       discard
@@ -964,7 +1043,8 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
       # Best-effort cleanup of any half-built domain.
       try:
         b.destroyDomain(domainName)
-        b.undefineDomain(domainName, removeAllStorage = true)
+        b.undefineDomain(domainName)
+        b.deleteDomainDisk(domainName)
       except CatchableError: discard
       raise newVmHarnessError($b.id, lpStartup,
         "LibvirtBackend.bootFromMedia: virt-install failed (exit " &
