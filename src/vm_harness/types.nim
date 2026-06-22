@@ -62,6 +62,37 @@ type
     diskGB*: int                 ## defaults to 50 when zero
     guestOs*: GuestOs
     guestArch*: GuestArch
+    recipeDir*: string           ## resolved path to ``guest-recipes/<id>/`` when
+                                 ## the caller passed ``--recipe <id>``; empty
+                                 ## when no recipe was supplied. Backends that
+                                 ## consume recipes (libvirt windows-x64-base
+                                 ## today) read companion artifacts relative to
+                                 ## this directory.
+    firstBootScript*: string     ## optional host path to a first-boot script
+                                 ## (e.g. ``./bootstrap-windows-runner-001.ps1``)
+                                 ## that the recipe wraps into the per-VM
+                                 ## autounattend ISO at provision time.
+    controllerPubKey*: string    ## optional host path to an SSH public key
+                                 ## (typically ``id_ed25519.pub``) that the
+                                 ## recipe wraps into the per-VM autounattend
+                                 ## ISO. The autounattend's FirstLogonCommands
+                                 ## block reads it back inside the guest and
+                                 ## writes the key into
+                                 ## ``C:\Users\<sshUser>\.ssh\authorized_keys``
+                                 ## so the controller can reach the guest over
+                                 ## SSH on first boot without a manual paste.
+    networkBridge*: string       ## libvirt-specific: name of the host bridge
+                                 ## the guest's primary NIC attaches to
+                                 ## (``virbr0`` for default NAT, ``br0`` for an
+                                 ## L2 bridge). Empty means "use the backend's
+                                 ## configured default". Other backends ignore.
+    backendOptions*: Table[string, string]
+                                 ## Free-form per-backend overrides. Used as the
+                                 ## escape hatch for backend-specific knobs that
+                                 ## haven't earned a typed field yet — callers
+                                 ## must namespace keys (``libvirt.<x>``,
+                                 ## ``hyperv.<x>``, ...). Unrecognised keys MUST
+                                 ## be ignored by the backend, not error.
 
   VmHandle* = ref object
     ## Live, started VM ready for ``execInGuest``. Backends construct one in

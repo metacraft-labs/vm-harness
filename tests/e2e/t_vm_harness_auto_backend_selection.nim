@@ -71,6 +71,17 @@ suite "e2e_vm_harness_auto_backend_selection":
           if v.name == utm.goldenBundleName: goldenPresent = true
         if not goldenPresent:
           canExercise = false
+      if canExercise and backend.id == biLibvirt:
+        # Only exercise libvirt if the test baseline already exists
+        # as a defined domain. The M4 Phase A slice's
+        # provisionBaseline needs either a pre-defined domain or a
+        # real ISO source — neither is plausible from this generic
+        # selection test, so we skip the lifecycle exercise. The
+        # libvirt-specific lifecycle is covered by
+        # tests/integration/t_libvirt_backend.nim.
+        let lv = cast[LibvirtBackend](backend)
+        if not lv.domainExists("auto-cell-baseline"):
+          canExercise = false
       if canExercise:
         backend.provisionBaseline(BaselineSpec(name: "auto-cell-baseline"))
         let vm = backend.revertToBaseline("auto-cell-baseline")
@@ -93,10 +104,24 @@ suite "e2e_vm_harness_auto_backend_selection":
                 of hpLinux:   goLinux        # → libvirt
                 of hpMacosArm: goLinux       # → tart-linux-arm
     let (id, backend) = newBackendForGuest(host, guest, noopFallback = true)
-    backend.provisionBaseline(BaselineSpec(name: "auto-cli-baseline"))
-    let envelope = newOutputEnvelope(outDir)
-    let gate = GateSpec(name: "auto-cli", baseline: "auto-cli-baseline",
-                        cmd: @["/bin/echo", "auto-selected:" & $id])
-    let r = runGate(backend, gate, envelope)
-    check r.verdict == vPass
-    check fileExists(outDir / "DONE")
+    # Skip the live-libvirt exercise on Linux hosts where the real
+    # libvirt backend is auto-selected: provisioning a fresh baseline
+    # would need a real Win11 ISO. The libvirt CLI dispatch path is
+    # covered by tests/integration/t_libvirt_backend.nim.
+    let libvirtNeedsBaseline =
+      backend.id == biLibvirt and
+      not cast[LibvirtBackend](backend).domainExists("auto-cli-baseline")
+    if libvirtNeedsBaseline:
+      # Skip the live-libvirt exercise on Linux hosts where the real
+      # libvirt backend is auto-selected: provisioning a fresh
+      # baseline would need a real Win11 ISO. The libvirt CLI dispatch
+      # path is covered by tests/integration/t_libvirt_backend.nim.
+      skip()
+    else:
+      backend.provisionBaseline(BaselineSpec(name: "auto-cli-baseline"))
+      let envelope = newOutputEnvelope(outDir)
+      let gate = GateSpec(name: "auto-cli", baseline: "auto-cli-baseline",
+                          cmd: @["/bin/echo", "auto-selected:" & $id])
+      let r = runGate(backend, gate, envelope)
+      check r.verdict == vPass
+      check fileExists(outDir / "DONE")

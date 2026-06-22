@@ -12,35 +12,54 @@ Rust port lives at `agent-harbor/main/crates/ah-vm/` (M17 of the
 
 ## Status
 
-**M1 — Hyper-V + WSL backends** is the current milestone. Today the
-repo ships:
+Shipped milestones:
+
+- **M1 — Hyper-V + WSL backends** (`src/vm_harness/backends/hyperv.nim`,
+  `wsl.nim`). PowerShell Direct over VMBus for Hyper-V; `wsl --import` /
+  `wsl --exec` for WSL2.
+- **M1.5 — bootFromMedia + serial-stream primitives**. Transient VM
+  bring-up around a VHDX/ISO/rootfs tarball with serial-console
+  capture for boot-time assertions.
+- **M2 — Tart** (`src/vm_harness/backends/tart.nim`). macOS Apple
+  Silicon host, macOS and Linux-ARM guests.
+- **M3 — UTM** (`src/vm_harness/backends/utm.nim`, partial).
+  Windows-on-ARM guest via UTM on macOS; clone-based per-gate revert
+  through `utmctl clone`.
+- **M4 Phase A slice — libvirt / QEMU/KVM** (`src/vm_harness/backends/libvirt.nim`).
+  Linux host, x86_64 Windows or Linux guests via `virt-install` +
+  `virsh`. Targets the windows-runner-001 prototype on
+  `solunska-server`. See `docs/m4-libvirt.md` for Phase B/C scope.
+- **M5 — Lima** (`src/vm_harness/backends/lima.nim`). macOS / Linux
+  host, Linux guest via `limactl`.
+
+Cross-cutting infrastructure that ships across all of the above:
 
 - The `VmBackend` concept and supporting types (`docs/design.md` §3.2).
 - A `NoopBackend` reference fixture for testing the harness scaffolding
   without any real hypervisor — the only allowed mock per the test
   methodology in `docs/design.md` §9.
-- A **`HyperVBackend`** adapter (`src/vm_harness/backends/hyperv.nim`)
-  that drives Hyper-V via PowerShell Direct over VMBus and wraps
-  reprobuild's existing `run-hyperv-m69-system.ps1` /
-  `provision-base-vm.ps1` for the reprobuild-specific orchestration.
-- A **`WslBackend`** adapter (`src/vm_harness/backends/wsl.nim`) that
-  drives WSL2 via `wsl --import` / `wsl <distro> --exec` /
-  `wsl --unregister`, and wraps reprobuild's existing
-  `run-wsl-m69-posix.ps1` for the reprobuild-specific orchestration.
 - The Tier-1 in-guest scripts (`guest-scripts/posix.sh`,
   `guest-scripts/windows.ps1`) embedded into the library via
   `staticRead` (design choice #1 in `docs/design.md` §12).
 - The standardized output envelope writer (`00-provision.log`,
   `02-<cmd>-run.txt`, `RESULT.txt`, `DONE`).
-- The CLI dispatcher (`vm-harness {provision,run,probe,shell,backends}`)
-  with `--backend auto` selection per (host OS, guest OS); the
-  `--backend hyperv` and `--backend wsl` selectors are now wired
+- The CLI dispatcher
+  (`vm-harness {provision,run,probe,shell,backends,snapshot,baseline}`)
+  with `--backend auto` selection per (host OS, guest OS); every
+  backend listed above has its `--backend <id>` selector wired
   through the registry.
 - The `try/finally` orchestrator that guarantees `stopAndCleanup` runs
   even on gate failure or SIGINT.
+- M30 snapshot/restore parity (Hyper-V, Lima, Tart, UTM) and M31 hot
+  snapshots + portable baseline export/import (Hyper-V; clone-based
+  parity on Tart/UTM).
 
-Subsequent backend implementations land in M2 (Tart), M3 (UTM),
-M4 (libvirt/QEMU), M5 (Lima).
+Outstanding:
+
+- **M4 Phase B** — libvirt snapshot/restore, argv-trace shim,
+  serial-stream primitives. Tracked in `docs/m4-libvirt.md`.
+- **M4 Phase C** — libvirt GPU + SR-IOV + USB passthrough. Gated on
+  applicable runner hardware.
 
 ## Layout
 
@@ -62,11 +81,16 @@ vm-harness/
 │           ├── process_helpers.nim   # shared PS / wsl.exe helpers (M1)
 │           ├── hyperv.nim            # M1
 │           ├── wsl.nim               # M1
-│           └── (tart, utm, libvirt, lima — M2-M5)
+│           ├── tart.nim              # M2
+│           ├── utm.nim               # M3
+│           ├── libvirt.nim           # M4 Phase A (slice)
+│           └── lima.nim              # M5
 ├── guest-scripts/
 │   ├── posix.sh
 │   └── windows.ps1
-├── guest-recipes/           # OS-bootstrap recipes (M3 onward)
+├── guest-recipes/           # OS-bootstrap recipes
+│   ├── windows-arm-base/    # UTM Win11-on-ARM golden (M3)
+│   └── windows-x64-base/    # libvirt Win11-on-x64 baseline (M4 Phase A)
 ├── tests/
 │   ├── unit/
 │   ├── integration/
@@ -74,6 +98,7 @@ vm-harness/
 ├── golden-outputs/          # M12 cross-language reference artifacts
 └── docs/
     ├── design.md            # mirror of reprobuild-specs/VM-Harness-Design.md
+    ├── m4-libvirt.md        # M4 Phase A slice scope + Phase B/C plan
     └── per-backend-notes/
 ```
 
