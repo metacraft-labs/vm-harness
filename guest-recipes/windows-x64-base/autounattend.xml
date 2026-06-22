@@ -356,8 +356,28 @@
              bootstrap notes. -->
         <SynchronousCommand wcm:action="add">
           <Order>6</Order>
-          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Continue'; foreach ($d in 'D','E','F','G','H') { $p = $d + ':\controller.pub'; if (Test-Path $p) { $key = (Get-Content -Raw $p).Trim(); $ssh = 'C:\Users\admin\.ssh'; New-Item -ItemType Directory -Force -Path $ssh | Out-Null; $userAuth = Join-Path $ssh 'authorized_keys'; if (-not (Test-Path $userAuth) -or -not ((Get-Content -Raw $userAuth -ErrorAction SilentlyContinue) -match [regex]::Escape($key))) { Add-Content -Path $userAuth -Value $key -Encoding ASCII }; icacls $ssh /inheritance:r /grant:r admin:F SYSTEM:F | Out-Null; icacls $userAuth /inheritance:r /grant:r admin:F SYSTEM:F | Out-Null; $adminAuth = 'C:\ProgramData\ssh\administrators_authorized_keys'; $progDataSsh = Split-Path $adminAuth; New-Item -ItemType Directory -Force -Path $progDataSsh | Out-Null; if (-not (Test-Path $adminAuth) -or -not ((Get-Content -Raw $adminAuth -ErrorAction SilentlyContinue) -match [regex]::Escape($key))) { Add-Content -Path $adminAuth -Value $key -Encoding ASCII }; icacls $adminAuth /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null; break } }"</CommandLine>
-          <Description>Install controller SSH pubkey into user + administrators authorized_keys</Description>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "foreach ($d in 'D','E','F','G','H') { $p=$d+':\controller.pub'; if (Test-Path $p) { Copy-Item $p C:\Windows\Temp\controller.pub -Force; break } }"</CommandLine>
+          <Description>Stage controller.pub on C:\Windows\Temp</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 6b. Install controller pubkey into admin's authorized_keys
+             with strict ACLs (Administrators + SYSTEM only). -->
+        <SynchronousCommand wcm:action="add">
+          <Order>7</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "if (Test-Path C:\Windows\Temp\controller.pub) { $k=(Get-Content -Raw C:\Windows\Temp\controller.pub).Trim(); $s='C:\Users\admin\.ssh'; New-Item -ItemType Directory -Force $s | Out-Null; $a=Join-Path $s 'authorized_keys'; Set-Content $a -Value $k -Encoding ASCII; icacls $s /inheritance:r /grant:r admin:F SYSTEM:F | Out-Null; icacls $a /inheritance:r /grant:r admin:F SYSTEM:F | Out-Null }"</CommandLine>
+          <Description>Install pubkey into admin user authorized_keys</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 6c. Mirror the pubkey to administrators_authorized_keys
+             so sshd's Match Group administrators block (which the
+             FOD enables by default and step 3's regex sometimes
+             misses) finds the key. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>8</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "if (Test-Path C:\Windows\Temp\controller.pub) { $k=(Get-Content -Raw C:\Windows\Temp\controller.pub).Trim(); $a='C:\ProgramData\ssh\administrators_authorized_keys'; New-Item -ItemType Directory -Force (Split-Path $a) | Out-Null; Set-Content $a -Value $k -Encoding ASCII; icacls $a /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null }"</CommandLine>
+          <Description>Mirror pubkey to administrators_authorized_keys</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
@@ -368,35 +388,35 @@
              searches removable drives for it because drive letters
              under OOBE depend on the device attach order. -->
         <SynchronousCommand wcm:action="add">
-          <Order>7</Order>
+          <Order>9</Order>
           <CommandLine>cmd.exe /c "for %i in (D E F G H) do if exist %i:\first-boot.ps1 copy /Y %i:\first-boot.ps1 C:\first-boot.ps1"</CommandLine>
           <Description>Stage first-boot.ps1 on C:\</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 8. Run the first-boot script if present (idempotent —
+        <!-- 10. Run the first-boot script if present (idempotent —
              the script itself is responsible for not re-running
              work on subsequent boots). -->
         <SynchronousCommand wcm:action="add">
-          <Order>8</Order>
+          <Order>10</Order>
           <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "if (Test-Path C:\first-boot.ps1) { &amp; C:\first-boot.ps1 *&gt; C:\Windows\Temp\first-boot.log }"</CommandLine>
           <Description>Run first-boot.ps1 if present</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 9. Marker file the recipe scripts (and the libvirt
+        <!-- 11. Marker file the recipe scripts (and the libvirt
              backend's startAndAwaitReady) poll for. Written before
              shutdown so the controller can confirm via SSH after the
              VM is restarted that the install finished without
              aborting partway through. -->
         <SynchronousCommand wcm:action="add">
-          <Order>9</Order>
+          <Order>11</Order>
           <CommandLine>cmd.exe /c "echo install-done > C:\Windows\Temp\repro-install-done"</CommandLine>
           <Description>Write install-done sentinel</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 10. Shut the guest down so the libvirt backend's
+        <!-- 12. Shut the guest down so the libvirt backend's
              virt-install wait flag sees the domain transition to
              "shut off" and treats that as install-complete. Without
              this, virt-install waits the full bootTimeoutSec (90
@@ -405,9 +425,9 @@
              controller restarts the VM in the next step
              (startAndAwaitReady) once provision returns. -->
         <SynchronousCommand wcm:action="add">
-          <Order>10</Order>
+          <Order>12</Order>
           <CommandLine>cmd.exe /c "shutdown /s /t 5 /c \"vm-harness FirstLogonCommands complete; signalling install-done to virt-install\""</CommandLine>
-          <Description>Shut down to signal install-complete to virt-install --wait</Description>
+          <Description>Shut down to signal install-complete to virt-install wait</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
       </FirstLogonCommands>
