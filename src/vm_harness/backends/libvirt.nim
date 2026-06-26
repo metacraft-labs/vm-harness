@@ -531,26 +531,32 @@ proc buildVirtInstallArgs*(b: LibvirtBackend, name: string,
     "--boot", "uefi",
     "--features", "smm.state=on",
     # Primary virtio-blk system disk (created on the default pool).
-    # boot_order=1 — UEFI tries the system disk first. On the very
-    # first boot it's empty, so BdsDxe falls through to boot_order=2
-    # (the install CD). On EVERY subsequent boot — including the
-    # mid-install reboots Windows Setup issues between WindowsPE
-    # phase 1, "specialize", and "oobeSystem" — the disk now has
-    # bootmgr written by Setup, so the firmware boots from it and
-    # Setup continues on the disk's installed copy instead of
-    # restarting from the CD. Without this, a Win11 ISO whose
-    # bootloader has been patched to ``efisys_noprompt.bin`` will
-    # loop forever: every reboot returns to firmware → CD → fresh
-    # Setup launch → reformat → reboot → ... .
+    # boot_order=2 — UEFI tries the install CD first. Once Setup
+    # writes bootmgr to the disk in WindowsPE phase 1, the Windows
+    # bootloader registers itself as a UEFI boot entry (BOOTX64.EFI
+    # under \EFI\Microsoft\Boot\), and the firmware's
+    # ``BootOrder`` variable starts preferring it ahead of the
+    # ``boot_order`` knob virt-install set here. Subsequent
+    # mid-install reboots therefore boot from the disk, not from
+    # the CD — exactly the convergence we want — and the install
+    # finishes without looping on the CD's "Press any key to boot
+    # from CD" prompt.
+    #
+    # We previously kept the disk at boot_order=1 (CD at 2) to lean
+    # on UEFI's "try next boot option on failure" behavior on the
+    # first boot, but Tianocore's BdsDxe doesn't reliably fall
+    # through from an empty virtio-blk disk to a SATA CD-ROM — it
+    # stalls at "No bootable option or device was found" instead
+    # of advancing to the next entry. Putting the CD first dodges
+    # that codepath entirely.
     "--disk", "path=" & diskPath & ",size=" & $diskGB &
-              ",format=qcow2,bus=virtio,boot_order=1",
+              ",format=qcow2,bus=virtio,boot_order=2",
     # Windows install media (sata CD-ROM — Win11 Setup can load
     # without virtio drivers; the autounattend uses the virtio-win
     # CD below to inject storage drivers in the WindowsPE phase).
-    # boot_order=2 — only used on the very first boot when the
-    # primary disk has no bootloader yet.
+    # boot_order=1 — primary boot source for the install lifecycle.
     "--disk", "device=cdrom,path=" & isoPath &
-              ",bus=sata,readonly=on,boot_order=2",
+              ",bus=sata,readonly=on,boot_order=1",
     # virtio-win driver disk (also sata; the autounattend's
     # <DriverPaths> entry pulls amd64\w11 from this CD).
     "--disk", "device=cdrom,path=" & virtioWinIsoPath &
