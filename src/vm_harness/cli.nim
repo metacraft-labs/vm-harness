@@ -66,6 +66,13 @@ type
     recipeDir*: string           ## resolved absolute path to the recipe dir
                                  ## (parseCliOpts performs the lookup so the
                                  ## error surfaces at parse time).
+    recipeBuildDir*: string      ## ``--recipe-build-dir <path>`` — writable
+                                 ## location for the recipe's ``build/`` outputs
+                                 ## (autounattend.iso, virtio-win.iso symlink,
+                                 ## Win11_*.iso symlink). When unset the backend
+                                 ## falls back to ``<recipeDir>/build`` which is
+                                 ## read-only when the recipe is shipped under
+                                 ## /nix/store.
     name*: string                ## ``--name <vm>`` — alias for ``--baseline``
                                  ## per the canonical libvirt M4 command.
                                  ## When both are passed the values must match.
@@ -244,6 +251,8 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       result.recipe = args[i]
       result.recipeDir = resolveRecipeDir(args[i])
       inc i
+    of "--recipe-build-dir":
+      inc i; result.recipeBuildDir = args[i]; inc i
     of "--source-image":
       inc i; result.sourceImage = args[i]; inc i
     of "--cpus", "--vcpu":
@@ -396,6 +405,7 @@ proc applyDefaults(spec: var BaselineSpec, opts: CliOpts) =
   # consume these fields ignore them (the contract is intentionally
   # tolerant — see types.nim's BaselineSpec docstrings).
   spec.recipeDir = opts.recipeDir
+  spec.recipeBuildDir = opts.recipeBuildDir
   spec.firstBootScript = opts.firstBootScript
   spec.controllerPubKey = opts.controllerPubKey
   spec.networkBridge = opts.networkBridge

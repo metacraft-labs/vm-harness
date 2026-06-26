@@ -36,7 +36,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-BUILD_DIR="${SCRIPT_DIR}/build"
+# VMH_BUILD_DIR lets the caller redirect outputs to a writable
+# directory when the recipe lives in /nix/store (e.g. when shipped
+# inside a Nix-built vm-harness package). When unset we keep the
+# historical "<SCRIPT_DIR>/build" shape so in-tree developer
+# workflows stay byte-identical.
+BUILD_DIR="${VMH_BUILD_DIR:-${SCRIPT_DIR}/build}"
 STAGE_DIR="${BUILD_DIR}/autounattend-stage"
 ISO_PATH="${BUILD_DIR}/autounattend.iso"
 FIRST_BOOT_SRC=""

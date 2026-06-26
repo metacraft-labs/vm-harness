@@ -68,6 +68,14 @@ type
                                  ## consume recipes (libvirt windows-x64-base
                                  ## today) read companion artifacts relative to
                                  ## this directory.
+    recipeBuildDir*: string      ## optional override for the recipe's per-run
+                                 ## ``build/`` directory (autounattend.iso,
+                                 ## virtio-win.iso, Win11_*.iso symlink). Empty
+                                 ## falls back to ``<recipeDir>/build`` — which
+                                 ## is writable for in-tree checkouts but
+                                 ## read-only when ``recipeDir`` lives under
+                                 ## ``/nix/store``. The CLI exposes this as
+                                 ## ``--recipe-build-dir``.
     firstBootScript*: string     ## optional host path to a first-boot script
                                  ## (e.g. ``./bootstrap-windows-runner-001.ps1``)
                                  ## that the recipe wraps into the per-VM

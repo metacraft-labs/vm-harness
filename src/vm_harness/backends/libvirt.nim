@@ -678,7 +678,18 @@ method provisionBaseline*(b: LibvirtBackend, spec: BaselineSpec) =
     let recipeDir =
       if spec.recipeDir.len > 0: spec.recipeDir
       else: getCurrentDir() / "guest-recipes" / "windows-x64-base"
-    let recipeBuildDir = recipeDir / "build"
+    # The per-run build dir holds autounattend.iso (built here),
+    # virtio-win.iso (downloaded by fetch-iso.sh or symlinked from
+    # the operator's host pool), and the Win11_*.iso symlink. When
+    # the operator passed --recipe-build-dir we use that — required
+    # for a /nix/store-resident recipeDir that's read-only — and
+    # otherwise fall back to ``<recipeDir>/build`` to preserve the
+    # in-tree workflow.
+    let recipeBuildDir =
+      if spec.recipeBuildDir.len > 0: spec.recipeBuildDir
+      else: recipeDir / "build"
+    if spec.recipeBuildDir.len > 0:
+      createDir(recipeBuildDir)
     # When the operator passed --first-boot-script, invoke the recipe's
     # build-autounattend-iso.sh helper (idempotent — it overwrites
     # build/autounattend.iso) before virt-install. This is what makes
@@ -704,7 +715,19 @@ method provisionBaseline*(b: LibvirtBackend, spec: BaselineSpec) =
         # authorized_keys before the controller first touches the guest.
         buildArgv.add("--controller-pubkey")
         buildArgv.add(spec.controllerPubKey)
-      let br = runProcessCapture(buildArgv, cwd = recipeDir, timeoutSec = 120)
+      # Pass VMH_BUILD_DIR so the builder writes its outputs
+      # (autounattend-stage, autounattend.iso) into the writable
+      # recipe-build-dir instead of trying to write next to itself
+      # when it lives under /nix/store.
+      var builderEnv = initTable[string, string]()
+      # Inherit existing PATH so xorriso/sed/awk that the unit's
+      # runtimeInputs put on the PATH stay visible.
+      for k in ["PATH", "HOME", "TMPDIR"]:
+        let v = getEnv(k)
+        if v.len > 0: builderEnv[k] = v
+      builderEnv["VMH_BUILD_DIR"] = recipeBuildDir
+      let br = runProcessCapture(buildArgv, cwd = recipeDir,
+        timeoutSec = 120, env = builderEnv)
       if br.exitCode != 0:
         raise newVmHarnessError($b.id, lpProvisioning,
           "build-autounattend-iso.sh failed (exit " & $br.exitCode &
