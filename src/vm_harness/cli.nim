@@ -174,6 +174,9 @@ proc resolveRecipeDir*(recipeId: string): string =
   ##   3. ``<exe-dir>/../guest-recipes/<id>``
   ##   4. ``<exe-dir>/../../guest-recipes/<id>``
   ##                                       (installed binary under build/bin/)
+  ##   5. ``<exe-dir>/../share/vm-harness/guest-recipes/<id>``
+  ##                                       (Nix-packaged binary; matches
+  ##                                       the flake's installPhase).
   ##
   ## Raises ``ValueError`` when the directory doesn't exist anywhere — the
   ## parse-time error surfaces the typo immediately instead of failing
@@ -193,6 +196,8 @@ proc resolveRecipeDir*(recipeId: string): string =
   let exeDir = getAppDir()
   candidates.add(exeDir / ".." / "guest-recipes" / recipeId)
   candidates.add(exeDir / ".." / ".." / "guest-recipes" / recipeId)
+  candidates.add(
+    exeDir / ".." / "share" / "vm-harness" / "guest-recipes" / recipeId)
   for c in candidates:
     if dirExists(c):
       return absolutePath(c)

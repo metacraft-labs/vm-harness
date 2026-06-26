@@ -58,9 +58,17 @@
               -o:vm-harness src/vm_harness/cli.nim
           '';
           installPhase = ''
-            mkdir -p $out/bin $out/share/vm-harness/guest-scripts
+            mkdir -p $out/bin \
+              $out/share/vm-harness/guest-scripts \
+              $out/share/vm-harness/guest-recipes
             install -m755 vm-harness $out/bin/vm-harness
             cp -R guest-scripts/* $out/share/vm-harness/guest-scripts/
+            # Recipes (autounattend.xml + helper scripts) are
+            # required at runtime by the libvirt backend's
+            # build-autounattend-iso step. Ship them next to the
+            # binary so `--recipe windows-x64-base` resolves
+            # without the operator setting VMH_RECIPES_DIR.
+            cp -R guest-recipes/* $out/share/vm-harness/guest-recipes/
           '';
         };
       });
