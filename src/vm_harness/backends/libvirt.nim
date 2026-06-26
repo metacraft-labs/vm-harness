@@ -528,23 +528,23 @@ proc buildVirtInstallArgs*(b: LibvirtBackend, name: string,
     "--memory", $memoryMB,
     "--cpu", "host-model",
     "--machine", "q35",
-    # ``--boot uefi`` selects the OVMF secure-boot pflash + secure
-    # loader, but virt-install's default for the underlying
-    # ``firmware.feature``'s ``enrolled-keys`` is ``no`` — the OVMF
-    # vars file ships without Microsoft's UEFI CA keys, so the
-    # firmware refuses to load Microsoft-signed bootmgr off the
-    # Win11 install CD and stalls at
+    # Disable secure-boot for the OVMF firmware. The libosinfo win11
+    # profile activates secure-boot=yes by default, which requires
+    # Microsoft's UEFI CA keys to be enrolled in the per-VM nvram
+    # vars file. The nixpkgs OVMF derivation in current use only
+    # ships the bare ``edk2-i386-vars.fd`` template (no
+    # key-enrolled variant), so secure-boot=yes silently rejects the
+    # Microsoft-signed bootmgr off the Win11 install CD and stalls
+    # at ``BdsDxe: No bootable option or device was found``.
     #
-    #   BdsDxe: failed to load Boot0001 "UEFI QEMU DVD-ROM ..."
-    #   BdsDxe: No bootable option or device was found.
-    #
-    # Enable ``enrolled-keys=yes`` so libvirt copies an
-    # MS-keys-enrolled vars template into the per-VM nvram file at
-    # define time. Pairs with secure-boot=yes (the OVMF profile
-    # libosinfo's win11 OS pulls in) to satisfy Win11's TPM + secure-
-    # boot install gates.
+    # Win11's setup-time policy only enforces TPM 2.0 (which the
+    # ``tpm`` block above provides); secure-boot enforcement at
+    # install time is checked but doesn't block installation when
+    # disabled at the firmware level. The runner workload doesn't
+    # need secure-boot post-install either — it's an ephemeral CI
+    # box that reverts to a clean snapshot between jobs.
     "--boot",
-    "uefi,firmware.feature0.enabled=yes,firmware.feature0.name=enrolled-keys",
+    "uefi,firmware.feature0.enabled=no,firmware.feature0.name=secure-boot,loader.secure=no",
     "--features", "smm.state=on",
     # Primary virtio-blk system disk (created on the default pool).
     # boot_order=2 — UEFI tries the install CD first. Once Setup
