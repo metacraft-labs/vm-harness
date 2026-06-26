@@ -528,7 +528,23 @@ proc buildVirtInstallArgs*(b: LibvirtBackend, name: string,
     "--memory", $memoryMB,
     "--cpu", "host-model",
     "--machine", "q35",
-    "--boot", "uefi",
+    # ``--boot uefi`` selects the OVMF secure-boot pflash + secure
+    # loader, but virt-install's default for the underlying
+    # ``firmware.feature``'s ``enrolled-keys`` is ``no`` — the OVMF
+    # vars file ships without Microsoft's UEFI CA keys, so the
+    # firmware refuses to load Microsoft-signed bootmgr off the
+    # Win11 install CD and stalls at
+    #
+    #   BdsDxe: failed to load Boot0001 "UEFI QEMU DVD-ROM ..."
+    #   BdsDxe: No bootable option or device was found.
+    #
+    # Enable ``enrolled-keys=yes`` so libvirt copies an
+    # MS-keys-enrolled vars template into the per-VM nvram file at
+    # define time. Pairs with secure-boot=yes (the OVMF profile
+    # libosinfo's win11 OS pulls in) to satisfy Win11's TPM + secure-
+    # boot install gates.
+    "--boot",
+    "uefi,firmware.feature0.enabled=yes,firmware.feature0.name=enrolled-keys",
     "--features", "smm.state=on",
     # Primary virtio-blk system disk (created on the default pool).
     # boot_order=2 — UEFI tries the install CD first. Once Setup
