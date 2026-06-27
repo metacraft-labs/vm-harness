@@ -665,14 +665,82 @@ method provisionBaseline*(b: LibvirtBackend, spec: BaselineSpec) =
         "treat the call as a no-op) or pass --source-image with " &
         "the Windows install ISO path")
 
-    # qcow2 fast path: pre-built baseline — just define the domain and
-    # return. virt-install is overkill for this case and would re-run
-    # the install.
+    # qcow2 fast path: pre-built baseline. The operator points
+    # ``--source-image`` at a known-good Win11 qcow2 (e.g. a snapshot
+    # created from a successful prior install). We clone it as the
+    # per-VM disk via a qcow2 backing-file relationship and define a
+    # minimal domain — no virt-install, no autounattend, no install
+    # ISOs. ``virsh start`` then boots the cloned image directly.
+    #
+    # Use case: the libvirt M4 install path requires a Win11 ISO with
+    # both BIOS and UEFI El Torito records AND an OVMF that auto-boots
+    # the UEFI eltorito image. When either is missing (BIOS-only ISOs,
+    # OVMF versions that don't auto-discover) the install path stalls
+    # at the firmware boot menu. The qcow2 path side-steps the entire
+    # firmware-discovery layer.
     if spec.sourceImage.endsWith(".qcow2"):
-      raise newException(BackendUnavailableError,
-        "LibvirtBackend.provisionBaseline: qcow2 import path is not " &
-        "implemented in the M4 Phase A slice. Use the ISO+autounattend " &
-        "code path, or define the domain manually via virsh.")
+      if not fileExists(spec.sourceImage):
+        raise newException(IOError,
+          "LibvirtBackend.provisionBaseline: --source-image qcow2 " &
+          "does not exist: " & spec.sourceImage)
+      let cpus = if spec.cpus > 0: spec.cpus else: 2
+      let mem = if spec.memoryMB > 0: spec.memoryMB else: 4096
+      if spec.networkBridge.len > 0:
+        b.networkBridge = spec.networkBridge
+      let diskPath = b.imagePoolDir / (spec.name & ".qcow2")
+      # Clone-on-write: the per-VM qcow2 is a thin overlay over the
+      # operator-supplied baseline. Writes are local to the overlay so
+      # the baseline stays clean and can back any number of runners.
+      let createArgs = @["qemu-img", "create",
+        "-F", "qcow2",
+        "-b", spec.sourceImage,
+        "-f", "qcow2",
+        diskPath]
+      let createRes = runProcessCapture(createArgs, timeoutSec = 60)
+      if createRes.exitCode != 0:
+        raise newVmHarnessError($b.id, lpProvisioning,
+          "qemu-img create (qcow2 backing " & spec.sourceImage &
+          ") failed (exit " & $createRes.exitCode &
+          "): " & createRes.stdout)
+      # Define the minimal q35 UEFI domain via a per-call virsh
+      # define so the firmware path matches the install branch.
+      # virt-install --import does this in one shot.
+      let importArgs = @[
+        "virt-install",
+        "--connect", b.libvirtUri,
+        "--name", spec.name,
+        "--osinfo", "win11",
+        "--vcpus", $cpus,
+        "--memory", $mem,
+        "--cpu", "host-model",
+        "--machine", "q35",
+        # Match the install path's secure-boot stance (see the
+        # ISO+autounattend branch below for the rationale).
+        "--boot",
+        "uefi,firmware.feature0.enabled=no,firmware.feature0.name=secure-boot,loader.secure=no",
+        "--features", "smm.state=on",
+        "--disk", "path=" & diskPath & ",format=qcow2,bus=virtio",
+        "--network", "bridge=" & b.networkBridge & ",model=virtio",
+        "--graphics", "vnc,listen=127.0.0.1",
+        "--video", "qxl",
+        "--noautoconsole",
+        "--import",
+        "--noreboot"
+      ]
+      let importRes = runProcessCapture(importArgs, timeoutSec = 120)
+      if importRes.exitCode != 0:
+        raise newVmHarnessError($b.id, lpProvisioning,
+          "virt-install --import failed (exit " & $importRes.exitCode &
+          "): " & importRes.stdout)
+      # Start the domain (--noreboot above keeps it powered off after
+      # the import).
+      let startArgs = b.virshArgs(@["start", spec.name])
+      let startRes = runProcessCapture(startArgs, timeoutSec = 60)
+      if startRes.exitCode != 0:
+        raise newVmHarnessError($b.id, lpProvisioning,
+          "virsh start failed (exit " & $startRes.exitCode &
+          "): " & startRes.stdout)
+      return
 
     if not fileExists(spec.sourceImage):
       raise newException(IOError,
