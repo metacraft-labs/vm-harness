@@ -109,7 +109,7 @@
 
     <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <!-- Bypass Win11's system-requirements check. Required when the
-           host CPU is not on Microsoft's approved list (e.g. solunska's
+           host CPU is not on Microsoft's approved list (e.g. high-mem-server's
            Sandy Bridge Xeon E5-2650 is too old), when virtualised TPM
            2.0 isn't exposed, or when SecureBoot can't be cleanly
            proven. Without these LabConfig keys Setup halts with

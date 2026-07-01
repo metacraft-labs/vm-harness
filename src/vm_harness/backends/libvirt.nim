@@ -1,6 +1,6 @@
 ## LibvirtBackend — vm-harness adapter for libvirt + QEMU/KVM on Linux
 ## hosts. Per design doc §4.5 and the M4 slice for the
-## windows-runner-001 prototype on ``solunska-server``.
+## windows-runner-001 prototype on ``high-mem-server``.
 ##
 ## *Scope of this slice (M4 Phase A):*
 ##
@@ -101,7 +101,7 @@ type
     libvirtUri*: string
       ## libvirt connection URI. Defaults to ``qemu:///system``
       ## (the rootful system instance, which is what
-      ## solunska-server runs).
+      ## high-mem-server runs).
     imagePoolDir*: string
       ## Directory backing the default libvirt storage pool. Used to
       ## resolve where ``virt-install`` writes the qcow2 (and where
@@ -186,7 +186,7 @@ proc newLibvirtBackend*(virshCmd: string = "virsh",
                         bootTimeoutSec: int = DefaultLibvirtBootTimeoutSec,
                         sshReadyTimeoutSec: int =
                           DefaultLibvirtSshReadyTimeoutSec): LibvirtBackend =
-  ## Construct a LibvirtBackend. Defaults match the solunska-server
+  ## Construct a LibvirtBackend. Defaults match the high-mem-server
   ## windows-runner-001 prototype layout: ``qemu:///system``,
   ## ``virbr0`` NAT, qcow2 in ``/var/lib/libvirt/images``, Windows
   ## OpenSSH on TCP/22.
@@ -583,7 +583,7 @@ proc buildVirtInstallArgs*(b: LibvirtBackend, name: string,
     # For qemu:///session we must use the SLIRP user-mode network — a
     # regular user can't create kernel bridges. The L3-REAL integration
     # test on a NixOS workstation runs this branch; production
-    # (qemu:///system on solunska) takes the bridge branch.
+    # (qemu:///system on high-mem-server) takes the bridge branch.
     (if b.libvirtUri == "qemu:///session" or
         (b.libvirtUri.startsWith("qemu+") and b.libvirtUri.endsWith("/session")):
        "--network"

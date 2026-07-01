@@ -28,7 +28,7 @@ Shipped milestones:
 - **M4 Phase A slice — libvirt / QEMU/KVM** (`src/vm_harness/backends/libvirt.nim`).
   Linux host, x86_64 Windows or Linux guests via `virt-install` +
   `virsh`. Targets the windows-runner-001 prototype on
-  `solunska-server`. See `docs/m4-libvirt.md` for Phase B/C scope.
+  `high-mem-server`. See `docs/m4-libvirt.md` for Phase B/C scope.
 - **M5 — Lima** (`src/vm_harness/backends/lima.nim`). macOS / Linux
   host, Linux guest via `limactl`.
 

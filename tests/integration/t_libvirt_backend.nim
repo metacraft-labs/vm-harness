@@ -26,7 +26,7 @@ import std/[options, os, sequtils, strutils, tables, unittest]
 import vm_harness
 
 suite "LibvirtBackend smoke (no live virsh)":
-  test "newLibvirtBackend populates defaults consistent with solunska-server":
+  test "newLibvirtBackend populates defaults consistent with high-mem-server":
     let b = newLibvirtBackend()
     check b.id == biLibvirt
     check b.hostPlatform == hpLinux
