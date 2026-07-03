@@ -285,6 +285,17 @@ proc domainExists*(b: LibvirtBackend, name: string): bool =
   let r = b.runVirsh(@["dominfo", name], timeoutSec = 30)
   r.exitCode == 0
 
+proc listAllDomainNames*(b: LibvirtBackend): seq[string] =
+  ## ``virsh list --all --name`` — every defined domain (running or
+  ## stopped). Used by the M2 ephemeral gate to assert NO residual
+  ## per-job domain survives teardown. Returns an empty seq on error.
+  let r = b.runVirsh(@["list", "--all", "--name"], timeoutSec = 30)
+  if r.exitCode != 0:
+    return @[]
+  for line in r.stdout.splitLines():
+    let s = line.strip()
+    if s.len > 0: result.add(s)
+
 proc domainState*(b: LibvirtBackend, name: string): string =
   ## Returns one of ``running``, ``paused``, ``shut off``, ``""``
   ## (when the domain doesn't exist). Used by ``startAndAwaitReady``
@@ -380,6 +391,206 @@ proc deleteDomainDisk*(b: LibvirtBackend, name: string) =
   if fileExists(qcow2):
     try: removeFile(qcow2)
     except CatchableError: discard
+
+# ---------------------------------------------------------------------------
+# M2 — per-job ephemeral CoW-clone reset.
+#
+# Each job gets a FRESH VM cloned from the golden qcow2 as a thin CoW
+# overlay, booted on real KVM, then destroyed leaving NO residue
+# (domain + overlay + nvram gone). This is the "destroy VM per job"
+# ephemeral model the GARM provider drives: CreateInstance maps onto
+# ``provisionEphemeralClone`` and DeleteInstance onto ``stopAndCleanup``
+# (which now removes the per-job overlay).
+#
+# We build the transient domain XML ourselves and ``virsh define`` it —
+# rather than shelling to ``virt-install`` — because (a) it keeps the
+# per-job path dependency-light (virt-install isn't always installed on
+# the runner host) and (b) it lets the OS-agnostic gate direct-kernel-
+# boot a tiny golden (``golden-linux-tiny``) that boots in ~1-2 s and
+# emits a serial marker, proving the reset primitive fast + hermetically
+# WITHOUT the 81 GiB Windows golden. For a real disk-bootable golden
+# (Windows M3) the same path is used with an empty kernel/initrd (the
+# firmware boots the overlay directly).
+
+type
+  EphemeralCloneSpec* = object
+    ## Inputs for one per-job CoW clone.
+    name*: string                ## domain name (must be unique per job)
+    goldenImage*: string         ## absolute path to the golden qcow2 to
+                                 ## clone from (backing file of the overlay)
+    cpus*: int                   ## defaults to 2 when 0
+    memoryMB*: int               ## defaults to 1024 when 0
+    kernel*: string              ## optional: direct-kernel-boot bzImage.
+                                 ## When set, ``initrd`` + ``cmdline`` drive a
+                                 ## QEMU ``-kernel/-initrd`` boot (the tiny
+                                 ## Linux golden). When empty the firmware
+                                 ## boots the overlay disk itself.
+    initrd*: string              ## optional initramfs for direct-kernel boot
+    cmdline*: string             ## optional kernel cmdline (e.g.
+                                 ## ``console=ttyS0 quiet panic=1``)
+    serialLogPath*: string       ## host path the guest's serial console is
+                                 ## captured to (boot-marker harvest). When
+                                 ## empty a temp path is chosen.
+
+proc overlayPathFor*(b: LibvirtBackend, name: string): string =
+  ## The per-job CoW overlay lives next to the other pool images and is
+  ## named ``<domain>.overlay.qcow2`` so ``stopAndCleanup`` can find and
+  ## remove exactly it (never the golden, never a shared ISO).
+  b.imagePoolDir / (name & ".overlay.qcow2")
+
+proc buildEphemeralDomainXml*(b: LibvirtBackend, spec: EphemeralCloneSpec,
+                              overlayPath, serialLogPath: string): string =
+  ## Render a minimal transient domain XML around the per-job overlay.
+  ## Pure function — unit-testable without libvirtd. Uses ``type='kvm'``
+  ## (real /dev/kvm boot) with a virtio-blk overlay disk and a
+  ## file-backed serial console so the harness can read the boot marker.
+  let cpus = if spec.cpus > 0: spec.cpus else: 2
+  let mem = if spec.memoryMB > 0: spec.memoryMB else: 1024
+  var osBlock = "  <os>\n" &
+    "    <type arch='x86_64' machine='q35'>hvm</type>\n"
+  if spec.kernel.len > 0:
+    osBlock.add("    <kernel>" & spec.kernel & "</kernel>\n")
+    if spec.initrd.len > 0:
+      osBlock.add("    <initrd>" & spec.initrd & "</initrd>\n")
+    if spec.cmdline.len > 0:
+      osBlock.add("    <cmdline>" & spec.cmdline & "</cmdline>\n")
+  else:
+    osBlock.add("    <boot dev='hd'/>\n")
+  osBlock.add("  </os>\n")
+  result =
+    "<domain type='kvm'>\n" &
+    "  <name>" & spec.name & "</name>\n" &
+    "  <memory unit='MiB'>" & $mem & "</memory>\n" &
+    "  <vcpu>" & $cpus & "</vcpu>\n" &
+    osBlock &
+    "  <features><acpi/></features>\n" &
+    "  <devices>\n" &
+    "    <disk type='file' device='disk'>\n" &
+    "      <driver name='qemu' type='qcow2'/>\n" &
+    "      <source file='" & overlayPath & "'/>\n" &
+    "      <target dev='vda' bus='virtio'/>\n" &
+    "    </disk>\n" &
+    "    <serial type='file'>\n" &
+    "      <source path='" & serialLogPath & "'/>\n" &
+    "      <target port='0'/>\n" &
+    "    </serial>\n" &
+    "    <console type='file'>\n" &
+    "      <source path='" & serialLogPath & "'/>\n" &
+    "      <target type='serial' port='0'/>\n" &
+    "    </console>\n" &
+    "  </devices>\n" &
+    "</domain>\n"
+
+proc removeEphemeralOverlay*(b: LibvirtBackend, name: string) =
+  ## Delete the per-job CoW overlay written by ``provisionEphemeralClone``.
+  ## Unlike ``--remove-all-storage`` (which refuses non-pool-managed files
+  ## and can nuke shared ISOs), this removes ONLY the ``.overlay.qcow2``
+  ## for this domain. Idempotent; never raises.
+  let overlay = b.overlayPathFor(name)
+  if fileExists(overlay):
+    try: removeFile(overlay)
+    except CatchableError: discard
+
+method provisionEphemeralClone*(b: LibvirtBackend,
+                                spec: EphemeralCloneSpec): VmHandle {.base.} =
+  ## Materialise ONE fresh per-job VM: CoW-clone the golden into a thin
+  ## overlay, define a transient domain on it, and start it on KVM.
+  ##
+  ## Steps (exact commands):
+  ##   1. ``qemu-img create -f qcow2 -b <golden> -F qcow2 <overlay>``
+  ##      — thin CoW overlay; writes stay local to the overlay so the
+  ##      golden backs any number of concurrent jobs untouched.
+  ##   2. ``virsh define <xml>`` — a transient q35/KVM domain on the
+  ##      overlay (direct-kernel-boot when ``spec.kernel`` is set,
+  ##      firmware disk-boot otherwise), serial console → a host file.
+  ##   3. ``virsh start <name>`` — boot on /dev/kvm.
+  ##
+  ## The returned handle carries ``overlayPath`` + ``serialLogPath`` in
+  ## ``extra`` and is marked ``ephemeral=true`` so ``stopAndCleanup`` (the
+  ## DeleteInstance path) destroys + undefines the domain AND removes the
+  ## overlay + nvram, leaving no residue.
+  when defined(linux):
+    if spec.name.len == 0:
+      raise newException(ValueError,
+        "provisionEphemeralClone: spec.name is empty")
+    if spec.goldenImage.len == 0:
+      raise newException(ValueError,
+        "provisionEphemeralClone: spec.goldenImage is empty")
+    if not fileExists(spec.goldenImage):
+      raise newException(IOError,
+        "provisionEphemeralClone: golden image does not exist: " &
+        spec.goldenImage)
+    if b.domainExists(spec.name):
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "provisionEphemeralClone: domain '" & spec.name &
+        "' already exists; per-job clones require a fresh name")
+
+    createDir(b.imagePoolDir)
+    let overlay = b.overlayPathFor(spec.name)
+    # Start from a clean overlay so a stale file from a crashed prior run
+    # can't leak state into this job.
+    if fileExists(overlay):
+      try: removeFile(overlay)
+      except CatchableError: discard
+    let createArgs = @[b.qemuImgCmd, "create",
+      "-f", "qcow2",
+      "-b", spec.goldenImage,
+      "-F", "qcow2",
+      overlay]
+    let createRes = runProcessCapture(createArgs, timeoutSec = 60)
+    if createRes.exitCode != 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "qemu-img create (CoW overlay over " & spec.goldenImage &
+        ") failed (exit " & $createRes.exitCode & "): " & createRes.stdout)
+
+    let serialLogPath =
+      if spec.serialLogPath.len > 0: spec.serialLogPath
+      else: getTempDir() / "vm-harness-ephemeral" / (spec.name & ".serial.log")
+    createDir(parentDir(serialLogPath))
+    # Truncate any stale serial log for this domain name.
+    try: writeFile(serialLogPath, "")
+    except CatchableError: discard
+
+    let xml = b.buildEphemeralDomainXml(spec, overlay, serialLogPath)
+    let xmlPath = getTempDir() / "vm-harness-ephemeral" / (spec.name & ".xml")
+    createDir(parentDir(xmlPath))
+    writeFile(xmlPath, xml)
+    let defineRes = b.runVirsh(@["define", xmlPath], timeoutSec = 60)
+    if defineRes.exitCode != 0:
+      b.removeEphemeralOverlay(spec.name)
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "virsh define (ephemeral) failed (exit " & $defineRes.exitCode &
+        "): " & defineRes.stdout)
+
+    let startRes = b.runVirsh(@["start", spec.name], timeoutSec = 120)
+    if startRes.exitCode != 0:
+      # Best-effort teardown of the half-built domain.
+      try: b.undefineDomain(spec.name)
+      except CatchableError: discard
+      b.removeEphemeralOverlay(spec.name)
+      raise newVmHarnessError($b.id, lpStartup,
+        "virsh start (ephemeral) failed (exit " & $startRes.exitCode &
+        "): " & startRes.stdout)
+
+    var extra = initTable[string, string]()
+    extra["libvirtUri"] = b.libvirtUri
+    extra["domain"] = spec.name
+    extra["ephemeral"] = "true"
+    extra["overlayPath"] = overlay
+    extra["goldenImage"] = spec.goldenImage
+    extra["serialLogPath"] = serialLogPath
+    result = VmHandle(
+      backend: b,
+      name: spec.name,
+      baseline: spec.goldenImage,
+      ipAddress: none(string),
+      sshPort: b.sshPort,
+      sshUser: b.sshUser,
+      sshAuth: SshAuth(kind: saNone),
+      extra: extra)
+  else:
+    raise newException(BackendUnavailableError,
+      "provisionEphemeralClone requires a Linux host")
 
 proc autostartDomain*(b: LibvirtBackend, name: string,
                      enabled: bool = true) =
@@ -993,16 +1204,38 @@ method stopAndCleanup*(b: LibvirtBackend, vm: VmHandle,
   ## For the windows-runner-001 prototype, the orchestrator invokes
   ## ``stopAndCleanup(vm, deleteVm = false)`` so the runner persists
   ## between vm-harness invocations.
+  ##
+  ## For M2 per-job EPHEMERAL clones (``vm.extra["ephemeral"] == "true"``,
+  ## set by ``provisionEphemeralClone``) this is the DeleteInstance path:
+  ## the domain is force-destroyed and undefined, and the per-job CoW
+  ## overlay is removed, leaving NO residual domain/disk. The golden is
+  ## never touched (only the ``.overlay.qcow2`` is removed).
   when defined(linux):
+    let isEphemeral = vm.extra.getOrDefault("ephemeral", "") == "true"
     try:
-      # Graceful shutdown first; fall back to destroy.
-      try: b.shutdownDomain(vm.name)
-      except CatchableError: discard
+      if isEphemeral:
+        # Force-stop immediately — a per-job VM has no state worth a
+        # graceful ACPI shutdown, and it may already have powered itself
+        # off (the tiny golden's init calls ``poweroff -f``).
+        try: b.destroyDomain(vm.name)
+        except CatchableError: discard
+      else:
+        # Graceful shutdown first; fall back to destroy.
+        try: b.shutdownDomain(vm.name)
+        except CatchableError: discard
       if deleteVm:
         try: b.undefineDomain(vm.name)
         except CatchableError: discard
-        try: b.deleteDomainDisk(vm.name)
-        except CatchableError: discard
+        if isEphemeral:
+          # Remove ONLY this job's CoW overlay (never the golden or a
+          # shared ISO). Equivalent to the design-doc's
+          # ``undefine --remove-all-storage`` for the ephemeral case, but
+          # scoped so it can't delete pool-shared read-only media.
+          try: b.removeEphemeralOverlay(vm.name)
+          except CatchableError: discard
+        else:
+          try: b.deleteDomainDisk(vm.name)
+          except CatchableError: discard
     except CatchableError:
       discard
   else:

@@ -43,6 +43,15 @@
           '';
         };
 
+        # The minimal fast-booting Linux golden used by the libvirt
+        # per-job ephemeral-reset gate (M2). Linux-only (needs a Linux
+        # kernel + module tree + qemu-img); guarded so darwin eval
+        # doesn't try to build it.
+        packages.golden-linux-tiny =
+          if pkgs.stdenv.isLinux
+          then import ./nix/golden-linux-tiny.nix { inherit pkgs; }
+          else null;
+
         packages.default = pkgs.stdenv.mkDerivation {
           pname = "vm-harness";
           version = "0.1.0";

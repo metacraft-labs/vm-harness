@@ -58,6 +58,14 @@ task test, "Run the vm-harness test suite":
   # command (--recipe / --name / --vcpu / --memory-gb / --network-bridge
   # / --first-boot-script). NoopBackend-style: no virsh, no libvirtd.
   exec "nim r --hints:off tests/integration/t_cli_libvirt_flags.nim"
+  # Campaign M2 — libvirt per-job ephemeral CoW-clone reset gate. Boots
+  # a FRESH per-job VM from a small Linux golden on REAL libvirt + KVM,
+  # probes the serial boot marker, tears it down (no residue), and
+  # asserts two-run independence. Self-skips cleanly unless
+  # VMH_GOLDEN_TINY points at a `golden-linux-tiny` bundle AND /dev/kvm +
+  # a reachable libvirtd (LIBVIRT_DEFAULT_URI=qemu:///session) are
+  # present. Build the golden with `nix build .#golden-linux-tiny`.
+  exec "nim r --hints:off tests/e2e/t_vmharness_libvirt_ephemeral_run.nim"
 
 task buildCli, "Build the vm-harness CLI binary":
   exec "nim c --hints:off -o:build/bin/vm-harness src/vm_harness/cli.nim"

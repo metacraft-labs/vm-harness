@@ -13,7 +13,7 @@
 ## CLI falls back to NoopBackend if ``--allow-noop-fallback`` is set
 ## (used by the M0 selection test on hosts without real hypervisors).
 
-import std/[json, os, sequtils, strformat, strutils, tables, terminal]
+import std/[json, os, sequtils, strformat, strutils, tables, terminal, times]
 import ./types, ./output, ./auto, ./orchestrator
 # Import every backend module so its registerBackend bootstrap runs.
 # Each import is a static side-effect: the backend's factory lands in
@@ -81,6 +81,21 @@ type
     firstBootScript*: string     ## ``--first-boot-script <path>`` — file the
                                  ## recipe's build-autounattend-iso.sh wraps
                                  ## into the per-VM autounattend ISO.
+    ephemeral*: bool             ## ``--ephemeral`` — libvirt-only: run one
+                                 ## per-job CoW-clone VM (fresh overlay from
+                                 ## ``--golden-image``, boot, then destroy +
+                                 ## remove overlay). This is the M2 per-job
+                                 ## reset the GARM provider drives.
+    goldenImage*: string         ## ``--golden-image <path>`` — golden qcow2 the
+                                 ## ephemeral overlay is CoW-cloned from.
+    kernel*: string              ## ``--kernel <path>`` — optional direct-kernel
+                                 ## boot bzImage for the ephemeral clone (the
+                                 ## tiny Linux golden). Omit for a disk-bootable
+                                 ## golden (firmware boots the overlay).
+    initrd*: string              ## ``--initrd <path>`` — optional initramfs for
+                                 ## the direct-kernel ephemeral boot.
+    kernelCmdline*: string       ## ``--kernel-cmdline <str>`` — optional kernel
+                                 ## cmdline for the direct-kernel ephemeral boot.
     controllerPubKey*: string    ## ``--controller-pubkey <path>`` — SSH public
                                  ## key (``id_ed25519.pub`` or similar) that
                                  ## the recipe's build-autounattend-iso.sh
@@ -144,6 +159,21 @@ Common flags:
                                   guest's FirstLogonCommands installs it in
                                   authorized_keys before first boot.
                                   Requires --recipe.
+  --ephemeral                     libvirt-only: run ONE per-job CoW-clone VM
+                                  (fresh overlay from --golden-image, boot on
+                                  KVM, then destroy + remove overlay — no
+                                  residue). The M2 per-job reset the GARM
+                                  provider drives. A positional arg after --
+                                  is treated as an expected serial boot marker.
+  --golden-image <path>           libvirt-only: golden qcow2 the ephemeral
+                                  overlay is CoW-cloned from. Requires
+                                  --ephemeral.
+  --kernel <path>                 libvirt-only: optional direct-kernel-boot
+                                  bzImage for --ephemeral (tiny Linux golden).
+  --initrd <path>                 libvirt-only: optional initramfs for the
+                                  direct-kernel ephemeral boot.
+  --kernel-cmdline <str>          libvirt-only: optional kernel cmdline for the
+                                  direct-kernel ephemeral boot.
   --output-dir <path>
   --env KEY=VAL                   (repeatable)
   --copy-to host:guest            (repeatable)
@@ -276,6 +306,17 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.firstBootScript = args[i]; inc i
     of "--controller-pubkey":
       inc i; result.controllerPubKey = args[i]; inc i
+    of "--ephemeral":
+      result.ephemeral = true
+      inc i
+    of "--golden-image":
+      inc i; result.goldenImage = args[i]; inc i
+    of "--kernel":
+      inc i; result.kernel = args[i]; inc i
+    of "--initrd":
+      inc i; result.initrd = args[i]; inc i
+    of "--kernel-cmdline":
+      inc i; result.kernelCmdline = args[i]; inc i
     of "--output-dir":
       inc i; result.outputDir = args[i]; inc i
     of "--timeout-sec":
@@ -425,7 +466,82 @@ proc cmdProvision(opts: CliOpts): int =
            {"backend": $id, "baseline": opts.baseline})
   0
 
+proc cmdRunEphemeral(opts: CliOpts): int =
+  ## M2 per-job ephemeral CoW clone: clone a fresh overlay from the
+  ## golden, boot it on KVM, harvest the serial console (boot-marker
+  ## probe), then destroy the domain + remove the overlay (no residue).
+  ## This is the exact create→boot→probe→destroy lifecycle the GARM
+  ## provider's CreateInstance/DeleteInstance will drive (M4).
+  ##
+  ## The probe is a serial boot marker rather than an in-guest exec
+  ## because the OS-agnostic tiny golden self-terminates
+  ## (``poweroff -f``); a real Windows/Linux golden that stays up would
+  ## instead use the SSH ``execInGuest`` path. When ``--`` supplies an
+  ## argument it is treated as the expected serial marker substring.
+  let id = biLibvirt
+  let backend = newBackend(id)
+  if opts.baseline.len == 0:
+    raise newException(ValueError, "run --ephemeral: --baseline is required")
+  if opts.goldenImage.len == 0:
+    raise newException(ValueError,
+      "run --ephemeral: --golden-image is required")
+  let lb = LibvirtBackend(backend)
+  let spec = EphemeralCloneSpec(
+    name: opts.baseline,
+    goldenImage: opts.goldenImage,
+    cpus: (if opts.cpus > 0: opts.cpus else: 2),
+    memoryMB: (if opts.memoryMB > 0: opts.memoryMB else: 1024),
+    kernel: opts.kernel,
+    initrd: opts.initrd,
+    cmdline: opts.kernelCmdline)
+  let expectMarker = if opts.cmd.len > 0: opts.cmd[0] else: ""
+  let timeoutSec = if opts.timeoutSec > 0: opts.timeoutSec else: 120
+  logEvent(opts.logFormat, "info", "ephemeral clone: boot",
+           {"backend": $id, "name": opts.baseline,
+            "golden": opts.goldenImage})
+  var vm = lb.provisionEphemeralClone(spec)
+  var verdict = 2
+  try:
+    # Poll for self-poweroff (tiny golden) or timeout.
+    let serialLog = vm.extra.getOrDefault("serialLogPath", "")
+    let deadline = epochTime() + timeoutSec.float
+    var poweredOff = false
+    while epochTime() < deadline:
+      if lb.domainState(opts.baseline) == "shut off":
+        poweredOff = true
+        break
+      sleep(500)
+    var serial = ""
+    if serialLog.len > 0 and fileExists(serialLog):
+      serial = readFile(serialLog)
+    if expectMarker.len > 0:
+      if expectMarker in serial:
+        logEvent(opts.logFormat, "info", "ephemeral probe: marker found",
+                 {"marker": expectMarker, "powered_off": $poweredOff})
+        verdict = 0
+      else:
+        logEvent(opts.logFormat, "error",
+                 "ephemeral probe: marker NOT found",
+                 {"marker": expectMarker})
+        verdict = 1
+    else:
+      # No expected marker: success == the domain booted and reached
+      # power-off within the deadline.
+      verdict = if poweredOff: 0 else: 1
+    if opts.outputDir.len > 0 and serial.len > 0:
+      try:
+        createDir(opts.outputDir)
+        writeFile(opts.outputDir / "serial.log", serial)
+      except CatchableError: discard
+  finally:
+    lb.stopAndCleanup(vm, deleteVm = true)
+    logEvent(opts.logFormat, "info", "ephemeral clone: destroyed",
+             {"name": opts.baseline})
+  verdict
+
 proc cmdRun(opts: CliOpts): int =
+  if opts.ephemeral:
+    return cmdRunEphemeral(opts)
   let (id, backend) = resolveBackend(opts)
   if opts.baseline.len == 0:
     raise newException(ValueError, "run: --baseline is required")
