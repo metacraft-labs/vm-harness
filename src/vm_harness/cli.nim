@@ -30,6 +30,7 @@ import ./backends/tart
 import ./backends/utm
 import ./backends/lima
 import ./backends/libvirt
+import ./backends/incus
 {.pop.}
 
 type
@@ -99,6 +100,10 @@ type
                                  ## lifecycle is unchanged.
     goldenImage*: string         ## ``--golden-image <path>`` — golden qcow2 the
                                  ## ephemeral overlay is CoW-cloned from.
+    baseImage*: string           ## ``--base-image <alias>`` — incus-only: the
+                                 ## base image alias/fingerprint the ephemeral
+                                 ## per-job container is launched from. Empty ⇒
+                                 ## the IncusBackend default (``vmh-base``).
     kernel*: string              ## ``--kernel <path>`` — optional direct-kernel
                                  ## boot bzImage for the ephemeral clone (the
                                  ## tiny Linux golden). Omit for a disk-bootable
@@ -347,6 +352,8 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i
     of "--golden-image":
       inc i; result.goldenImage = args[i]; inc i
+    of "--base-image":
+      inc i; result.baseImage = args[i]; inc i
     of "--kernel":
       inc i; result.kernel = args[i]; inc i
     of "--initrd":
@@ -510,6 +517,71 @@ proc cmdProvision(opts: CliOpts): int =
            {"backend": $id, "baseline": opts.baseline})
   0
 
+proc cmdRunEphemeralIncus(opts: CliOpts): int =
+  ## Incus per-job ephemeral CONTAINER: launch a FRESH container from the
+  ## base image, run an exec probe, then destroy it (``incus delete
+  ## --force``) leaving NO residue. The container analog of the libvirt
+  ## CoW-clone path — the same create→probe→destroy lifecycle the GARM
+  ## provider's CreateInstance/DeleteInstance drive, but far cheaper (no
+  ## /dev/kvm, sub-second launch).
+  ##
+  ## ``--baseline`` names the per-job container; ``--base-image`` the image
+  ## to launch from (default ``vmh-base``). ``--user-data`` (when set)
+  ## injects cloud-init user-data — the IM2 JIT seam. Args after ``--`` are
+  ## the in-guest probe command (default ``true``).
+  let backend = newBackend(biIncus)
+  if opts.baseline.len == 0:
+    raise newException(ValueError,
+      "run --ephemeral --backend incus: --baseline (container name) is required")
+  let ib = IncusBackend(backend)
+  var userData = ""
+  if opts.userDataFile.len > 0:
+    if not fileExists(opts.userDataFile):
+      raise newException(ValueError,
+        "run --ephemeral: --user-data file not found: " & opts.userDataFile)
+    userData = readFile(opts.userDataFile)
+  let spec = EphemeralIncusSpec(
+    name: opts.baseline,
+    baseImage: opts.baseImage,
+    ephemeral: false,
+    userData: userData,
+    config: initTable[string, string]())
+  logEvent(opts.logFormat, "info", "ephemeral container: launch",
+           {"backend": $biIncus, "name": opts.baseline,
+            "base": (if opts.baseImage.len > 0: opts.baseImage else: ib.baseImage)})
+  var vm = ib.provisionEphemeralClone(spec)
+  if opts.keepEphemeral:
+    logEvent(opts.logFormat, "info", "ephemeral container: kept running",
+             {"name": opts.baseline})
+    echo opts.baseline
+    return 0
+  var verdict = 2
+  try:
+    let readyTimeout = if opts.timeoutSec > 0: opts.timeoutSec else: 60
+    ib.startAndAwaitReady(vm, readyTimeout)
+    let probeCmd = if opts.cmd.len > 0: opts.cmd else: @["true"]
+    let r = ib.execInGuest(vm, initTable[string, string](), probeCmd,
+                           timeoutSec = readyTimeout)
+    if r.exitCode == 0:
+      logEvent(opts.logFormat, "info", "ephemeral probe: ok",
+               {"cmd": probeCmd.join(" "), "stdout": r.stdout.strip()})
+      verdict = 0
+    else:
+      logEvent(opts.logFormat, "error", "ephemeral probe: FAILED",
+               {"cmd": probeCmd.join(" "), "exit": $r.exitCode,
+                "stdout": r.stdout.strip()})
+      verdict = 1
+    if opts.outputDir.len > 0:
+      try:
+        createDir(opts.outputDir)
+        writeFile(opts.outputDir / "probe.log", r.stdout)
+      except CatchableError: discard
+  finally:
+    ib.stopAndCleanup(vm, deleteVm = true)
+    logEvent(opts.logFormat, "info", "ephemeral container: destroyed",
+             {"name": opts.baseline})
+  verdict
+
 proc cmdRunEphemeral(opts: CliOpts): int =
   ## M2 per-job ephemeral CoW clone: clone a fresh overlay from the
   ## golden, boot it on KVM, harvest the serial console (boot-marker
@@ -522,6 +594,12 @@ proc cmdRunEphemeral(opts: CliOpts): int =
   ## (``poweroff -f``); a real Windows/Linux golden that stays up would
   ## instead use the SSH ``execInGuest`` path. When ``--`` supplies an
   ## argument it is treated as the expected serial marker substring.
+  ##
+  ## The Incus container path is a separate lifecycle (no serial console,
+  ## an in-guest exec probe instead) — dispatch to it when the backend is
+  ## ``incus``.
+  if opts.backend == $biIncus:
+    return cmdRunEphemeralIncus(opts)
   let id = biLibvirt
   let backend = newBackend(id)
   if opts.baseline.len == 0:
@@ -724,6 +802,7 @@ proc cmdBackends(opts: CliOpts): int =
                of biHyperv, biWsl: "windows"
                of biTartMacos, biTartLinuxArm, biUtmWindowsArm: "macos-arm"
                of biLibvirt, biLima: "linux/macos"
+               of biIncus: "linux"
     let guests = case id
                  of biNoop: "any"
                  of biHyperv: "linux,windows"
@@ -733,6 +812,7 @@ proc cmdBackends(opts: CliOpts): int =
                  of biUtmWindowsArm: "windows"
                  of biLibvirt: "linux,windows"
                  of biLima: "linux"
+                 of biIncus: "linux"
     let marker = if registered: "*" else: " "
     echo($id & marker & " ".repeat(max(1, 20 - len($id) - 1)) & host &
          " ".repeat(max(1, 14 - host.len)) & guests)

@@ -43,7 +43,7 @@ proc parseBackendId*(s: string): BackendId =
   raise newException(ValueError, &"Unknown backend: '{s}'. Known: " &
                      ([$biNoop, $biHyperv, $biWsl, $biTartMacos,
                        $biTartLinuxArm, $biUtmWindowsArm, $biLibvirt,
-                       $biLima]).join(", "))
+                       $biLima, $biIncus]).join(", "))
 
 proc autoSelectBackendId*(host: HostPlatform, guest: GuestOs): BackendId =
   ## Thin pass-through to ``types.selectBackendId``. Centralized here so

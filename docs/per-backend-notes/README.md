@@ -8,6 +8,8 @@ One file per backend lands here as M1-M5 are implemented:
 - `utm.md` — M3 (Windows-on-ARM guests on Mac hosts).
 - `libvirt.md` — M4 (Linux + Windows guests on Linux hosts).
 - `lima.md` — M5 (Linux guests on Mac hosts, alternative to Tart).
+- `incus.md` — Linux system-container guests on Linux hosts (ephemeral
+  per-job containers; the container analog of the libvirt VM path).
 
 Each note documents the host-side CLI invocations, the in-guest
 transport (SSH, PowerShell Direct, direct `wsl --` exec), file-transfer

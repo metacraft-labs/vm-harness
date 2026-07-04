@@ -42,6 +42,7 @@ type
     biUtmWindowsArm = "utm-windows-arm"
     biLibvirt = "libvirt"
     biLima = "lima"
+    biIncus = "incus"
 
   SshAuthKind* = enum
     saNone, saPassword, saKeyFile

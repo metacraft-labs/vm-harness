@@ -77,6 +77,18 @@ task test, "Run the vm-harness test suite":
   # system libvirtd + python3/sshpass/genisoimage are present. NEVER touches
   # windows-runner-001.
   exec "nim r --hints:off tests/e2e/t_windows_golden_jit_boot.nim"
+  # Campaign IM1 — Incus per-job ephemeral CONTAINER reset gate. Launches
+  # a FRESH per-job container from the small `vmh-base` (Debian 12) image
+  # on REAL Incus, runs an in-guest `incus exec` probe, tears it down with
+  # `incus delete --force` (no residual container, no residual storage
+  # volume), and asserts two-run independence (a marker file written into
+  # run 1's guest is absent in run 2's fresh container). Fast, no /dev/kvm.
+  # Self-skips cleanly unless the Incus daemon is reachable (set
+  # VMH_INCUS_CMD="sudo incus" if the incus-admin group isn't active in the
+  # session) AND the base image is present (pull via
+  # `incus image copy images:debian/12 local: --alias vmh-base`). NEVER
+  # touches windows-runner-001 or unrelated production containers.
+  exec "nim r --hints:off tests/e2e/t_vmharness_incus_ephemeral_run.nim"
 
 task buildCli, "Build the vm-harness CLI binary":
   exec "nim c --hints:off -o:build/bin/vm-harness src/vm_harness/cli.nim"
