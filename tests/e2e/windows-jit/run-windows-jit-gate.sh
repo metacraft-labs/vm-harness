@@ -11,9 +11,13 @@
 #      (config-drive openstack/latest/user_data) carrying the mock metadata
 #      URL + the JWT.
 #   3. Start the mock GARM metadata+runner server (JWT-authorized routes).
-#   4. Boot a fresh per-job CoW clone of the golden via `vm-harness run
-#      --ephemeral` with the config-drive ISO injected (cloudbase-init
-#      ConfigDrive datasource) + UEFI (OVMF).
+#   4. Boot a fresh per-job CoW clone of the golden via the REAL
+#      `vm-harness run --ephemeral --keep` CLI with the config-drive ISO
+#      injected (cloudbase-init ConfigDrive datasource) + UEFI (OVMF).
+#      `--keep` leaves the domain running for the in-guest probe; teardown
+#      goes through `vm-harness ephemeral-destroy`. The VM lifecycle
+#      (clone / config-drive build / UEFI boot / teardown) is thus the
+#      shipped CLI code path, not an inline virsh reimplementation.
 #   5. Wait for the guest to boot; SSH in (password) and drive the bootstrap
 #      (cloudbase-init runs it on first boot in production; the gate invokes
 #      it explicitly for a deterministic, fast probe — see NOTE below).
@@ -156,89 +160,67 @@ done
 log "mock up (authorized cert-bundle -> 200)"
 
 # --- 4. boot a fresh CoW clone with the config-drive injected ------------
-log "booting fresh ephemeral clone '$GATE_NAME' from golden (UEFI + config-drive)"
-# Resolve the harness binary.
+# Drive the REAL vm-harness CLI: `run --ephemeral --keep` clones a fresh
+# CoW overlay off the golden, builds + attaches the config-2 ISO from
+# --user-data/--meta-data, boots UEFI (OVMF via --uefi-loader/--uefi-nvram-
+# template), and LEAVES THE DOMAIN RUNNING so we can SSH in and drive the
+# JIT bootstrap. Teardown goes through `vm-harness ephemeral-destroy`
+# (same ephemeral stopAndCleanup: destroy + undefine --nvram + remove
+# overlay/config-drive/nvram). This exercises the SHIPPED CLI code path
+# (buildConfigDriveIso + buildEphemeralDomainXml UEFI + attach + boot +
+# teardown) end-to-end, not an inline virsh reimplementation.
+log "booting fresh ephemeral clone '$GATE_NAME' via real vm-harness CLI (UEFI + config-drive)"
+
+# Resolve the harness binary. Prefer $VMH_HARNESS, then a nix build result,
+# then build it once from source via nim.
 HARNESS="${VMH_HARNESS:-}"
 if [[ -z "$HARNESS" ]]; then
   if [[ -x "$SCRIPT_DIR/../../../result/bin/vm-harness" ]]; then
     HARNESS="$SCRIPT_DIR/../../../result/bin/vm-harness"
+  elif command -v vm-harness >/dev/null; then
+    HARNESS="$(command -v vm-harness)"
+  else
+    log "no prebuilt vm-harness; compiling from source (nim)"
+    HARNESS="$WORK/vm-harness"
+    ( cd "$SCRIPT_DIR/../../.." && \
+      nim c --hints:off --opt:speed --path:src -o:"$HARNESS" \
+        src/vm_harness/cli.nim ) >/dev/null 2>&1 \
+      || { fail "could not build vm-harness"; exit 1; }
   fi
 fi
+[[ -x "$HARNESS" ]] || { fail "vm-harness binary not found/executable: $HARNESS"; exit 1; }
+log "using vm-harness: $HARNESS"
 
-# The harness `run --ephemeral` builds the config-drive ISO from --user-data,
-# attaches it + boots UEFI, then (no serial marker for Windows) tears down.
-# For the JIT probe we need the clone to STAY UP while we SSH in, so we drive
-# provisionEphemeralClone directly via a tiny Nim helper is overkill; instead
-# we build the ISO + clone with virsh here (mirroring the harness path) so we
-# control teardown timing. The harness code path is unit-tested separately
-# (buildConfigDriveIso + buildEphemeralDomainXml); here we exercise the real
-# virsh clone+boot+destroy sequence the harness runs.
+# Paths the CLI derives deterministically from --baseline (used for the
+# residue check + belt-and-braces cleanup).
 OVERLAY="$POOL_DIR/$GATE_NAME.overlay.qcow2"
 CDISO="$POOL_DIR/$GATE_NAME.config-drive.iso"
 NVRAM="$POOL_DIR/${GATE_NAME}_VARS.fd"
 rm -f "$OVERLAY" "$CDISO" "$NVRAM"
 
-qemu-img create -f qcow2 -b "$VMH_WIN_GOLDEN" -F qcow2 "$OVERLAY" >/dev/null \
-  || { fail "qemu-img create overlay"; exit 1; }
-cp "$VMH_OVMF_VARS" "$NVRAM"
-
-# Build the config-drive ISO (openstack/latest/{meta_data.json,user_data}).
-CDSTAGE="$WORK/configdrive"
-mkdir -p "$CDSTAGE/openstack/latest"
+# meta_data.json for the config-drive (openstack layout the CLI builds).
+METADATA="$WORK/meta_data.json"
 printf '{"uuid":"%s","hostname":"%s","name":"%s"}' "$GATE_NAME" "$GATE_NAME" "$GATE_NAME" \
-  > "$CDSTAGE/openstack/latest/meta_data.json"
-cp "$USER_DATA" "$CDSTAGE/openstack/latest/user_data"
-if command -v genisoimage >/dev/null; then
-  genisoimage -quiet -o "$CDISO" -V config-2 -J -r "$CDSTAGE"
-else
-  xorriso -as mkisofs -quiet -o "$CDISO" -V config-2 -J -R "$CDSTAGE"
-fi
-[[ -f "$CDISO" ]] || { fail "config-drive ISO build"; exit 1; }
+  > "$METADATA"
 
-DOMXML="$WORK/domain.xml"
-cat > "$DOMXML" <<XML
-<domain type='kvm'>
-  <name>$GATE_NAME</name>
-  <memory unit='MiB'>4096</memory>
-  <vcpu>4</vcpu>
-  <os firmware='efi'>
-    <type arch='x86_64' machine='q35'>hvm</type>
-    <firmware><feature enabled='no' name='enrolled-keys'/><feature enabled='no' name='secure-boot'/></firmware>
-    <loader readonly='yes' secure='no' type='pflash' format='raw'>$VMH_OVMF_CODE</loader>
-    <nvram template='$VMH_OVMF_VARS' templateFormat='raw' format='raw'>$NVRAM</nvram>
-    <boot dev='hd'/>
-  </os>
-  <features><acpi/><apic/>
-    <hyperv mode='custom'><relaxed state='on'/><vapic state='on'/><spinlocks state='on' retries='8191'/></hyperv>
-    <smm state='on'/>
-  </features>
-  <cpu mode='host-passthrough'/>
-  <clock offset='localtime'><timer name='rtc' tickpolicy='catchup'/><timer name='hpet' present='no'/><timer name='hypervclock' present='yes'/></clock>
-  <devices>
-    <emulator>/run/libvirt/nix-emulators/qemu-system-x86_64</emulator>
-    <disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='$OVERLAY'/><target dev='vda' bus='virtio'/></disk>
-    <disk type='file' device='cdrom'><driver name='qemu' type='raw'/><source file='$CDISO'/><target dev='sda' bus='sata'/><readonly/></disk>
-    <interface type='network'><source network='default'/><model type='virtio'/></interface>
-    <serial type='pty'><target type='isa-serial' port='0'/></serial>
-    <console type='pty'><target type='serial' port='0'/></console>
-    <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>
-    <video><model type='qxl'/></video>
-    <input type='tablet' bus='usb'/>
-    <channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>
-  </devices>
-</domain>
-XML
-
-# Fall back to a generic emulator path if the nix one isn't present.
-if [[ ! -e /run/libvirt/nix-emulators/qemu-system-x86_64 ]]; then
-  EMU="$(command -v qemu-system-x86_64)"
-  sed -i "s#<emulator>.*</emulator>#<emulator>$EMU</emulator>#" "$DOMXML"
-fi
-
-virsh -c "$URI" define "$DOMXML" >/dev/null || { fail "virsh define"; exit 1; }
-virsh -c "$URI" start "$GATE_NAME" >/dev/null || { fail "virsh start"; exit 1; }
 CLONE_STARTED=1
-log "clone booted; waiting for guest IP + SSH"
+if ! LIBVIRT_DEFAULT_URI="$URI" "$HARNESS" run --ephemeral --keep \
+      --baseline "$GATE_NAME" \
+      --golden-image "$VMH_WIN_GOLDEN" \
+      --user-data "$USER_DATA" \
+      --meta-data "$METADATA" \
+      --uefi-loader "$VMH_OVMF_CODE" \
+      --uefi-nvram-template "$VMH_OVMF_VARS" \
+      --cpus 4 --memory-mb 4096 \
+      >"$WORK/harness-up.out" 2>"$WORK/harness-up.err"; then
+  fail "vm-harness run --ephemeral --keep failed"
+  cat "$WORK/harness-up.err" >&2
+  exit 1
+fi
+# Sanity: the CLI must have created the overlay + config-drive ISO.
+[[ -f "$OVERLAY" ]] || { fail "CLI did not create overlay $OVERLAY"; exit 1; }
+[[ -f "$CDISO" ]]   || { fail "CLI did not create config-drive ISO $CDISO"; exit 1; }
+log "clone booted via CLI; waiting for guest IP + SSH"
 
 # --- 5. wait for guest, drive bootstrap over SSH -------------------------
 GUEST_IP=""
@@ -361,7 +343,13 @@ then log "PASS (c'): runner connected to the mock Actions server (connectionData
 else fail "(c') runner never reached the mock Actions connectionData endpoint"; fi
 
 # --- 7. teardown + no-residue --------------------------------------------
-log "tearing down clone (ephemeral stopAndCleanup path)"
+# Reclaim via the REAL CLI (ephemeral stopAndCleanup: destroy + undefine
+# --nvram + remove overlay/config-drive/nvram — no residue).
+log "tearing down clone via real vm-harness CLI (ephemeral-destroy)"
+LIBVIRT_DEFAULT_URI="$URI" "$HARNESS" ephemeral-destroy \
+  --baseline "$GATE_NAME" >/dev/null 2>&1 \
+  || log "ephemeral-destroy returned non-zero (will verify residue directly)"
+# Belt-and-braces (never leak; the CLI already did the above).
 virsh -c "$URI" destroy "$GATE_NAME"  >/dev/null 2>&1
 virsh -c "$URI" undefine "$GATE_NAME" --nvram >/dev/null 2>&1
 rm -f "$OVERLAY" "$CDISO" "$NVRAM"

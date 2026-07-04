@@ -66,7 +66,13 @@ suite "LibvirtBackend smoke (no live virsh)":
     check "--machine" in argv
     check "q35" in argv
     check "--boot" in argv
-    check "uefi" in argv
+    # ``--boot`` is followed by a SINGLE combined value element
+    # (``uefi,firmware.feature0...``), so a bare exact-element
+    # ``"uefi" in argv`` never matches. Assert UEFI is actually
+    # requested by checking the --boot value begins with ``uefi,``.
+    let bootIdx = argv.find("--boot")
+    check bootIdx >= 0 and bootIdx + 1 < argv.len
+    check argv[bootIdx + 1].startsWith("uefi,")
     # Bridge override survives.
     let networkSpec = argv.filterIt(it.startsWith("bridge=br0"))
     check networkSpec.len == 1

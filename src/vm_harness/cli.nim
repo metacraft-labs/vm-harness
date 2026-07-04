@@ -13,7 +13,8 @@
 ## CLI falls back to NoopBackend if ``--allow-noop-fallback`` is set
 ## (used by the M0 selection test on hosts without real hypervisors).
 
-import std/[json, os, sequtils, strformat, strutils, tables, terminal, times]
+import std/[json, options, os, sequtils, strformat, strutils, tables,
+            terminal, times]
 import ./types, ./output, ./auto, ./orchestrator
 # Import every backend module so its registerBackend bootstrap runs.
 # Each import is a static side-effect: the backend's factory lands in
@@ -86,6 +87,16 @@ type
                                  ## ``--golden-image``, boot, then destroy +
                                  ## remove overlay). This is the M2 per-job
                                  ## reset the GARM provider drives.
+    keepEphemeral*: bool         ## ``--keep`` — libvirt-only (M3): with
+                                 ## ``--ephemeral``, clone + attach the
+                                 ## config-drive + boot (UEFI) and RETURN
+                                 ## LEAVING THE DOMAIN RUNNING (no probe, no
+                                 ## teardown). The caller drives an in-guest
+                                 ## probe (e.g. SSH the Windows JIT bootstrap)
+                                 ## then reclaims the VM via the
+                                 ## ``ephemeral-destroy`` subcommand. Without
+                                 ## ``--keep`` the M2 boot→probe→destroy
+                                 ## lifecycle is unchanged.
     goldenImage*: string         ## ``--golden-image <path>`` — golden qcow2 the
                                  ## ephemeral overlay is CoW-cloned from.
     kernel*: string              ## ``--kernel <path>`` — optional direct-kernel
@@ -122,6 +133,10 @@ vm-harness <subcommand> [flags]
 Subcommands:
   provision               Ensure a baseline image exists (idempotent).
   run                     One-shot revert + exec + harvest + cleanup.
+  ephemeral-destroy       libvirt-only: reclaim an ephemeral clone left
+                          running by `run --ephemeral --keep` (destroy +
+                          undefine --nvram + remove overlay/config-drive/
+                          nvram — no residue). Requires --baseline.
   probe                   Print available backends as JSON.
   shell                   (placeholder) Open an interactive shell into a baseline.
   backends                Tabular listing of every known backend.
@@ -177,6 +192,12 @@ Common flags:
                                   residue). The M2 per-job reset the GARM
                                   provider drives. A positional arg after --
                                   is treated as an expected serial boot marker.
+  --keep                          libvirt-only: with --ephemeral, clone +
+                                  attach the config-drive + boot (UEFI) and
+                                  LEAVE THE DOMAIN RUNNING (no probe/teardown).
+                                  Reclaim it with `ephemeral-destroy`. Used to
+                                  drive an in-guest probe (e.g. the Windows JIT
+                                  bootstrap over SSH) for a long-lived golden.
   --golden-image <path>           libvirt-only: golden qcow2 the ephemeral
                                   overlay is CoW-cloned from. Requires
                                   --ephemeral.
@@ -320,6 +341,9 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.controllerPubKey = args[i]; inc i
     of "--ephemeral":
       result.ephemeral = true
+      inc i
+    of "--keep":
+      result.keepEphemeral = true
       inc i
     of "--golden-image":
       inc i; result.goldenImage = args[i]; inc i
@@ -541,6 +565,24 @@ proc cmdRunEphemeral(opts: CliOpts): int =
            {"backend": $id, "name": opts.baseline,
             "golden": opts.goldenImage})
   var vm = lb.provisionEphemeralClone(spec)
+
+  # --keep: leave the domain RUNNING for an out-of-band in-guest probe
+  # (e.g. the Windows JIT gate SSHes in and drives the bootstrap). The
+  # caller reclaims the VM via the ``ephemeral-destroy`` subcommand,
+  # which runs the very same ephemeral ``stopAndCleanup`` teardown. This
+  # is the real CLI path the M3 gate exercises for a long-lived Windows
+  # golden that stays up (as opposed to the M2 tiny golden that
+  # self-terminates and is probed via the serial marker below).
+  if opts.keepEphemeral:
+    logEvent(opts.logFormat, "info", "ephemeral clone: kept running",
+             {"name": opts.baseline,
+              "overlay": vm.extra.getOrDefault("overlayPath", ""),
+              "config_drive": vm.extra.getOrDefault("configDriveIso", ""),
+              "uefi_nvram": vm.extra.getOrDefault("uefiNvram", "")})
+    # Emit the domain name on stdout so a shell caller can capture it.
+    echo opts.baseline
+    return 0
+
   var verdict = 2
   try:
     # Poll for self-poweroff (tiny golden) or timeout.
@@ -579,6 +621,43 @@ proc cmdRunEphemeral(opts: CliOpts): int =
     logEvent(opts.logFormat, "info", "ephemeral clone: destroyed",
              {"name": opts.baseline})
   verdict
+
+proc cmdEphemeralDestroy(opts: CliOpts): int =
+  ## Reclaim an ephemeral clone left running by ``run --ephemeral --keep``.
+  ## Reconstructs the per-job VmHandle (the ephemeral artifact paths are
+  ## deterministic from ``--baseline``) and runs the SAME ephemeral
+  ## ``stopAndCleanup(deleteVm=true)`` teardown the non-keep path runs:
+  ## ``virsh destroy`` + ``virsh undefine --nvram`` + remove the CoW
+  ## overlay + the injected config-drive ISO + the per-job OVMF nvram —
+  ## leaving NO residue. The golden + the OVMF template are never touched.
+  let backend = newBackend(biLibvirt)
+  if opts.baseline.len == 0:
+    raise newException(ValueError,
+      "ephemeral-destroy: --baseline is required")
+  let lb = LibvirtBackend(backend)
+  var extra = initTable[string, string]()
+  extra["libvirtUri"] = lb.libvirtUri
+  extra["domain"] = opts.baseline
+  extra["ephemeral"] = "true"
+  extra["overlayPath"] = lb.overlayPathFor(opts.baseline)
+  # The config-drive ISO + per-job OVMF nvram are per-job artifacts named
+  # after the domain; point stopAndCleanup at their deterministic paths so
+  # they are removed only if present (a tiny-Linux clone has neither).
+  extra["configDriveIso"] = lb.configDriveIsoPathFor(opts.baseline)
+  extra["uefiNvram"] = lb.imagePoolDir / (opts.baseline & "_VARS.fd")
+  let vm = VmHandle(
+    backend: lb,
+    name: opts.baseline,
+    baseline: opts.goldenImage,
+    ipAddress: none(string),
+    sshPort: lb.sshPort,
+    sshUser: lb.sshUser,
+    sshAuth: SshAuth(kind: saNone),
+    extra: extra)
+  lb.stopAndCleanup(vm, deleteVm = true)
+  logEvent(opts.logFormat, "info", "ephemeral clone: destroyed",
+           {"name": opts.baseline})
+  0
 
 proc cmdRun(opts: CliOpts): int =
   if opts.ephemeral:
@@ -782,6 +861,7 @@ proc runCli*(args: seq[string]): int =
     return 0
   of "provision": return cmdProvision(opts)
   of "run":       return cmdRun(opts)
+  of "ephemeral-destroy": return cmdEphemeralDestroy(opts)
   of "probe":     return cmdProbe(opts)
   of "backends":  return cmdBackends(opts)
   of "shell":     return cmdShell(opts)
