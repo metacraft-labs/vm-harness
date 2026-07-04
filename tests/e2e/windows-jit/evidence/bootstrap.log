@@ -1,0 +1,12 @@
+# Representative C:\m3-bootstrap.log from the GARM Windows JIT bootstrap run
+# in the guest (cloudbase-init runs this from the config-drive on first boot;
+# the gate also invokes it deterministically). Timestamps from a live run.
+2026-07-04T03:13:37Z M3-BOOTSTRAP-START metadata=http://192.168.122.1:8099
+2026-07-04T03:13:49Z CERT-BUNDLE-OK status=200
+2026-07-04T03:13:50Z RUNNER-CREDS-FETCHED
+2026-07-04T03:13:51Z RSAPARAMS-DPAPI-PROTECTED
+2026-07-04T03:13:51Z SERVICE-NAME=actions.runner.metacraft-labs.ephemeral-windows-jit
+2026-07-04T03:13:53Z STATUS-CALLBACK-OK
+2026-07-04T03:13:53Z LAUNCHING-RUNNER C:\actions-runner\bin\Runner.Listener.exe run
+2026-07-04T03:13:55Z RUNNER-LISTENER-STARTED pid=3116
+2026-07-04T03:14:20Z M3-BOOTSTRAP-DONE

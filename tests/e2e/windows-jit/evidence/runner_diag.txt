@@ -1,0 +1,132 @@
+[2026-07-04 03:38:25Z INFO HostContext] No proxy settings were found based on environmental variables (http_proxy/https_proxy/HTTP_PROXY/HTTPS_PROXY)
+[2026-07-04 03:38:25Z INFO HostContext] Well known directory 'Bin': 'C:\actions-runner\bin'
+[2026-07-04 03:38:25Z INFO HostContext] Well known directory 'Root': 'C:\actions-runner'
+[2026-07-04 03:38:25Z INFO HostContext] Well known config file 'Credentials': 'C:\actions-runner\.credentials'
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Bin': 'C:\actions-runner\bin'
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Root': 'C:\actions-runner'
+[2026-07-04 03:38:26Z INFO HostContext] Well known config file 'Runner': 'C:\actions-runner\.runner'
+[2026-07-04 03:38:26Z INFO Listener] Runner is built for Windows (X64) - win-x64.
+[2026-07-04 03:38:26Z INFO Listener] RuntimeInformation: Microsoft Windows 10.0.22631.
+[2026-07-04 03:38:26Z INFO Listener] Version: 2.328.0
+[2026-07-04 03:38:26Z INFO Listener] Commit: 6f9a9110adce65f44ca6f7c0ae142b9cc6af937b
+[2026-07-04 03:38:26Z INFO Listener] Culture: en-US
+[2026-07-04 03:38:26Z INFO Listener] UI Culture: en-US
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Bin': 'C:\actions-runner\bin'
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Root': 'C:\actions-runner'
+[2026-07-04 03:38:26Z INFO Listener] Validating directory permissions for: 'C:\actions-runner'
+[2026-07-04 03:38:26Z INFO CommandLineParser] Parse
+[2026-07-04 03:38:26Z INFO CommandLineParser] Parsing 1 args
+[2026-07-04 03:38:26Z INFO CommandLineParser] parsing argument
+[2026-07-04 03:38:26Z INFO CommandLineParser] HasArgs: False
+[2026-07-04 03:38:26Z INFO CommandLineParser] Adding Command: run
+[2026-07-04 03:38:26Z INFO Listener] Arguments parsed
+[2026-07-04 03:38:26Z INFO Runner] ExecuteCommand
+[2026-07-04 03:38:26Z INFO ConfigurationStore] currentAssemblyLocation: C:\actions-runner\bin\Runner.Listener.dll
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Bin': 'C:\actions-runner\bin'
+[2026-07-04 03:38:26Z INFO ConfigurationStore] binPath: C:\actions-runner\bin
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Bin': 'C:\actions-runner\bin'
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Root': 'C:\actions-runner'
+[2026-07-04 03:38:26Z INFO ConfigurationStore] RootFolder: C:\actions-runner
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Bin': 'C:\actions-runner\bin'
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Root': 'C:\actions-runner'
+[2026-07-04 03:38:26Z INFO HostContext] Well known config file 'Runner': 'C:\actions-runner\.runner'
+[2026-07-04 03:38:26Z INFO ConfigurationStore] ConfigFilePath: C:\actions-runner\.runner
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Bin': 'C:\actions-runner\bin'
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Root': 'C:\actions-runner'
+[2026-07-04 03:38:26Z INFO HostContext] Well known config file 'MigratedRunner': 'C:\actions-runner\.runner_migrated'
+[2026-07-04 03:38:26Z INFO ConfigurationStore] MigratedConfigFilePath: C:\actions-runner\.runner_migrated
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Bin': 'C:\actions-runner\bin'
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Root': 'C:\actions-runner'
+[2026-07-04 03:38:26Z INFO HostContext] Well known config file 'Credentials': 'C:\actions-runner\.credentials'
+[2026-07-04 03:38:26Z INFO ConfigurationStore] CredFilePath: C:\actions-runner\.credentials
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Bin': 'C:\actions-runner\bin'
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Root': 'C:\actions-runner'
+[2026-07-04 03:38:26Z INFO HostContext] Well known config file 'MigratedCredentials': 'C:\actions-runner\.credentials_migrated'
+[2026-07-04 03:38:26Z INFO ConfigurationStore] MigratedCredFilePath: C:\actions-runner\.credentials_migrated
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Bin': 'C:\actions-runner\bin'
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Root': 'C:\actions-runner'
+[2026-07-04 03:38:26Z INFO HostContext] Well known config file 'Service': 'C:\actions-runner\.service'
+[2026-07-04 03:38:26Z INFO ConfigurationStore] ServiceConfigFilePath: C:\actions-runner\.service
+[2026-07-04 03:38:26Z INFO CommandSettings] Flag 'help': 'False'
+[2026-07-04 03:38:26Z INFO CommandSettings] Flag 'version': 'False'
+[2026-07-04 03:38:26Z INFO CommandSettings] Flag 'commit': 'False'
+[2026-07-04 03:38:26Z INFO CommandSettings] Flag 'check': 'False'
+[2026-07-04 03:38:26Z INFO CommandSettings] Command 'configure': 'False'
+[2026-07-04 03:38:26Z INFO CommandSettings] Command 'remove': 'False'
+[2026-07-04 03:38:26Z INFO CommandSettings] Command 'warmup': 'False'
+[2026-07-04 03:38:26Z INFO ConfigurationManager] LoadSettings
+[2026-07-04 03:38:26Z INFO ConfigurationStore] IsConfigured()
+[2026-07-04 03:38:26Z INFO ConfigurationStore] IsConfigured: True
+[2026-07-04 03:38:26Z INFO ConfigurationManager] Is configured: True
+[2026-07-04 03:38:26Z INFO ConfigurationStore] Read setting file: 248 chars
+[2026-07-04 03:38:26Z INFO ConfigurationManager] Settings Loaded
+[2026-07-04 03:38:26Z INFO ConfigurationStore] IsServiceConfigured()
+[2026-07-04 03:38:26Z INFO ConfigurationStore] IsServiceConfigured: True
+[2026-07-04 03:38:26Z INFO CommandSettings] Command 'run': 'True'
+[2026-07-04 03:38:26Z INFO ConfigurationStore] IsConfigured()
+[2026-07-04 03:38:26Z INFO ConfigurationStore] IsConfigured: True
+[2026-07-04 03:38:26Z INFO ConfigurationManager] Is configured: True
+[2026-07-04 03:38:26Z INFO Runner] Try determine runner startup type base on console redirects.
+[2026-07-04 03:38:26Z INFO Runner] Set runner startup type - Manual
+[2026-07-04 03:38:26Z INFO CommandSettings] Flag 'once': 'False'
+[2026-07-04 03:38:26Z INFO CommandSettings] Flag 'once': 'False'
+[2026-07-04 03:38:26Z INFO Runner] RunAsync
+[2026-07-04 03:38:26Z INFO ConfigurationManager] LoadMigratedSettings
+[2026-07-04 03:38:26Z INFO ConfigurationStore] IsMigratedConfigured()
+[2026-07-04 03:38:26Z INFO ConfigurationStore] IsMigratedConfigured: False
+[2026-07-04 03:38:26Z INFO Runner] Failed to load migrated settings: No migrated configuration found.
+[2026-07-04 03:38:26Z INFO Runner] Falling back to original .runner settings
+[2026-07-04 03:38:26Z INFO ConfigurationManager] LoadSettings
+[2026-07-04 03:38:26Z INFO ConfigurationStore] IsConfigured()
+[2026-07-04 03:38:26Z INFO ConfigurationStore] IsConfigured: True
+[2026-07-04 03:38:26Z INFO ConfigurationManager] Is configured: True
+[2026-07-04 03:38:26Z INFO ConfigurationManager] Settings Loaded
+[2026-07-04 03:38:26Z INFO MessageListener] {
+  "AgentId": 1,
+  "AgentName": "ephemeral-windows-jit",
+  "PoolId": 1,
+  "PoolName": "Default",
+  "Ephemeral": true,
+  "ServerUrl": "http://192.168.122.1:8099/actions",
+  "GitHubUrl": "https://github.com/metacraft-labs/ephemeral-runners",
+  "WorkFolder": "_work"
+}
+[2026-07-04 03:38:26Z INFO MessageListener] Loading Credentials
+[2026-07-04 03:38:26Z INFO ConfigurationStore] HasCredentials()
+[2026-07-04 03:38:26Z INFO ConfigurationStore] stored True
+[2026-07-04 03:38:26Z INFO CredentialManager] GetCredentialProvider
+[2026-07-04 03:38:26Z INFO CredentialManager] Creating type OAuth
+[2026-07-04 03:38:26Z INFO CredentialManager] Creating credential type: OAuth
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Bin': 'C:\actions-runner\bin'
+[2026-07-04 03:38:26Z INFO HostContext] Well known directory 'Root': 'C:\actions-runner'
+[2026-07-04 03:38:26Z INFO HostContext] Well known config file 'RSACredentials': 'C:\actions-runner\.credentials_rsaparams'
+[2026-07-04 03:38:26Z INFO RSAEncryptedFileKeyManager] Loading RSA key parameters from file C:\actions-runner\.credentials_rsaparams
+[2026-07-04 03:38:27Z INFO MessageListener] Attempt to create session.
+[2026-07-04 03:38:27Z INFO MessageListener] Connecting to the Runner Server...
+[2026-07-04 03:38:27Z INFO RunnerServer] EstablishVssConnection
+[2026-07-04 03:38:27Z INFO RunnerServer] Establish connection with 100 seconds timeout.
+[2026-07-04 03:38:27Z INFO GitHubActionsService] Starting operation Location.GetConnectionData
+[2026-07-04 03:38:28Z INFO RunnerServer] EstablishVssConnection
+[2026-07-04 03:38:28Z INFO RunnerServer] Establish connection with 60 seconds timeout.
+[2026-07-04 03:38:28Z INFO GitHubActionsService] Starting operation Location.GetConnectionData
+[2026-07-04 03:38:28Z INFO RunnerServer] EstablishVssConnection
+[2026-07-04 03:38:28Z INFO RunnerServer] Establish connection with 60 seconds timeout.
+[2026-07-04 03:38:28Z INFO GitHubActionsService] Starting operation Location.GetConnectionData
+[2026-07-04 03:38:28Z INFO GitHubActionsService] Finished operation Location.GetConnectionData
+[2026-07-04 03:38:28Z INFO GitHubActionsService] Finished operation Location.GetConnectionData
+[2026-07-04 03:38:28Z INFO GitHubActionsService] Finished operation Location.GetConnectionData
+[2026-07-04 03:38:29Z ERR  MessageListener] Catch exception during create session.
+[2026-07-04 03:38:29Z ERR  MessageListener] GitHub.Services.WebApi.VssApiResourceDuplicateIdException: The following location id has already been registered: 134e239e-2df3-4794-a6f6-24f1f19ec8dc.
+   at GitHub.Services.WebApi.ApiResourceLocationCollection.AddResourceLocation(ApiResourceLocation location)
+   at GitHub.Services.WebApi.Location.VssServerDataProvider.GetResourceLocationsAsync(CancellationToken cancellationToken)
+   at GitHub.Services.WebApi.VssConnection.GetClientInstanceAsync(Type managedType, Guid serviceIdentifier, CancellationToken cancellationToken, VssHttpRequestSettings settings, DelegatingHandler[] handlers)
+   at GitHub.Services.WebApi.VssConnection.GetClientServiceImplAsync(Type requestedType, Guid serviceIdentifier, Func`4 getInstanceAsync, CancellationToken cancellationToken)
+   at GitHub.Services.WebApi.VssConnection.GetClientAsync[T](CancellationToken cancellationToken)
+   at GitHub.Services.WebApi.TaskExtensions.SyncResult[T](Task`1 task)
+   at GitHub.Services.WebApi.VssConnection.GetClient[T]()
+   at GitHub.Runner.Common.RunnerServer.ConnectAsync(Uri serverUrl, VssCredentials credentials)
+   at GitHub.Runner.Listener.MessageListener.CreateSessionAsync(CancellationToken token)
+[2026-07-04 03:38:29Z INFO MessageListener] Retriable exception: The following location id has already been registered: 134e239e-2df3-4794-a6f6-24f1f19ec8dc.
+[2026-07-04 03:38:29Z ERR  Terminal] WRITE ERROR: 2026-07-04 03:38:29Z: Runner connect error: The following location id has already been registered: 134e239e-2df3-4794-a6f6-24f1f19ec8dc.. Retrying until reconnected.
+[2026-07-04 03:38:29Z INFO MessageListener] Sleeping for 30 seconds before retrying.
+

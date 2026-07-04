@@ -1,0 +1,15 @@
+{
+  "authorized": [
+    "/system/cert-bundle",
+    "/credentials/runner",
+    "/credentials/credentials",
+    "/credentials/credentials_rsaparams",
+    "/system/service-name",
+    "/status",
+    "GET /actions/_apis/connectionData"
+  ],
+  "unauthorized": [
+    "/credentials/runner"
+  ],
+  "note": "authorized = fetched with a valid per-instance JWT (200); unauthorized = no-JWT probe rejected (401). connectionData = Runner.Listener connected to the mock Actions server."
+}

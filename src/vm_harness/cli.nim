@@ -96,6 +96,18 @@ type
                                  ## the direct-kernel ephemeral boot.
     kernelCmdline*: string       ## ``--kernel-cmdline <str>`` — optional kernel
                                  ## cmdline for the direct-kernel ephemeral boot.
+    userDataFile*: string        ## ``--user-data <path>`` — libvirt-only (M3):
+                                 ## a file whose contents become the config-drive
+                                 ## ``openstack/latest/user_data`` (the rendered
+                                 ## GARM bootstrap). vm-harness builds a
+                                 ## ``config-2``-labelled ISO and attaches it so
+                                 ## cloudbase-init runs it on first boot.
+    metaDataFile*: string        ## ``--meta-data <path>`` — optional override for
+                                 ## the config-drive ``meta_data.json``.
+    uefiLoader*: string          ## ``--uefi-loader <path>`` — OVMF code fd; when
+                                 ## set the ephemeral clone boots UEFI (Windows).
+    uefiNvramTemplate*: string   ## ``--uefi-nvram-template <path>`` — OVMF vars
+                                 ## template donor for the per-job nvram copy.
     controllerPubKey*: string    ## ``--controller-pubkey <path>`` — SSH public
                                  ## key (``id_ed25519.pub`` or similar) that
                                  ## the recipe's build-autounattend-iso.sh
@@ -317,6 +329,14 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.initrd = args[i]; inc i
     of "--kernel-cmdline":
       inc i; result.kernelCmdline = args[i]; inc i
+    of "--user-data":
+      inc i; result.userDataFile = args[i]; inc i
+    of "--meta-data":
+      inc i; result.metaDataFile = args[i]; inc i
+    of "--uefi-loader":
+      inc i; result.uefiLoader = args[i]; inc i
+    of "--uefi-nvram-template":
+      inc i; result.uefiNvramTemplate = args[i]; inc i
     of "--output-dir":
       inc i; result.outputDir = args[i]; inc i
     of "--timeout-sec":
@@ -486,6 +506,23 @@ proc cmdRunEphemeral(opts: CliOpts): int =
     raise newException(ValueError,
       "run --ephemeral: --golden-image is required")
   let lb = LibvirtBackend(backend)
+  # M3: build the config-drive ISO from --user-data so cloudbase-init runs
+  # the injected bootstrap on first boot. Per-job artifacts (ISO + nvram)
+  # live next to the overlay and are removed on teardown.
+  var configDriveIso = ""
+  if opts.userDataFile.len > 0:
+    if not fileExists(opts.userDataFile):
+      raise newException(ValueError,
+        "run --ephemeral: --user-data file not found: " & opts.userDataFile)
+    let userData = readFile(opts.userDataFile)
+    var metaData = ""
+    if opts.metaDataFile.len > 0 and fileExists(opts.metaDataFile):
+      metaData = readFile(opts.metaDataFile)
+    configDriveIso = lb.configDriveIsoPathFor(opts.baseline)
+    discard buildConfigDriveIso(configDriveIso, userData, metaData)
+  var uefiNvram = ""
+  if opts.uefiLoader.len > 0:
+    uefiNvram = lb.imagePoolDir / (opts.baseline & "_VARS.fd")
   let spec = EphemeralCloneSpec(
     name: opts.baseline,
     goldenImage: opts.goldenImage,
@@ -493,7 +530,11 @@ proc cmdRunEphemeral(opts: CliOpts): int =
     memoryMB: (if opts.memoryMB > 0: opts.memoryMB else: 1024),
     kernel: opts.kernel,
     initrd: opts.initrd,
-    cmdline: opts.kernelCmdline)
+    cmdline: opts.kernelCmdline,
+    configDriveIso: configDriveIso,
+    uefiLoader: opts.uefiLoader,
+    uefiNvramTemplate: opts.uefiNvramTemplate,
+    uefiNvram: uefiNvram)
   let expectMarker = if opts.cmd.len > 0: opts.cmd[0] else: ""
   let timeoutSec = if opts.timeoutSec > 0: opts.timeoutSec else: 120
   logEvent(opts.logFormat, "info", "ephemeral clone: boot",

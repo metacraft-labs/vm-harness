@@ -431,6 +431,89 @@ type
     serialLogPath*: string       ## host path the guest's serial console is
                                  ## captured to (boot-marker harvest). When
                                  ## empty a temp path is chosen.
+    configDriveIso*: string      ## optional: absolute path to a config-drive
+                                 ## ISO (cloudbase-init ConfigDrive datasource,
+                                 ## OpenStack layout ``openstack/latest/
+                                 ## {meta_data.json,user_data}``, volume label
+                                 ## ``config-2``). When set it is attached to
+                                 ## the domain as a read-only CD-ROM so
+                                 ## cloudbase-init consumes + runs the injected
+                                 ## user_data on first boot. This is the M3 JIT
+                                 ## bootstrap-injection seam.
+    uefiLoader*: string          ## optional: OVMF code firmware
+                                 ## (``edk2-x86_64-code.fd``). When set the
+                                 ## domain boots UEFI (required by Windows 11);
+                                 ## ``uefiNvramTemplate`` supplies the vars
+                                 ## template and ``uefiNvram`` the per-job vars
+                                 ## copy. Empty ⇒ legacy/direct-kernel boot
+                                 ## (the tiny Linux golden path).
+    uefiNvramTemplate*: string   ## OVMF vars template (read-only donor)
+    uefiNvram*: string           ## per-job writable OVMF vars copy path
+
+proc configDriveIsoPathFor*(b: LibvirtBackend, name: string): string =
+  ## Per-job config-drive ISO path, named ``<domain>.config-drive.iso`` so
+  ## the ephemeral teardown can find and remove exactly it (never a
+  ## pool-shared install ISO).
+  b.imagePoolDir / (name & ".config-drive.iso")
+
+proc buildConfigDriveIso*(isoPath, userData: string;
+                          metaData: string = ""): string =
+  ## Build a cloudbase-init ConfigDrive ISO at ``isoPath`` carrying the
+  ## OpenStack config-drive layout:
+  ##
+  ##   openstack/latest/meta_data.json   (instance identity)
+  ##   openstack/latest/user_data        (the rendered GARM bootstrap;
+  ##                                       cloudbase-init's userdata plugin
+  ##                                       executes it on first boot)
+  ##
+  ## The ISO is ISO9660 (Rock-Ridge + Joliet) with the volume label
+  ## ``config-2`` — the label cloudbase-init's ConfigDrive datasource
+  ## probes for. Returns ``isoPath`` on success; raises on failure.
+  ##
+  ## ``metaData`` may be a JSON string; when empty a minimal
+  ## ``meta_data.json`` is synthesised (uuid + hostname derived from the
+  ## ISO basename) so cloudbase-init's datasource is satisfied.
+  let staging = getTempDir() / ("vm-harness-configdrive-" &
+    toHex(int64(epochTime() * 1000.0) and 0xFFFFFFFF'i64, 8).toLowerAscii())
+  let osDir = staging / "openstack" / "latest"
+  createDir(osDir)
+  var meta = metaData
+  if meta.len == 0:
+    let base = splitFile(isoPath).name
+    meta = "{\"uuid\": \"" & base & "\", \"hostname\": \"" & base &
+      "\", \"name\": \"" & base & "\"}"
+  writeFile(osDir / "meta_data.json", meta)
+  writeFile(osDir / "user_data", userData)
+  # Prefer genisoimage/mkisofs; fall back to xorriso (its mkisofs-compat
+  # emulation). The volume label MUST be ``config-2``.
+  var built = false
+  for tool in ["genisoimage", "mkisofs"]:
+    if findExe(tool).len > 0:
+      let res = runProcessCapture(@[tool,
+        "-quiet",
+        "-output", isoPath,
+        "-volid", "config-2",
+        "-joliet", "-rock",
+        staging], timeoutSec = 120)
+      if res.exitCode == 0:
+        built = true
+        break
+  if not built and findExe("xorriso").len > 0:
+    let res = runProcessCapture(@["xorriso", "-as", "mkisofs",
+      "-quiet",
+      "-o", isoPath,
+      "-V", "config-2",
+      "-J", "-R",
+      staging], timeoutSec = 120)
+    if res.exitCode == 0:
+      built = true
+  try: removeDir(staging)
+  except CatchableError: discard
+  if not built:
+    raise newException(IOError,
+      "buildConfigDriveIso: no ISO tool (genisoimage/mkisofs/xorriso) " &
+      "succeeded building " & isoPath)
+  result = isoPath
 
 proc overlayPathFor*(b: LibvirtBackend, name: string): string =
   ## The per-job CoW overlay lives next to the other pool images and is
@@ -446,8 +529,22 @@ proc buildEphemeralDomainXml*(b: LibvirtBackend, spec: EphemeralCloneSpec,
   ## file-backed serial console so the harness can read the boot marker.
   let cpus = if spec.cpus > 0: spec.cpus else: 2
   let mem = if spec.memoryMB > 0: spec.memoryMB else: 1024
+  # UEFI (Windows 11) needs a pflash loader + writable nvram vars. When a
+  # loader is supplied we emit the <loader>/<nvram> pair; otherwise the
+  # domain uses SeaBIOS (legacy/direct-kernel — the tiny Linux golden).
+  let uefi = spec.uefiLoader.len > 0
   var osBlock = "  <os>\n" &
     "    <type arch='x86_64' machine='q35'>hvm</type>\n"
+  if uefi:
+    osBlock.add("    <loader readonly='yes' type='pflash' format='raw'>" &
+      spec.uefiLoader & "</loader>\n")
+    if spec.uefiNvram.len > 0:
+      if spec.uefiNvramTemplate.len > 0:
+        osBlock.add("    <nvram template='" & spec.uefiNvramTemplate &
+          "' templateFormat='raw' format='raw'>" & spec.uefiNvram &
+          "</nvram>\n")
+      else:
+        osBlock.add("    <nvram format='raw'>" & spec.uefiNvram & "</nvram>\n")
   if spec.kernel.len > 0:
     osBlock.add("    <kernel>" & spec.kernel & "</kernel>\n")
     if spec.initrd.len > 0:
@@ -457,19 +554,68 @@ proc buildEphemeralDomainXml*(b: LibvirtBackend, spec: EphemeralCloneSpec,
   else:
     osBlock.add("    <boot dev='hd'/>\n")
   osBlock.add("  </os>\n")
+  # Optional config-drive CD-ROM (M3 cloudbase-init ConfigDrive datasource).
+  # Attached read-only on the SATA bus so a Windows guest's cloudbase-init
+  # finds a labelled ``config-2`` volume and runs the injected user_data.
+  var configDriveDisk = ""
+  if spec.configDriveIso.len > 0:
+    configDriveDisk =
+      "    <disk type='file' device='cdrom'>\n" &
+      "      <driver name='qemu' type='raw'/>\n" &
+      "      <source file='" & spec.configDriveIso & "'/>\n" &
+      "      <target dev='sda' bus='sata'/>\n" &
+      "      <readonly/>\n" &
+      "    </disk>\n"
+  # A firmware (disk-boot) golden — the real Windows golden — needs a
+  # network interface so cloudbase-init can reach the mock/real GARM
+  # metadata endpoint. A direct-kernel tiny-Linux golden does not (it
+  # self-terminates without networking); we only add the NIC for the
+  # firmware-boot path so the existing M2 tiny-golden gate is unchanged.
+  var netIface = ""
+  if spec.kernel.len == 0:
+    netIface =
+      "    <interface type='network'>\n" &
+      "      <source network='default'/>\n" &
+      "      <model type='virtio'/>\n" &
+      "    </interface>\n"
+  # Windows 11 on UEFI requires SMM + APIC; hyperv enlightenments improve
+  # stability. The tiny-Linux path keeps the minimal <acpi/>-only features.
+  var featuresBlock = "  <features><acpi/></features>\n"
+  var clockBlock = ""
+  if uefi:
+    featuresBlock =
+      "  <features>\n" &
+      "    <acpi/>\n    <apic/>\n" &
+      "    <hyperv mode='custom'>\n" &
+      "      <relaxed state='on'/>\n" &
+      "      <vapic state='on'/>\n" &
+      "      <spinlocks state='on' retries='8191'/>\n" &
+      "    </hyperv>\n" &
+      "    <smm state='on'/>\n" &
+      "  </features>\n"
+    clockBlock =
+      "  <clock offset='localtime'>\n" &
+      "    <timer name='rtc' tickpolicy='catchup'/>\n" &
+      "    <timer name='hpet' present='no'/>\n" &
+      "    <timer name='hypervclock' present='yes'/>\n" &
+      "  </clock>\n"
   result =
     "<domain type='kvm'>\n" &
     "  <name>" & spec.name & "</name>\n" &
     "  <memory unit='MiB'>" & $mem & "</memory>\n" &
     "  <vcpu>" & $cpus & "</vcpu>\n" &
     osBlock &
-    "  <features><acpi/></features>\n" &
+    featuresBlock &
+    (if uefi: "  <cpu mode='host-passthrough'/>\n" else: "") &
+    clockBlock &
     "  <devices>\n" &
     "    <disk type='file' device='disk'>\n" &
     "      <driver name='qemu' type='qcow2'/>\n" &
     "      <source file='" & overlayPath & "'/>\n" &
     "      <target dev='vda' bus='virtio'/>\n" &
     "    </disk>\n" &
+    configDriveDisk &
+    netIface &
     "    <serial type='file'>\n" &
     "      <source path='" & serialLogPath & "'/>\n" &
     "      <target port='0'/>\n" &
@@ -579,6 +725,10 @@ method provisionEphemeralClone*(b: LibvirtBackend,
     extra["overlayPath"] = overlay
     extra["goldenImage"] = spec.goldenImage
     extra["serialLogPath"] = serialLogPath
+    if spec.configDriveIso.len > 0:
+      extra["configDriveIso"] = spec.configDriveIso
+    if spec.uefiNvram.len > 0:
+      extra["uefiNvram"] = spec.uefiNvram
     result = VmHandle(
       backend: b,
       name: spec.name,
@@ -1233,6 +1383,17 @@ method stopAndCleanup*(b: LibvirtBackend, vm: VmHandle,
           # scoped so it can't delete pool-shared read-only media.
           try: b.removeEphemeralOverlay(vm.name)
           except CatchableError: discard
+          # Also remove this job's injected config-drive ISO + per-job
+          # OVMF nvram vars copy (M3). Both are per-job artifacts named
+          # after the domain; the golden + the OVMF template are untouched.
+          let cdIso = vm.extra.getOrDefault("configDriveIso", "")
+          if cdIso.len > 0 and fileExists(cdIso):
+            try: removeFile(cdIso)
+            except CatchableError: discard
+          let nvram = vm.extra.getOrDefault("uefiNvram", "")
+          if nvram.len > 0 and fileExists(nvram):
+            try: removeFile(nvram)
+            except CatchableError: discard
         else:
           try: b.deleteDomainDisk(vm.name)
           except CatchableError: discard

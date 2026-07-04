@@ -171,3 +171,86 @@ suite "LibvirtBackend smoke (no live virsh)":
     # And the (linux, windows) dispatch picks libvirt.
     check autoSelectBackendId(hpLinux, goWindows) == biLibvirt
     check autoSelectBackendId(hpLinux, goLinux) == biLibvirt
+
+  # ---- M3: config-drive injection + UEFI ephemeral domain rendering ----
+
+  test "buildEphemeralDomainXml attaches the config-drive CD-ROM + NIC " &
+       "for a firmware (Windows) golden":
+    let b = newLibvirtBackend()
+    let spec = EphemeralCloneSpec(
+      name: "m3-eph",
+      goldenImage: "/storage/iso/golden-win11-cloudbase.qcow2",
+      cpus: 4, memoryMB: 4096,
+      configDriveIso: "/var/lib/libvirt/images/m3-eph.config-drive.iso")
+    let xml = b.buildEphemeralDomainXml(spec,
+      "/var/lib/libvirt/images/m3-eph.overlay.qcow2",
+      "/tmp/m3-eph.serial.log")
+    # The overlay disk is the boot disk.
+    check "m3-eph.overlay.qcow2" in xml
+    # The config-drive is attached read-only as a CD-ROM (cloudbase-init
+    # ConfigDrive datasource consumes it).
+    check "device='cdrom'" in xml
+    check "m3-eph.config-drive.iso" in xml
+    check "<readonly/>" in xml
+    # A firmware-boot golden gets a NIC so cloudbase-init can reach the
+    # metadata endpoint.
+    check "<interface type='network'>" in xml
+    # No direct-kernel boot for a firmware golden.
+    check "<kernel>" notin xml
+    check "<boot dev='hd'/>" in xml
+
+  test "buildEphemeralDomainXml renders UEFI (OVMF) loader + per-job nvram":
+    let b = newLibvirtBackend()
+    let spec = EphemeralCloneSpec(
+      name: "m3-uefi",
+      goldenImage: "/storage/iso/golden-win11-cloudbase.qcow2",
+      uefiLoader: "/run/libvirt/nix-ovmf/edk2-x86_64-code.fd",
+      uefiNvramTemplate: "/run/libvirt/nix-ovmf/edk2-i386-vars.fd",
+      uefiNvram: "/var/lib/libvirt/images/m3-uefi_VARS.fd")
+    let xml = b.buildEphemeralDomainXml(spec,
+      "/var/lib/libvirt/images/m3-uefi.overlay.qcow2",
+      "/tmp/m3-uefi.serial.log")
+    check "edk2-x86_64-code.fd" in xml
+    check "<loader" in xml and "pflash" in xml
+    check "m3-uefi_VARS.fd" in xml
+    check "template='/run/libvirt/nix-ovmf/edk2-i386-vars.fd'" in xml
+    # Windows on UEFI needs SMM.
+    check "<smm state='on'/>" in xml
+
+  test "the tiny-Linux (direct-kernel) ephemeral path is unchanged (no NIC/" &
+       "config-drive/UEFI)":
+    let b = newLibvirtBackend()
+    let spec = EphemeralCloneSpec(
+      name: "m2-tiny",
+      goldenImage: "/tmp/golden.qcow2",
+      kernel: "/tmp/kernel", initrd: "/tmp/initramfs.gz",
+      cmdline: "console=ttyS0 quiet panic=1")
+    let xml = b.buildEphemeralDomainXml(spec,
+      "/tmp/m2-tiny.overlay.qcow2", "/tmp/m2-tiny.serial.log")
+    check "<kernel>/tmp/kernel</kernel>" in xml
+    # M2 tiny golden self-terminates without networking; no NIC is added.
+    check "<interface" notin xml
+    check "device='cdrom'" notin xml
+    check "<loader" notin xml
+
+  test "buildConfigDriveIso writes the openstack config-drive layout + " &
+       "labels it config-2 (when an ISO tool is available)":
+    if findExe("genisoimage").len == 0 and findExe("mkisofs").len == 0 and
+       findExe("xorriso").len == 0:
+      echo "[skip] no genisoimage/mkisofs/xorriso on PATH"
+      skip()
+    else:
+      let iso = getTempDir() / "m3-configdrive-unit.iso"
+      removeFile(iso)
+      let ud = "#ps1_sysnative\nWrite-Output HELLO-M3\n"
+      let meta = "{\"uuid\":\"unit-test\",\"hostname\":\"unit-test\"}"
+      let got = buildConfigDriveIso(iso, ud, meta)
+      check got == iso
+      check fileExists(iso)
+      # The ISO must carry the config-2 volume label + the user_data. We
+      # grep the raw ISO bytes for the volume id + payload marker.
+      let raw = readFile(iso)
+      check "config-2" in raw
+      check "HELLO-M3" in raw
+      check "user_data" in raw
+      removeFile(iso)

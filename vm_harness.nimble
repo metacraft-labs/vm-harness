@@ -66,6 +66,17 @@ task test, "Run the vm-harness test suite":
   # a reachable libvirtd (LIBVIRT_DEFAULT_URI=qemu:///session) are
   # present. Build the golden with `nix build .#golden-linux-tiny`.
   exec "nim r --hints:off tests/e2e/t_vmharness_libvirt_ephemeral_run.nim"
+  # Campaign M3 — Windows golden + cloudbase-init config-drive JIT injection
+  # gate. Boots a FRESH per-job CoW clone of the cloudbase-init Windows
+  # golden on REAL libvirt + KVM (UEFI/OVMF) with an INJECTED config-drive
+  # carrying the GARM Windows JIT bootstrap, drives it against a MOCK GARM
+  # metadata+actions endpoint (per-instance JWT), and asserts the runner
+  # fetches the JIT credentials under the JWT + launches Runner.Listener +
+  # attempts a runner session, then tears the clone down with no residue.
+  # Self-skips unless the golden (VMH_WIN_GOLDEN) + OVMF + /dev/kvm + a
+  # system libvirtd + python3/sshpass/genisoimage are present. NEVER touches
+  # windows-runner-001.
+  exec "nim r --hints:off tests/e2e/t_windows_golden_jit_boot.nim"
 
 task buildCli, "Build the vm-harness CLI binary":
   exec "nim c --hints:off -o:build/bin/vm-harness src/vm_harness/cli.nim"
