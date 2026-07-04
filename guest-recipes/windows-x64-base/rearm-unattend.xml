@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  sysprep2 re-arm unattend for the cloudbase-init Windows golden.
+
+  Passed to `sysprep /generalize /oobe /shutdown /unattend:<this>` so that,
+  on the NEXT boot of every CoW clone, Windows mini-setup:
+    - generalize: keeps the virtio device drivers (PersistAllDeviceInstalls),
+      so the clone still sees its virtio-blk/virtio-net devices;
+    - specialize: regenerates the machine SID (implicit to /generalize) and
+      assigns a RANDOM computer name (ComputerName=*) so every clone gets a
+      DISTINCT hostname;
+    - oobeSystem: skips the entire Win11 24H2 OOBE (no MSA/region/EULA/
+      wireless prompts) and boots straight to the logon screen, where the
+      persisted `admin` local account + Automatic OpenSSH + Automatic
+      cloudbase-init services come up unattended.
+
+  The persisted admin account, its authorized_keys, OpenSSH, and
+  cloudbase-init (Automatic) all survive /generalize, so this file
+  deliberately does NOT re-create the account, re-install OpenSSH, or run
+  any FirstLogonCommands (and in particular does NOT shut the clone down).
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+  <settings pass="generalize">
+    <component name="Microsoft-Windows-PnpSysprep" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <PersistAllDeviceInstalls>true</PersistAllDeviceInstalls>
+      <DoNotCleanUpNonPresentDevices>true</DoNotCleanUpNonPresentDevices>
+    </component>
+  </settings>
+
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <ComputerName>*</ComputerName>
+      <TimeZone>UTC</TimeZone>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UILanguageFallback>en-US</UILanguageFallback>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <NetworkLocation>Work</NetworkLocation>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+      <TimeZone>UTC</TimeZone>
+    </component>
+  </settings>
+
+</unattend>

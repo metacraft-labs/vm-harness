@@ -66,29 +66,122 @@ qemu-img convert -O qcow2 -c /storage/scratch/inspect.overlay.qcow2 \
 The companion `cloudbase-init.conf` in this directory is the exact config
 written into the golden.
 
-## Golden completeness — HONEST caveat (sysprep)
+## Sysprep `/generalize` — the production golden
 
-This golden is **NOT sysprepped `/generalize`d**. It shares the base golden's
-SID + hostname across clones (both the M3 clones and the running
-`windows-runner-001` report hostname `REPRO-N226DFJUD`). For the M3 MECHANISM
-proof this is fine — each ephemeral clone is a fresh CoW overlay, cloudbase-init
-keys "have I run" on the per-job config-drive instance-id (unique per job) so it
-runs fresh on every clone, and the runner is `--ephemeral` (one job, then
-destroyed).
+The **non-generalized** golden (`golden-win11-cloudbase.qcow2`) shares the base
+golden's machine SID + hostname across clones (both the M3 clones and the
+running `windows-runner-001` report hostname `REPRO-N226DFJUD`). For the M3
+MECHANISM proof that is fine — cloudbase-init keys "have I run" on the per-job
+config-drive instance-id, so it runs fresh on every clone, and the runner is
+`--ephemeral`. But at fleet scale, duplicate machine SIDs risk AD / telemetry /
+WSUS collisions, so a **production** golden must be `sysprep /generalize`d so
+each clone gets a fresh SID + hostname.
 
-A **production** golden should additionally:
+The distinct-identity gate
+(`tests/e2e/windows-sysprep/run-sysprep-identity-gate.sh`) boots two clones of
+the generalized golden and asserts their machine SIDs and hostnames differ
+while cloudbase-init still consumes the injected config-drive.
 
-- run **`sysprep /generalize /oobe`** (with a cloudbase-init
-  `SetupComplete`/unattend that re-arms cloudbase-init) so each clone gets a
-  fresh machine SID + hostname — required for correctness at fleet scale and to
-  avoid AD/telemetry collisions;
-- pin the cloudbase-init + runner versions and re-capture on updates;
-- optionally pre-install the runner as a service shell so the JIT path only has
-  to drop the `.runner`/`.credentials` and `Start-Service`.
+> **STATUS / KNOWN BLOCKER (2026-07-04): the generalized golden is NOT yet
+> gate-passing.** The procedure below successfully `/generalize`s
+> `golden-win11-cloudbase.qcow2` and captures it cold, but every CoW clone of
+> the result fails Windows mini-setup at the **specialize** pass with the modal
+> *"Windows could not finish configuring the system. To attempt to resume
+> configuration, restart the computer."* (deterministic — a reboot shows the
+> same dialog), so the clone never completes OOBE / networks. Root cause, from
+> the clone's `C:\Windows\Panther\setupact.log`: during specialize CBS tries to
+> finalize the removal of Feature-on-Demand packages that generalize
+> deprovisioned (`Microsoft-Windows-Kernel-LA57-FoD`,
+> `Microsoft-OneCore-DirectX-Database-FOD`) but hits
+> `ERROR_NOT_FOUND` / `CbsExecuteStateFailed` / *"Failed to commit CSI
+> transaction … Component reboot required, package changes need to be pended"*.
+> This is a **pre-existing component-store inconsistency in the base golden**
+> (the same orphaned incomplete CBS session `SessionsPending\…_3389271126` that
+> also caused the reserved-storage sysprep-validation lock in step 3), which
+> generalize then turns into un-committable pending FoD-removal transactions.
+> FIX for the next attempt: on a fresh copy, **repair the component store
+> BEFORE generalize** — `DISM /Online /Cleanup-Image /StartComponentCleanup
+> /ResetBase` (note the `/ResetBase`, which finalizes the pending session and
+> drops superseded FoD payloads; plain `StartComponentCleanup` did NOT clear
+> it), optionally `DISM /Online /Cleanup-Image /RevertPendingActions`, then
+> generalize. The unvalidated capture is parked at
+> `/storage/scratch/golden-win11-cloudbase-sysprep.UNVALIDATED-clone-specialize-fails.qcow2`
+> (moved OUT of `/storage/iso` so it is not mistaken for a working golden).
 
-Sysprep `/generalize` was deliberately deferred from M3 (a full sysprep cycle is
-slow to iterate and would need its own unattend to re-arm cloudbase-init +
-OpenSSH + auto-logon; doing it wrong bricks the golden). The first-boot
-config-drive path proven here is the correct injection MECHANISM regardless of
-whether the golden is sysprepped; sysprep is an orthogonal generalization step
-for M4/production.
+### Procedure (what produced the sysprepped golden)
+
+Run on the KVM host against a **COPY** of the golden — never mutate the golden
+in place, and (critically) **capture while the guest is shut down, right after
+`sysprep … /shutdown`, BEFORE any boot**. Booting a generalized image runs OOBE
+and CONSUMES the generalize (the result is a re-specialized, non-reusable
+image), so the golden must be captured cold.
+
+```bash
+# 1. Full standalone COPY of the golden (do NOT touch the original).
+qemu-img convert -O qcow2 /storage/iso/golden-win11-cloudbase.qcow2 \
+  /storage/scratch/sysprep2-work.qcow2
+
+# 2. Boot a throwaway domain off the copy (UEFI/OVMF, virtio-net on virbr0,
+#    distinct from windows-runner-001). SSH in (admin / repro-windows-x64).
+```
+
+3. **Clear the "reserved storage in use" blocker.** Win11 24H2 `sysprep
+   /generalize` fails validation with
+   `SYSPRP Sysprep_Clean_Validate_Opk: Audit mode cannot be turned on if
+   reserved storage is in use … hr = 0x800F0975` whenever reserved storage has
+   an active servicing scenario (this golden carried an orphaned incomplete CBS
+   session from its build). `ShippedWithReserves=0` alone is **not** enough. In
+   the guest:
+
+   ```powershell
+   dism /online /Cleanup-Image /StartComponentCleanup   # finalize pending CBS
+   shutdown /r /t 3 /f                                   # reboot to settle
+   # after reboot, reset the ReserveManager scenario then disable reserves:
+   reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager" /v ActiveScenario /t REG_DWORD /d 0 /f
+   reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager" /v DisableDeletes /t REG_DWORD /d 0 /f
+   dism /online /Set-ReservedStorageState /State:Disabled   # must report success
+   ```
+
+4. **Bake the re-arm unattend** (see `rearm-unattend.xml` alongside this recipe,
+   the exact file used). It is minimal on purpose — the persisted `admin`
+   account, its `authorized_keys`, Automatic OpenSSH, and Automatic
+   cloudbase-init all SURVIVE `/generalize`, so it does NOT re-create the
+   account or re-install anything (and must NOT shut the clone down):
+   - `generalize`: `PersistAllDeviceInstalls=true` (keep virtio drivers);
+   - `specialize`: `<ComputerName>*</ComputerName>` → random DISTINCT hostname
+     per clone, `TimeZone=UTC`;
+   - `oobeSystem`: full Win11 OOBE skip (`SkipMachineOOBE`/`SkipUserOOBE`/
+     `HideOnlineAccountScreens`/…) so clones boot straight to the logon screen
+     unattended.
+
+5. **Run sysprep — with `/quiet`:**
+
+   ```
+   C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /quiet ^
+       /unattend:C:\sysprep2-unattend.xml
+   ```
+
+   `/quiet` is MANDATORY: without it, a validation failure pops a modal error
+   MessageBox, and in the non-interactive Session-0 (SSH/service) context there
+   is no one to dismiss it — `sysprep.exe` then hangs forever holding the
+   sysprep mutex (a second attempt blocks behind it). With `/quiet`, a failure
+   writes `Panther\setuperr.log` and exits.
+
+   Keep the `wuauserv` (Windows Update) service startable during the run: the
+   generalize provider `GeneralizeForImaging` (wuaueng.dll) drives WU client
+   generalization and stalls badly if the service can't start. The guest
+   `SHUTS DOWN` on success.
+
+6. **Capture the instant it powers off (do NOT boot the work image again):**
+
+   ```bash
+   qemu-img convert -O qcow2 /storage/scratch/sysprep2-work.qcow2 \
+     /storage/iso/golden-win11-cloudbase-sysprep.qcow2
+   ```
+
+7. Destroy + undefine the throwaway domain (`virsh undefine … --nvram`) and
+   delete the work overlay/nvram.
+
+Because cloudbase-init is left Automatic, on each clone's first boot the service
+auto-starts, sees the injected config-drive's fresh instance-id, and runs the
+userdata — the M3 injection mechanism is unchanged by sysprep.

@@ -1,0 +1,14 @@
+#ps1_sysnative
+# Minimal cloudbase-init user_data for the sysprep distinct-identity gate.
+#
+# Delivered via the injected config-drive (openstack/latest/user_data). Its
+# ONLY job is to prove — autonomously, on first boot, without any SSH driving
+# — that cloudbase-init on the sysprepped golden still detects + consumes the
+# injected config-drive and runs the userdata. It stamps a marker file the
+# gate later reads over SSH, tagging it with the per-clone instance name so a
+# stale marker from an earlier boot can't masquerade as a fresh run.
+$ErrorActionPreference = "Continue"
+$marker = "C:\cloudbase-ran.txt"
+$ts = Get-Date -Format "o"
+$body = "CLOUDBASE-INIT-USERDATA-RAN instance=@INSTANCE@ host=$env:COMPUTERNAME at=$ts"
+Set-Content -Path $marker -Value $body -Encoding ASCII
