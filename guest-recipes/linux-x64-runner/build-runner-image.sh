@@ -7,9 +7,12 @@
 #   * cloud-init present + enabled (so Incus's `cloud-init.user-data`
 #     config key is consumed on first boot — this is the JIT-injection
 #     seam the IM1 IncusBackend drives, proven by the IM2 gate),
-#   * the GitHub Actions runner staged under /opt/actions-runner so the
-#     per-job bootstrap launches `run.sh --jitconfig` with no gate-time
-#     GitHub download,
+#   * the GitHub Actions runner staged under /home/runner/actions-runner
+#     (the path GARM's Linux install template treats as the CACHED runner:
+#     `RUN_HOME="/home/$RunnerUsername/actions-runner"` — when that dir
+#     already exists the bootstrap SKIPS the download+extract and uses the
+#     baked-in copy) so the per-job bootstrap launches `run.sh --jitconfig`
+#     with no gate-time GitHub download,
 #   * an unprivileged `runner` user with passwordless sudo (the runner
 #     refuses to run as root),
 #   * the runner's .NET runtime deps (libicu/libssl/libkrb5/zlib) — the
@@ -41,7 +44,14 @@
 #                       absent                   (default: images:debian/12/cloud)
 #   VMH_RUNNER_VERSION  actions runner version   (default: 2.335.1)
 #   VMH_RUNNER_TARBALL  pre-downloaded tarball    (default: download to /tmp)
-#   VMH_RUNNER_CACHE    in-image runner dir       (default: /opt/actions-runner)
+#   VMH_RUNNER_CACHE    in-image runner dir       (default: /home/<user>/actions-runner)
+#
+# IM4 note: the cache path MUST match GARM's Linux install template, which
+# looks for a cached runner at exactly `/home/<RunnerUsername>/actions-runner`
+# (RunnerUsername defaults to `runner`). Staging elsewhere (the old
+# /opt/actions-runner) made the template's `[ ! -d "$RUN_HOME" ]` test true, so
+# GARM re-downloaded + re-extracted the ~200 MB runner into /home/runner every
+# job. Baking it at the expected path lets the bootstrap take the cached branch.
 set -euo pipefail
 
 INCUS=(${VMH_INCUS_CMD:-incus})
@@ -49,8 +59,10 @@ ALIAS="${VMH_RUNNER_ALIAS:-vmh-linux-runner}"
 CLOUD_BASE="${VMH_CLOUD_BASE:-im2-debian-cloud}"
 CLOUD_REMOTE="${VMH_CLOUD_REMOTE:-images:debian/12/cloud}"
 RUNNER_VERSION="${VMH_RUNNER_VERSION:-2.335.1}"
-RUNNER_CACHE="${VMH_RUNNER_CACHE:-/opt/actions-runner}"
 RUNNER_USER="${VMH_RUNNER_USER:-runner}"
+# Default to the GARM-expected cached path /home/<user>/actions-runner so the
+# per-job bootstrap uses the baked runner instead of re-downloading it.
+RUNNER_CACHE="${VMH_RUNNER_CACHE:-/home/${RUNNER_USER}/actions-runner}"
 BLD="im2-bld-runner"
 
 log() { echo "[build-runner-image] $*"; }
@@ -131,6 +143,20 @@ log "staging actions runner ${RUNNER_VERSION} into ${RUNNER_CACHE}"
 log "smoke: Runner.Listener --version"
 "${INCUS[@]}" exec "$BLD" -- sh -c "
   cd '${RUNNER_CACHE}' && DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 ./bin/Runner.Listener --version
+"
+
+# IM4 CRITICAL: the runner SERVICE runs as the unprivileged '${RUNNER_USER}'
+# user, and GARM's cached-runner bootstrap path does NOT chown the runner dir
+# (unlike the download path — it assumes a cached tree is already runner-owned).
+# The smoke test above ran as ROOT and created a root:root '_diag' log dir; a
+# runner-user listener then fails with "Access to the path .../_diag/…' is
+# denied" and NEVER picks up jobs. Remove the root-owned runtime dirs and
+# re-assert runner ownership so the baked tree is 100% writable by the service.
+log "clearing root-owned runtime dirs + re-asserting ${RUNNER_USER} ownership"
+"${INCUS[@]}" exec "$BLD" -- sh -c "
+  set -e
+  rm -rf '${RUNNER_CACHE}/_diag' '${RUNNER_CACHE}/_work'
+  chown -R ${RUNNER_USER}:${RUNNER_USER} '${RUNNER_CACHE}'
 "
 
 # 6. Record the image provenance.
