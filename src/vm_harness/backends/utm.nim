@@ -84,6 +84,9 @@ type
     startTimeoutSec*: int
       ## Hard ceiling for the ``utmctl start`` invocation itself.
       ## Default 60.
+    probeTimeoutSec*: int
+      ## Hard ceiling for ``utmctl list`` during availability probing.
+      ## Default 15.
 
 const
   DefaultGoldenBundleName* = "repro-windows-arm-base"
@@ -110,7 +113,8 @@ proc newUtmBackend*(utmctlCmd: string = "utmctl",
                     sshPort: int = 22,
                     bootTimeoutSec: int = 180,
                     sshReadyTimeoutSec: int = 180,
-                    startTimeoutSec: int = 60): UtmBackend =
+                    startTimeoutSec: int = 60,
+                    probeTimeoutSec: int = 15): UtmBackend =
   ## Construct a UtmBackend. Defaults match the provisioning recipe under
   ## ``guest-recipes/windows-arm-base/``; override the golden name /
   ## credentials when consuming a custom bundle.
@@ -129,7 +133,8 @@ proc newUtmBackend*(utmctlCmd: string = "utmctl",
     sshPort: sshPort,
     bootTimeoutSec: bootTimeoutSec,
     sshReadyTimeoutSec: sshReadyTimeoutSec,
-    startTimeoutSec: startTimeoutSec)
+    startTimeoutSec: startTimeoutSec,
+    probeTimeoutSec: probeTimeoutSec)
 
 # ---------------------------------------------------------------------------
 # Process helper. Same shape as the one used inline by tart.nim — kept
@@ -159,43 +164,26 @@ proc runProcessCapture(cmd: seq[string], cwd: string = "",
   let errStream = if mergeStderr: nil else: p.errorStream
   var stdout = ""
   var stderr = ""
-  var deadline = if timeoutSec > 0: epochTime() + timeoutSec.float else: 0.0
-  while true:
-    var chunk = newString(4096)
-    let n = outStream.readData(addr chunk[0], chunk.len)
-    if n > 0:
-      chunk.setLen(n)
-      stdout.add(chunk)
-    elif n == 0:
-      if errStream != nil:
-        var ec = newString(4096)
-        let en = errStream.readData(addr ec[0], ec.len)
-        if en > 0:
-          ec.setLen(en)
-          stderr.add(ec)
-      if not p.running:
-        if errStream != nil:
-          var ec = newString(4096)
-          let en = errStream.readData(addr ec[0], ec.len)
-          if en > 0:
-            ec.setLen(en)
-            stderr.add(ec)
-        break
-      if timeoutSec > 0 and epochTime() > deadline:
-        p.terminate()
-        return ExecResult(
-          exitCode: -1,
-          stdout: stdout,
-          stderr: stderr & "vm-harness: process timed out after " &
-                  $timeoutSec & "s",
-          elapsedMs: int((epochTime() - start) * 1000))
-      sleep(50)
-  let code = p.waitForExit(timeout = -1)
+  let timeoutMs =
+    if timeoutSec > 0: timeoutSec * 1000
+    else: -1
+  let code = p.waitForExit(timeout = timeoutMs)
+  stdout = outStream.readAll()
+  if errStream != nil:
+    stderr = errStream.readAll()
+  let elapsedMs = int((epochTime() - start) * 1000)
+  if timeoutSec > 0 and elapsedMs >= timeoutMs and code != 0:
+    return ExecResult(
+      exitCode: -1,
+      stdout: stdout,
+      stderr: stderr & "vm-harness: process timed out after " &
+              $timeoutSec & "s",
+      elapsedMs: elapsedMs)
   ExecResult(
     exitCode: code,
     stdout: stdout,
     stderr: stderr,
-    elapsedMs: int((epochTime() - start) * 1000))
+    elapsedMs: elapsedMs)
 
 # ---------------------------------------------------------------------------
 # UTM CLI primitives.
@@ -417,7 +405,8 @@ method probeAvailability*(b: UtmBackend): bool =
   ## we tolerate the noise.
   when defined(macosx):
     try:
-      let rUtm = runProcessCapture(@[b.utmctlCmd, "list"], timeoutSec = 15)
+      let rUtm = runProcessCapture(@[b.utmctlCmd, "list"],
+                                   timeoutSec = b.probeTimeoutSec)
       if rUtm.exitCode != 0:
         return false
       let rSshpass = runProcessCapture(@[b.sshpassCmd, "-V"], timeoutSec = 10)
