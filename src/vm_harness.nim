@@ -29,6 +29,7 @@ import ./vm_harness/backends/hyperv
 import ./vm_harness/backends/wsl
 import ./vm_harness/backends/tart
 import ./vm_harness/backends/utm
+import ./vm_harness/backends/qemu_windows_arm
 import ./vm_harness/backends/lima
 import ./vm_harness/backends/libvirt
 import ./vm_harness/backends/incus
@@ -46,6 +47,7 @@ export hyperv
 export wsl
 export tart
 export utm
+export qemu_windows_arm
 export lima
 export libvirt
 export incus

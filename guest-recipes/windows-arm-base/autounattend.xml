@@ -2,7 +2,7 @@
 <!--
   vm-harness Windows-on-ARM golden image autounattend.xml (M3).
 
-  Drives Windows 11 ARM64 Insider Preview Setup from first boot through
+  Drives Windows 11 Arm64 Setup from first boot through
   to a desktop with OpenSSH server enabled and admin auto-logon. Mirrors
   the Hyper-V harness's Panther override pattern from
     reprobuild/tools/hyperv-m69-system/provision-base-vm.ps1
@@ -101,8 +101,8 @@
             <DiskID>0</DiskID>
             <PartitionID>3</PartitionID>
           </InstallTo>
-          <!-- Pro is the most permissive SKU that ships in all Win11 ARM
-               Insider ISOs; the recipe scripts validate the available
+          <!-- Pro is the most permissive SKU expected in Win11 Arm64
+               ISOs; the recipe scripts validate the available
                image names and fall back to "Windows 11 Home" or
                "Windows 11 ARM" if Pro isn't present in the ISO. -->
           <InstallFrom>
@@ -215,7 +215,7 @@
 
         <!-- 4. Open inbound TCP/22 on the firewall (the OpenSSH
              capability install does this, but we re-assert it
-             defensively in case future Insider builds change the
+             defensively in case future Windows builds change the
              default rule shape). -->
         <SynchronousCommand wcm:action="add">
           <Order>4</Order>

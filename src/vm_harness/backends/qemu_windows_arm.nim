@@ -1,0 +1,508 @@
+## QemuWindowsArmBackend — direct QEMU/HVF Windows-on-ARM cached boot.
+##
+## This backend is intentionally narrower than UTM: it consumes a prebuilt
+## directory containing ``windows.qcow2``, creates a per-run copy under a
+## writable state directory, boots it with ``qemu-system-aarch64`` on macOS
+## HVF, and reaches the guest through OpenSSH over user-mode networking with
+## host port forwarding. It exists as an unblock path when UTM's control plane
+## cannot enumerate or clone registered bundles.
+
+import std/[net, options, os, osproc, streams,
+            strutils, tables, times]
+import ../types
+import ../auto
+
+type
+  QemuWindowsArmBackend* = ref object of VmBackend
+    qemuCmd*: string
+    sshpassCmd*: string
+    sshCmd*: string
+    scpCmd*: string
+    stateDir*: string
+    ephemeralPrefix*: string
+    sshUser*: string
+    sshPassword*: string
+    sshPort*: int
+    bootTimeoutSec*: int
+    sshReadyTimeoutSec*: int
+    probeTimeoutSec*: int
+    baselines*: Table[string, string]
+    baselineCpus*: Table[string, int]
+    baselineMemoryMB*: Table[string, int]
+    qemuPids*: Table[string, int]
+
+const
+  DefaultQemuWindowsArmPrefix* = "repro-vm-qemu-windows-arm"
+  DefaultQemuWindowsArmUser* = "admin"
+  DefaultQemuWindowsArmPassword* = "repro-windows-arm"
+
+proc defaultStateDir*(): string =
+  let override = getEnv("VM_HARNESS_QEMU_WINDOWS_ARM_STATE_DIR")
+  if override.len > 0:
+    return override
+  getHomeDir() / ".local" / "state" / "vm-harness" / "qemu-windows-arm"
+
+proc newQemuWindowsArmBackend*(qemuCmd: string = "qemu-system-aarch64",
+                               sshpassCmd: string = "sshpass",
+                               sshCmd: string = "ssh",
+                               scpCmd: string = "scp",
+                               stateDir: string = "",
+                               ephemeralPrefix: string = DefaultQemuWindowsArmPrefix,
+                               sshUser: string = DefaultQemuWindowsArmUser,
+                               sshPassword: string = DefaultQemuWindowsArmPassword,
+                               sshPort: int = 2223,
+                               bootTimeoutSec: int = 300,
+                               sshReadyTimeoutSec: int = 300,
+                               probeTimeoutSec: int = 10): QemuWindowsArmBackend =
+  result = QemuWindowsArmBackend(
+    id: biQemuWindowsArm,
+    hostPlatform: hpMacosArm,
+    supportedGuests: {goWindows},
+    qemuCmd: qemuCmd,
+    sshpassCmd: sshpassCmd,
+    sshCmd: sshCmd,
+    scpCmd: scpCmd,
+    stateDir: (if stateDir.len > 0: stateDir else: defaultStateDir()),
+    ephemeralPrefix: ephemeralPrefix,
+    sshUser: sshUser,
+    sshPassword: sshPassword,
+    sshPort: sshPort,
+    bootTimeoutSec: bootTimeoutSec,
+    sshReadyTimeoutSec: sshReadyTimeoutSec,
+    probeTimeoutSec: probeTimeoutSec,
+    baselines: initTable[string, string](),
+    baselineCpus: initTable[string, int](),
+    baselineMemoryMB: initTable[string, int](),
+    qemuPids: initTable[string, int]())
+
+proc runProcessCapture(cmd: seq[string], cwd: string = "",
+                      timeoutSec: int = 0,
+                      mergeStderr: bool = true): ExecResult =
+  if cmd.len == 0:
+    raise newException(ValueError, "runProcessCapture: empty cmd")
+  let start = epochTime()
+  let opts = if mergeStderr: {poUsePath, poStdErrToStdOut} else: {poUsePath}
+  var p = startProcess(cmd[0], workingDir = cwd, args = cmd[1 .. ^1],
+                       options = opts)
+  defer: p.close()
+  let outStream = p.outputStream
+  let errStream = if mergeStderr: nil else: p.errorStream
+  var timedOut = false
+  let deadline = if timeoutSec > 0: epochTime() + timeoutSec.float else: 0.0
+  while p.running:
+    if timeoutSec > 0 and epochTime() > deadline:
+      timedOut = true
+      p.terminate()
+      sleep(200)
+      if p.running:
+        try: p.kill()
+        except CatchableError: discard
+      break
+    sleep(50)
+  let code = p.waitForExit(timeout = -1)
+  if timedOut:
+    return ExecResult(exitCode: -1, stdout: "",
+                      stderr: "vm-harness: process timed out after " &
+                              $timeoutSec & "s",
+                      elapsedMs: int((epochTime() - start) * 1000))
+  let stdout = outStream.readAll()
+  let stderr = if errStream != nil: errStream.readAll() else: ""
+  ExecResult(exitCode: code, stdout: stdout, stderr: stderr,
+             elapsedMs: int((epochTime() - start) * 1000))
+
+proc validateWindowsArmVmDir*(dir: string): string =
+  ## Return the absolute baseline directory when it contains windows.qcow2.
+  if dir.len == 0:
+    raise newException(ValueError, "Windows ARM baseline directory is empty")
+  if not dirExists(dir):
+    raise newException(ValueError, "Windows ARM baseline directory not found: " & dir)
+  let disk = dir / "windows.qcow2"
+  if not fileExists(disk):
+    raise newException(ValueError,
+      "Windows ARM baseline directory must contain windows.qcow2: " & dir)
+  absolutePath(dir)
+
+proc ephemeralName*(prefix: string, epochMs: int64, pid: int): string =
+  prefix & "-" & $epochMs & "-" & $pid
+
+proc ephemeralDirFor*(stateDir, name: string): string =
+  stateDir / "instances" / name
+
+proc pickTcpPort*(preferred: int): int =
+  if preferred > 0:
+    try:
+      var s = newSocket()
+      defer: s.close()
+      s.bindAddr(Port(preferred), "127.0.0.1")
+      return preferred
+    except OSError:
+      discard
+  var s = newSocket()
+  defer: s.close()
+  s.bindAddr(Port(0), "127.0.0.1")
+  result = int(s.getLocalAddr()[1])
+
+proc qemuFirmwareArgs(vmDir: string): seq[string] =
+  let explicitCode = getEnv("VMH_QEMU_EFI_CODE")
+  let explicitVars = getEnv("VMH_QEMU_EFI_VARS")
+  let codeCandidates = @[
+    explicitCode,
+    vmDir / "QEMU_EFI.fd",
+    vmDir / "edk2-aarch64-code.fd",
+    vmDir / "AAVMF_CODE.fd",
+    vmDir / "OVMF_CODE.fd"
+  ]
+  let varsCandidates = @[
+    explicitVars,
+    vmDir / "QEMU_VARS.fd",
+    vmDir / "edk2-aarch64-vars.fd",
+    vmDir / "AAVMF_VARS.fd",
+    vmDir / "OVMF_VARS.fd"
+  ]
+  var code = ""
+  var vars = ""
+  for c in codeCandidates:
+    if c.len > 0 and fileExists(c):
+      code = c
+      break
+  for v in varsCandidates:
+    if v.len > 0 and fileExists(v):
+      vars = v
+      break
+  if code.len > 0 and vars.len > 0:
+    return @[
+      "-drive", "if=pflash,format=raw,readonly=on,file=" & code,
+      "-drive", "if=pflash,format=raw,file=" & vars
+    ]
+  if code.len > 0:
+    return @["-bios", code]
+  @[]
+
+proc buildQemuWindowsArmArgs*(vmDir: string, sshPort: int,
+                              cpus: int = 4, memoryMB: int = 8192): seq[string] =
+  let disk = vmDir / "windows.qcow2"
+  let serialLog = vmDir / "serial.log"
+  let monitorSock = vmDir / "qemu-monitor.sock"
+  result = @[
+    "-accel", "hvf",
+    "-machine", "virt,highmem=on",
+    "-cpu", "host",
+    "-m", $memoryMB,
+    "-smp", $cpus,
+    "-drive", "id=disk0,file=" & disk & ",format=qcow2,if=none,cache=writeback,discard=unmap",
+    "-device", "virtio-blk-device,drive=disk0,bootindex=1",
+    "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:" & $sshPort & "-:22",
+    "-device", "virtio-net-device,netdev=net0",
+    "-device", "virtio-rng-device",
+    "-device", "ramfb",
+    "-display", "none",
+    "-serial", "file:" & serialLog,
+    "-monitor", "unix:" & monitorSock & ",server=on,wait=off",
+    "-D", vmDir / "qemu.log",
+    "-rtc", "base=localtime",
+    "-no-reboot"
+  ]
+  result.add(qemuFirmwareArgs(vmDir))
+
+proc windowsCmdQuote*(s: string): string =
+  if s.len == 0:
+    return "\"\""
+  var needsQuote = false
+  for ch in s:
+    if ch in {' ', '\t', '"', '&', '|', '<', '>', '^'}:
+      needsQuote = true
+      break
+  if not needsQuote:
+    return s
+  "\"" & s.replace("\"", "\"\"") & "\""
+
+proc buildWindowsRemoteCommand*(env: Table[string, string],
+                                cmd: seq[string]): string =
+  if cmd.len == 0:
+    raise newException(ValueError, "buildWindowsRemoteCommand: empty cmd")
+  var inner = ""
+  for k, v in env:
+    inner.add("set \"")
+    inner.add(k)
+    inner.add("=")
+    inner.add(v.replace("\"", "\"\""))
+    inner.add("\" & ")
+  for i, a in cmd:
+    if i > 0: inner.add(" ")
+    inner.add(windowsCmdQuote(a))
+  "cmd /c \"" & inner & "\""
+
+proc sshArgsBase*(b: QemuWindowsArmBackend, port: int): seq[string] =
+  @[
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "GlobalKnownHostsFile=/dev/null",
+    "-o", "PreferredAuthentications=password",
+    "-o", "PubkeyAuthentication=no",
+    "-o", "IdentitiesOnly=yes",
+    "-o", "LogLevel=ERROR",
+    "-o", "ConnectTimeout=15",
+    "-o", "ServerAliveInterval=15",
+    "-o", "ServerAliveCountMax=4",
+    "-p", $port,
+    b.sshUser & "@127.0.0.1"
+  ]
+
+proc buildSshpassSshArgs*(b: QemuWindowsArmBackend, pwdFile: string,
+                          port: int, remoteCommand: string): seq[string] =
+  @[b.sshpassCmd, "-f", pwdFile, b.sshCmd] &
+    b.sshArgsBase(port) & @[remoteCommand]
+
+proc writePasswordFile(password: string): string =
+  let path = getTempDir() / "vm-harness-qemu-win-arm-pwd-" &
+             $getCurrentProcessId() & "-" & $int(epochTime() * 1000)
+  writeFile(path, password)
+  when defined(posix):
+    try:
+      setFilePermissions(path, {fpUserRead, fpUserWrite})
+    except CatchableError:
+      discard
+  path
+
+proc cloneOneFile(src, dst: string) =
+  when defined(macosx):
+    let r = runProcessCapture(@["/bin/cp", "-c", src, dst], timeoutSec = 120)
+    if r.exitCode == 0:
+      return
+  copyFile(src, dst)
+
+proc createEphemeralCopy*(baselineDir, destDir: string) =
+  let base = validateWindowsArmVmDir(baselineDir)
+  if dirExists(destDir):
+    removeDir(destDir)
+  createDir(destDir)
+  for kind, path in walkDir(base):
+    if kind != pcFile:
+      continue
+    let name = extractFilename(path)
+    if name == "windows.qcow2" or name.endsWith(".fd") or
+       name.endsWith(".rom") or name.endsWith(".bin"):
+      cloneOneFile(path, destDir / name)
+
+proc waitForSshReady*(b: QemuWindowsArmBackend, port: int,
+                    timeoutSec: int): bool =
+  let deadline = epochTime() + timeoutSec.float
+  let pwdFile = writePasswordFile(b.sshPassword)
+  defer:
+    try: removeFile(pwdFile)
+    except CatchableError: discard
+  while epochTime() < deadline:
+    let cmd = b.buildSshpassSshArgs(pwdFile, port, "cmd /c \"echo ready\"")
+    let r = runProcessCapture(cmd, timeoutSec = 20)
+    if r.exitCode == 0 and "ready" in r.stdout:
+      return true
+    sleep(3000)
+  false
+
+proc startQemuInBackground*(b: QemuWindowsArmBackend, vmDir: string,
+                            sshPort, cpus, memoryMB: int): int =
+  let args = buildQemuWindowsArmArgs(vmDir, sshPort, cpus, memoryMB)
+  var p = startProcess(b.qemuCmd, args = args,
+                       options = {poUsePath, poDaemon},
+                       workingDir = vmDir)
+  result = p.processID
+
+method probeAvailability*(b: QemuWindowsArmBackend): bool =
+  when defined(macosx):
+    try:
+      let q = runProcessCapture(@[b.qemuCmd, "--version"],
+                                timeoutSec = b.probeTimeoutSec)
+      if q.exitCode != 0:
+        return false
+      if "aarch64" notin (q.stdout & q.stderr).toLowerAscii and
+         "qemu emulator" notin (q.stdout & q.stderr).toLowerAscii:
+        return false
+      let s = runProcessCapture(@[b.sshpassCmd, "-V"], timeoutSec = 10)
+      return "sshpass" in (s.stdout & s.stderr).toLowerAscii
+    except CatchableError:
+      return false
+  else:
+    false
+
+method provisionBaseline*(b: QemuWindowsArmBackend, spec: BaselineSpec) =
+  let source = if spec.sourceImage.len > 0: spec.sourceImage else: spec.name
+  let baselineDir =
+    try:
+      validateWindowsArmVmDir(source)
+    except ValueError as e:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "QemuWindowsArmBackend: " & e.msg)
+  createDir(b.stateDir / "instances")
+  b.baselines[spec.name] = baselineDir
+  b.baselineCpus[spec.name] = if spec.cpus > 0: spec.cpus else: 4
+  b.baselineMemoryMB[spec.name] = if spec.memoryMB > 0: spec.memoryMB else: 8192
+  if "ephemeralPrefix" in spec.backendOptions:
+    b.ephemeralPrefix = spec.backendOptions["ephemeralPrefix"]
+
+method revertToBaseline*(b: QemuWindowsArmBackend, baselineName: string): VmHandle =
+  let baselineDir =
+    if baselineName in b.baselines:
+      b.baselines[baselineName]
+    else:
+      try:
+        validateWindowsArmVmDir(baselineName)
+      except ValueError as e:
+        raise newVmHarnessError($b.id, lpRevert,
+          "QemuWindowsArmBackend: " & e.msg)
+  let name = ephemeralName(b.ephemeralPrefix, int64(epochTime() * 1000),
+                           getCurrentProcessId())
+  let vmDir = ephemeralDirFor(b.stateDir, name)
+  createEphemeralCopy(baselineDir, vmDir)
+  let port = pickTcpPort(b.sshPort)
+  let cpus = if baselineName in b.baselineCpus: b.baselineCpus[baselineName] else: 4
+  let memoryMB =
+    if baselineName in b.baselineMemoryMB: b.baselineMemoryMB[baselineName]
+    else: 8192
+  let pid = b.startQemuInBackground(vmDir, port, cpus, memoryMB)
+  b.qemuPids[name] = pid
+  if not b.waitForSshReady(port, b.sshReadyTimeoutSec):
+    let vm = VmHandle(backend: b, name: name, baseline: baselineName,
+                      ipAddress: some("127.0.0.1"), sshPort: port,
+                      sshUser: b.sshUser,
+                      sshAuth: SshAuth(kind: saPassword, password: b.sshPassword),
+                      extra: {"vmDir": vmDir, "qemuPid": $pid}.toTable)
+    b.stopAndCleanup(vm, deleteVm = true)
+    raise (ref GuestBootFailureError)(
+      msg: "QemuWindowsArmBackend: SSH did not become ready on " &
+           "127.0.0.1:" & $port & " within " & $b.sshReadyTimeoutSec & "s",
+      backend: $b.id, phase: lpStartup)
+  VmHandle(
+    backend: b,
+    name: name,
+    baseline: baselineName,
+    ipAddress: some("127.0.0.1"),
+    sshPort: port,
+    sshUser: b.sshUser,
+    sshAuth: SshAuth(kind: saPassword, password: b.sshPassword),
+    extra: {"vmDir": vmDir, "baselineDir": baselineDir, "qemuPid": $pid}.toTable)
+
+method execInGuest*(b: QemuWindowsArmBackend, vm: VmHandle,
+                   env: Table[string, string],
+                   cmd: seq[string],
+                   stdin: string = "",
+                   timeoutSec: int = 600): ExecResult =
+  if cmd.len == 0:
+    raise newException(ValueError, "execInGuest: empty cmd")
+  let pwdFile = writePasswordFile(b.sshPassword)
+  defer:
+    try: removeFile(pwdFile)
+    except CatchableError: discard
+  let remote = buildWindowsRemoteCommand(env, cmd)
+  let sshCmd = b.buildSshpassSshArgs(pwdFile, vm.sshPort, remote)
+  if stdin.len == 0:
+    return runProcessCapture(sshCmd, timeoutSec = timeoutSec)
+  let start = epochTime()
+  var p = startProcess(sshCmd[0], args = sshCmd[1 .. ^1],
+                       options = {poUsePath, poStdErrToStdOut})
+  defer: p.close()
+  p.inputStream.write(stdin)
+  p.inputStream.close()
+  let outStream = p.outputStream
+  var stdout = ""
+  let deadline = if timeoutSec > 0: epochTime() + timeoutSec.float else: 0.0
+  while true:
+    var chunk = newString(4096)
+    let n = outStream.readData(addr chunk[0], chunk.len)
+    if n > 0:
+      chunk.setLen(n)
+      stdout.add(chunk)
+    elif n == 0:
+      if not p.running: break
+      if timeoutSec > 0 and epochTime() > deadline:
+        p.terminate()
+        return ExecResult(exitCode: -1, stdout: stdout, stderr: "",
+                          elapsedMs: int((epochTime() - start) * 1000))
+      sleep(50)
+  ExecResult(exitCode: p.waitForExit(timeout = -1), stdout: stdout,
+             stderr: "", elapsedMs: int((epochTime() - start) * 1000))
+
+proc scpCopy*(b: QemuWindowsArmBackend, port: int, src, dest: string,
+              toGuest: bool, recursive: bool = true,
+              timeoutSec: int = 600) =
+  let pwdFile = writePasswordFile(b.sshPassword)
+  defer:
+    try: removeFile(pwdFile)
+    except CatchableError: discard
+  var args = @[b.sshpassCmd, "-f", pwdFile, b.scpCmd,
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "GlobalKnownHostsFile=/dev/null",
+    "-o", "PreferredAuthentications=password",
+    "-o", "PubkeyAuthentication=no",
+    "-o", "IdentitiesOnly=yes",
+    "-o", "LogLevel=ERROR",
+    "-o", "ConnectTimeout=15",
+    "-P", $port]
+  if recursive:
+    args.add("-r")
+  if toGuest:
+    args.add(src)
+    args.add(b.sshUser & "@127.0.0.1:" & dest)
+  else:
+    args.add(b.sshUser & "@127.0.0.1:" & src)
+    args.add(dest)
+  let r = runProcessCapture(args, timeoutSec = timeoutSec)
+  if r.exitCode != 0:
+    raise newVmHarnessError($b.id, lpCopy,
+      "scp " & (if toGuest: "to" else: "from") &
+      " Windows ARM guest failed (exit " & $r.exitCode & "): " &
+      r.stdout & r.stderr)
+
+method copyToGuest*(b: QemuWindowsArmBackend, vm: VmHandle,
+                   hostPath: string, guestPath: string) =
+  if not fileExists(hostPath) and not dirExists(hostPath):
+    raise newVmHarnessError($b.id, lpCopy,
+      "QemuWindowsArmBackend.copyToGuest: source not found: " & hostPath)
+  b.scpCopy(vm.sshPort, hostPath, guestPath,
+            toGuest = true, recursive = dirExists(hostPath))
+
+method copyFromGuest*(b: QemuWindowsArmBackend, vm: VmHandle,
+                     guestPath: string, hostPath: string) =
+  createDir(parentDir(hostPath))
+  b.scpCopy(vm.sshPort, guestPath, hostPath, toGuest = false, recursive = true)
+
+method installArgvTraceShim*(b: QemuWindowsArmBackend, vm: VmHandle,
+                            shim: ArgvTraceShim) =
+  raise newException(BackendUnavailableError,
+    "installArgvTraceShim is not implemented for qemu-windows-arm yet")
+
+method stopAndCleanup*(b: QemuWindowsArmBackend, vm: VmHandle,
+                      deleteVm: bool = true) =
+  try:
+    let pidText = vm.extra.getOrDefault("qemuPid", "")
+    if pidText.len > 0:
+      discard runProcessCapture(@["/bin/kill", "-TERM", pidText], timeoutSec = 5)
+      sleep(1000)
+      discard runProcessCapture(@["/bin/kill", "-KILL", pidText], timeoutSec = 5)
+    if vm.name in b.qemuPids:
+      b.qemuPids.del(vm.name)
+    if deleteVm:
+      let vmDir = vm.extra.getOrDefault("vmDir", "")
+      if vmDir.len > 0 and dirExists(vmDir):
+        removeDir(vmDir)
+  except CatchableError:
+    discard
+
+registerBackend(biQemuWindowsArm,
+  proc(): VmBackend =
+    newQemuWindowsArmBackend(
+      qemuCmd = getEnv("VMH_QEMU_WINDOWS_ARM_QEMU_CMD", "qemu-system-aarch64"),
+      sshpassCmd = getEnv("VMH_QEMU_WINDOWS_ARM_SSHPASS_CMD", "sshpass"),
+      sshCmd = getEnv("VMH_QEMU_WINDOWS_ARM_SSH_CMD", "ssh"),
+      scpCmd = getEnv("VMH_QEMU_WINDOWS_ARM_SCP_CMD", "scp"),
+      stateDir = getEnv("VM_HARNESS_QEMU_WINDOWS_ARM_STATE_DIR", ""),
+      ephemeralPrefix = getEnv("VMH_QEMU_WINDOWS_ARM_EPHEMERAL_PREFIX",
+                               DefaultQemuWindowsArmPrefix),
+      sshUser = getEnv("VMH_QEMU_WINDOWS_ARM_SSH_USER",
+                       DefaultQemuWindowsArmUser),
+      sshPassword = getEnv("VMH_QEMU_WINDOWS_ARM_SSH_PASSWORD",
+                           DefaultQemuWindowsArmPassword),
+      sshPort = parseInt(getEnv("VMH_QEMU_WINDOWS_ARM_SSH_PORT", "2223")),
+      bootTimeoutSec = parseInt(getEnv("VMH_QEMU_WINDOWS_ARM_BOOT_TIMEOUT", "300")),
+      sshReadyTimeoutSec = parseInt(getEnv("VMH_QEMU_WINDOWS_ARM_SSH_TIMEOUT", "300")),
+      probeTimeoutSec = parseInt(getEnv("VMH_QEMU_WINDOWS_ARM_PROBE_TIMEOUT", "10"))))

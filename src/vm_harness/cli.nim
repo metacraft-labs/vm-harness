@@ -28,6 +28,7 @@ import ./backends/hyperv
 import ./backends/wsl
 import ./backends/tart
 import ./backends/utm
+import ./backends/qemu_windows_arm
 import ./backends/lima
 import ./backends/libvirt
 import ./backends/incus
@@ -166,7 +167,7 @@ Subcommands:
 
 Common flags:
   --backend <auto|noop|hyperv|wsl|tart-macos|tart-linux-arm|
-             utm-windows-arm|libvirt|lima>
+             utm-windows-arm|qemu-windows-arm|libvirt|lima>
   --guest <linux|windows|macos>   Required when --backend auto.
   --baseline <name>               Logical baseline tag (== libvirt domain name).
   --name <vm>                     Alias for --baseline (canonical libvirt M4
@@ -812,7 +813,8 @@ proc cmdBackends(opts: CliOpts): int =
     let host = case id
                of biNoop: "any"
                of biHyperv, biWsl: "windows"
-               of biTartMacos, biTartLinuxArm, biUtmWindowsArm: "macos-arm"
+               of biTartMacos, biTartLinuxArm, biUtmWindowsArm,
+                  biQemuWindowsArm: "macos-arm"
                of biLibvirt, biLima: "linux/macos"
                of biIncus: "linux"
     let guests = case id
@@ -821,7 +823,7 @@ proc cmdBackends(opts: CliOpts): int =
                  of biWsl: "linux"
                  of biTartMacos: "macos"
                  of biTartLinuxArm: "linux"
-                 of biUtmWindowsArm: "windows"
+                 of biUtmWindowsArm, biQemuWindowsArm: "windows"
                  of biLibvirt: "linux,windows"
                  of biLima: "linux"
                  of biIncus: "linux"

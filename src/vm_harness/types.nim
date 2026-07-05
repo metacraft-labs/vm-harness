@@ -40,6 +40,7 @@ type
     biTartMacos = "tart-macos"
     biTartLinuxArm = "tart-linux-arm"
     biUtmWindowsArm = "utm-windows-arm"
+    biQemuWindowsArm = "qemu-windows-arm"
     biLibvirt = "libvirt"
     biLima = "lima"
     biIncus = "incus"

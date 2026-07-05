@@ -9,7 +9,7 @@
 #
 # Inputs (must exist before running):
 #
-#   ./build/win11-arm-insider.iso     — produced by fetch-iso.sh (or
+#   ./build/win11-arm64.iso           — produced by fetch-iso.sh (or
 #                                       VMH_WIN11_ARM_ISO override)
 #   ./build/autounattend.iso          — produced by build-autounattend-iso.sh
 #
@@ -33,7 +33,7 @@ DISK_PATH="${DATA_DIR}/disk.qcow2"
 CONFIG_PATH="${BUNDLE_PATH}/config.plist"
 DISK_SIZE="${VMH_GOLDEN_DISK_SIZE:-64G}"
 
-WIN_ISO="${VMH_WIN11_ARM_ISO:-${BUILD_DIR}/win11-arm-insider.iso}"
+WIN_ISO="${VMH_WIN11_ARM_ISO:-${BUILD_DIR}/win11-arm64.iso}"
 UNATTEND_ISO="${BUILD_DIR}/autounattend.iso"
 
 if [[ ! -f "${WIN_ISO}" ]]; then
