@@ -1,0 +1,84 @@
+#!/bin/bash
+# GARM-style Linux JIT bootstrap, delivered as cloud-init user-data and
+# injected via the IM1 IncusBackend seam (`incus config set <name>
+# cloud-init.user-data ...`). Derived from garm-provider-common's
+# CloudConfigTemplate (the UseJITConfig metadata-pull path in
+# vendor/.../cloudconfig/templates.go): pull cert-bundle + the JIT config
+# from the GARM metadata endpoint (each JWT-authorized), then launch the
+# actions runner with the JIT config via `run.sh --jitconfig`. Runs against
+# the IM2 MOCK metadata endpoint (no live GitHub).
+#
+# Placeholders substituted by the gate driver:
+#   @METADATA_URL@  mock GARM metadata base URL (http://<mock-ip>:<port>)
+#   @TOKEN@         per-instance JWT (Bearer) authorizing the metadata pull
+#   @RUN_HOME@      staged/cached runner dir baked into the image
+#   @RUNNER_USER@   unprivileged user the runner runs as
+set -e
+set -o pipefail
+
+METADATA_URL="@METADATA_URL@"
+BEARER_TOKEN="@TOKEN@"
+RUN_HOME="@RUN_HOME@"
+RUNNER_USER="@RUNNER_USER@"
+LOG=/var/log/im2-bootstrap.log
+
+log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
+
+# GARM sendStatus() analog — a JWT-authorized progress callback to the
+# metadata endpoint (proves the bootstrap talks to GARM under the JWT).
+sendStatus() {
+  curl --retry 5 --retry-delay 2 --retry-connrefused --fail -s \
+    -X POST -H 'Accept: application/json' \
+    -H "Authorization: Bearer ${BEARER_TOKEN}" \
+    -d "{\"status\": \"installing\", \"message\": \"$1\"}" \
+    "${METADATA_URL}/status" >/dev/null 2>&1 || log "status-callback-warn: $1"
+}
+
+log "IM2-BOOTSTRAP-START metadata=${METADATA_URL} run_home=${RUN_HOME}"
+
+# 1. cert-bundle (JWT-authorized) — GARM handshake.
+curl --retry 5 --retry-delay 2 --retry-connrefused --fail -s \
+  -H 'Accept: application/json' -H "Authorization: Bearer ${BEARER_TOKEN}" \
+  "${METADATA_URL}/system/cert-bundle" -o /tmp/cert-bundle.json
+log "CERT-BUNDLE-OK $(wc -c < /tmp/cert-bundle.json) bytes"
+
+sendStatus "downloading JIT credentials"
+
+# 2. JIT config (JWT-authorized) — the combined base64 blob run.sh consumes.
+curl --retry 5 --retry-delay 2 --retry-connrefused --fail -s \
+  -H 'Accept: application/json' -H "Authorization: Bearer ${BEARER_TOKEN}" \
+  "${METADATA_URL}/credentials/jitconfig" -o /tmp/jitconfig.b64
+JIT="$(cat /tmp/jitconfig.b64)"
+if [ -z "$JIT" ]; then log "JIT-EMPTY-FAIL"; exit 1; fi
+log "JITCONFIG-FETCHED $(wc -c < /tmp/jitconfig.b64) bytes"
+
+# 3. service name (JWT-authorized) — GARM parity.
+curl --retry 5 --retry-delay 2 --retry-connrefused --fail -s \
+  -H 'Accept: application/json' -H "Authorization: Bearer ${BEARER_TOKEN}" \
+  "${METADATA_URL}/system/service-name" -o /tmp/service-name || true
+log "SERVICE-NAME=$(cat /tmp/service-name 2>/dev/null)"
+
+sendStatus "launching runner with JIT config"
+
+# 4. Launch the runner with the injected JIT config. `run.sh --jitconfig`
+#    decodes the blob into .runner/.credentials/.credentials_rsaparams,
+#    then execs Runner.Listener which connects to serverUrl (the mock) and
+#    creates a session (an --ephemeral JIT runner listens for one job). The
+#    runner refuses to run as root, so we run it as the unprivileged
+#    RUNNER_USER; cloud-init runs as root, so we drop privileges. Detach it
+#    and capture stdout so the gate can observe the session-create/listen.
+chown -R "${RUNNER_USER}:${RUNNER_USER}" "${RUN_HOME}" 2>/dev/null || true
+cat > /tmp/launch-runner.sh <<EOF
+#!/bin/bash
+cd "${RUN_HOME}"
+export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+export RUNNER_ALLOW_RUNASROOT=0
+exec ./run.sh --jitconfig "${JIT}"
+EOF
+chmod +x /tmp/launch-runner.sh
+log "LAUNCHING-RUNNER run.sh --jitconfig (as ${RUNNER_USER})"
+setsid runuser -u "${RUNNER_USER}" -- /bin/bash /tmp/launch-runner.sh \
+  > /var/log/im2-runner.log 2>&1 < /dev/null &
+echo $! > /var/log/im2-runner.pid
+log "RUNNER-LAUNCHED pid=$(cat /var/log/im2-runner.pid)"
+log "IM2-BOOTSTRAP-DONE"

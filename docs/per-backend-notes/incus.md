@@ -119,6 +119,76 @@ container is considered ready. This is the GARM JIT bootstrap seam — the
 Incus analog of the libvirt config-drive ISO, but simpler (a config key).
 `spec.config` carries any additional raw `incus config set` keys.
 
+## IM2 — Linux runner image + cloud-init JIT injection
+
+The Linux/container analog of the Windows M3 golden. Deliverables:
+
+- **Runner image `vmh-linux-runner`** — built by
+  `guest-recipes/linux-x64-runner/build-runner-image.sh`. A Debian *cloud*
+  container image (`im2-debian-cloud` = `images:debian/12/cloud`, which
+  ships cloud-init) with the GitHub Actions runner staged under
+  `/opt/actions-runner`, an unprivileged `runner` user (passwordless sudo;
+  the runner refuses to run as root), and the .NET runtime deps
+  (`libicu72/libssl3/zlib1g/libkrb5-3` — already in the cloud base, so no
+  apt is needed). Build (idempotent; `im2-bld-runner` throwaway + the
+  `vmh-linux-runner` alias only):
+
+  ```sh
+  export VMH_INCUS_CMD="sudo -n incus"
+  guest-recipes/linux-x64-runner/build-runner-image.sh
+  ```
+
+  The runner tarball is downloaded **on the host** and `incus file push`ed
+  in — see the networking caveat below.
+
+- **Cloud-init JIT injection** — the gate injects a GARM-derived Linux
+  bootstrap (`tests/e2e/linux-jit/user_data.sh.tmpl`, derived from
+  garm-provider-common's `CloudConfigTemplate` UseJITConfig path) as
+  `cloud-init.user-data` through the IM1 seam above. On first boot
+  cloud-init runs it autonomously: it pulls the JIT config from the mock
+  GARM metadata endpoint (JWT-authorized; no-JWT → 401) and launches the
+  runner via `run.sh --jitconfig <blob>`.
+
+- **Mock GARM metadata + Actions endpoint** —
+  `tests/e2e/linux-jit/mock_garm.py`, stdlib-only (HS256 verified with
+  `hmac`, RSA/JIT material pre-generated on the host by `gen_jitconfig.py`
+  and served static) so it runs inside a plain cloud container. It serves
+  the JWT-authorized `/credentials/*` + `/system/*` routes and a minimal
+  Azure-DevOps Actions surface (connectiondata with the DistributedTask
+  location GUIDs, oauth/token, session-create, message long-poll).
+
+- **Gate `t_incus_linux_jit_boot`** (`tests/e2e/`, driver
+  `tests/e2e/linux-jit/run-linux-jit-gate.sh`) — launches a container from
+  `vmh-linux-runner` with the injected bootstrap and asserts: cloud-init
+  ran it autonomously; the JIT pull was JWT-authorized (no-JWT → 401);
+  `run.sh --jitconfig` launched `Runner.Listener`, which connected to the
+  mock, **POSTed a real runner session (SESSION-CREATED)** and reached
+  **"Listening for Jobs"**; then both containers tear down with no residue.
+  Uses only `im2-*` names.
+
+  ```sh
+  export VMH_INCUS_CMD="sudo -n incus"
+  nim r --hints:off tests/e2e/t_incus_linux_jit_boot.nim
+  ```
+
+### Networking caveat (this host)
+
+On `solunska-server` the host firewall (`nixos-fw`, default-drop input)
+does **not** trust `incusbr0`, and Docker's `FORWARD` policy is DROP. So a
+container has **no external egress** and **cannot reach a service bound on
+the host** (and DHCPv4 does not lease — only IPv6 SLAAC comes up). Two
+consequences the IM2 tooling works around:
+
+- **Image build** downloads the runner tarball on the host and pushes it in
+  (no in-guest `curl`/`apt`).
+- **The gate** runs the mock in a **sibling container** (`im2-mock`) — two
+  containers on `incusbr0` talk L2, bypassing the host firewall — and gives
+  both containers a **static IPv4** via injected `cloud-init.network-config`
+  (the runner) / `incus exec ip addr add` (the mock). In a normal host with
+  a trusted bridge + working DHCP the mock could run on the host and DHCP
+  would suffice; the static-IP + sibling-container shape is purely to
+  sidestep this host's firewall.
+
 ## Gotchas
 
 - `incus exec -- true` can fail transiently for a second or two after
