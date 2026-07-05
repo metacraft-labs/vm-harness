@@ -49,6 +49,7 @@ type
     memoryMB*: int
     diskGB*: int
     outputDir*: string
+    ephemeralPrefix*: string
     envPairs*: Table[string, string]
     copyTo*: seq[tuple[host: string, guest: string]]
     copyFrom*: seq[tuple[guest: string, host: string]]
@@ -213,6 +214,7 @@ Common flags:
   --kernel-cmdline <str>          libvirt-only: optional kernel cmdline for the
                                   direct-kernel ephemeral boot.
   --output-dir <path>
+  --ephemeral-prefix <prefix>     Backend-specific prefix for ephemeral VMs.
   --env KEY=VAL                   (repeatable)
   --copy-to host:guest            (repeatable)
   --copy-from guest:host          (repeatable)
@@ -370,6 +372,8 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.uefiNvramTemplate = args[i]; inc i
     of "--output-dir":
       inc i; result.outputDir = args[i]; inc i
+    of "--ephemeral-prefix":
+      inc i; result.ephemeralPrefix = args[i]; inc i
     of "--timeout-sec":
       inc i; result.timeoutSec = parseInt(args[i]); inc i
     of "--env":
@@ -508,6 +512,8 @@ proc applyDefaults(spec: var BaselineSpec, opts: CliOpts) =
   spec.controllerPubKey = opts.controllerPubKey
   spec.networkBridge = opts.networkBridge
   spec.backendOptions = initTable[string, string]()
+  if opts.ephemeralPrefix.len > 0:
+    spec.backendOptions["ephemeralPrefix"] = opts.ephemeralPrefix
 
 proc cmdProvision(opts: CliOpts): int =
   let (id, backend) = resolveBackend(opts)
