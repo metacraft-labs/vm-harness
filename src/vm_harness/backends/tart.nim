@@ -40,6 +40,12 @@ import ../auto
 # Backend type.
 
 type
+  TartSharedDir = object
+    tag: string
+    hostPath: string
+    guestPath: string
+    readOnly: bool
+
   TartBackend* = ref object of VmBackend
     ## Adapter around the ``tart`` CLI.
     tartCmd*: string
@@ -74,6 +80,9 @@ type
       ## VM name → pid of the ``tart run --no-graphics`` background process.
       ## Stored so ``stopAndCleanup`` can issue an extra ``kill`` if the
       ## ``tart stop`` cmdlet leaves the run process hanging.
+    sharedDirs*: seq[TartSharedDir]
+      ## Host directories attached through Tart virtiofs and mounted inside
+      ## the guest after SSH becomes ready.
 
 const
   CirrusLabsMacosGolden* = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
@@ -86,6 +95,22 @@ const
   DefaultCirrusLabsPassword* = "admin"
   DefaultEphemeralPrefixMacos* = "repro-vm-tart-macos"
   DefaultEphemeralPrefixLinuxArm* = "repro-vm-tart-linux"
+
+proc defaultSharedDirs(): seq[TartSharedDir] =
+  let nixStore = getEnv("MCL_RUNNER_SHARED_NIX_STORE")
+  if nixStore.len > 0 and dirExists(nixStore):
+    result.add(TartSharedDir(
+      tag: "mcl-nix-store",
+      hostPath: nixStore,
+      guestPath: "/nix/store",
+      readOnly: true))
+  let reproStore = getEnv("MCL_RUNNER_SHARED_REPRO_STORE")
+  if reproStore.len > 0 and dirExists(reproStore):
+    result.add(TartSharedDir(
+      tag: "mcl-repro-store",
+      hostPath: reproStore,
+      guestPath: "/private/var/lib/reprobuild/shared-store",
+      readOnly: false))
 
 proc newTartBackend*(guestOs: GuestOs = goLinux,
                      goldenImage: string = "",
@@ -124,6 +149,10 @@ proc newTartBackend*(guestOs: GuestOs = goLinux,
                  of goMacos: DefaultEphemeralPrefixMacos
                  of goLinux: DefaultEphemeralPrefixLinuxArm
                  of goWindows: ""  ## unreachable
+  let tartStateDir = getEnv("VM_HARNESS_TART_STATE_DIR")
+  if tartStateDir.len > 0 and getEnv("TART_HOME").len == 0:
+    createDir(tartStateDir)
+    putEnv("TART_HOME", tartStateDir)
   result = TartBackend(
     id: id,
     hostPlatform: hpMacosArm,
@@ -139,7 +168,8 @@ proc newTartBackend*(guestOs: GuestOs = goLinux,
     sshPort: sshPort,
     bootTimeoutSec: bootTimeoutSec,
     sshReadyTimeoutSec: sshReadyTimeoutSec,
-    ephemeralPids: initTable[string, int]())
+    ephemeralPids: initTable[string, int](),
+    sharedDirs: defaultSharedDirs())
 
 # ---------------------------------------------------------------------------
 # Process helper. Same shape as the helper used by hyperv.nim and wsl.nim
@@ -265,8 +295,19 @@ proc runTartVmInBackground*(b: TartBackend, name: string): int =
   ## process is intentionally NOT reaped here — the VM lifecycle ends
   ## when ``stopAndCleanup`` issues ``tart stop`` (which causes the
   ## ``tart run`` process to exit cleanly on its own).
+  var args = @["run", "--no-graphics"]
+  for d in b.sharedDirs:
+    var share = d.hostPath
+    if d.readOnly:
+      share.add(":ro")
+    if d.tag.len > 0:
+      share.add(if d.readOnly: ",tag=" else: ":tag=")
+      share.add(d.tag)
+    args.add("--dir")
+    args.add(share)
+  args.add(name)
   let p = startProcess(b.tartCmd,
-                       args = @["run", "--no-graphics", name],
+                       args = args,
                        options = {poUsePath, poParentStreams, poDaemon})
   result = p.processID
   # Don't close(p): closing detaches our handle, but the process keeps
@@ -319,6 +360,9 @@ proc sshArgsBase(b: TartBackend, host: string): seq[string] =
     "-o", "StrictHostKeyChecking=no",
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "GlobalKnownHostsFile=/dev/null",
+    "-o", "PreferredAuthentications=password",
+    "-o", "PubkeyAuthentication=no",
+    "-o", "IdentitiesOnly=yes",
     "-o", "LogLevel=ERROR",
     "-o", "ConnectTimeout=10",
     "-o", "ServerAliveInterval=15",
@@ -345,6 +389,77 @@ proc waitForSshReady*(b: TartBackend, host: string,
       return true
     sleep(2000)
   false
+
+proc scpCopy*(b: TartBackend, host: string, src: string, dest: string,
+              toGuest: bool, recursive: bool = true,
+              timeoutSec: int = 600)
+
+proc mountMacosSharedDirs*(b: TartBackend, vm: VmHandle) =
+  if b.sharedDirs.len == 0:
+    return
+  if vm.ipAddress.isNone:
+    raise newVmHarnessError($b.id, lpStartup,
+      "TartBackend: cannot mount shared directories without VM IP address")
+  var lines: seq[string] = @[
+    "exec >/tmp/vm-harness-mount-shares.log 2>&1",
+    "set -x",
+    "set -eu",
+    "sleep 3",
+    "if [ ! -e /nix ]; then",
+    "  sudo -n mkdir -p /System/Volumes/Data/nix",
+    "  if [ ! -f /etc/synthetic.conf ] || ! grep -q '^nix[[:space:]]' /etc/synthetic.conf; then",
+    "    printf \"nix\\tSystem/Volumes/Data/nix\\n\" | sudo -n tee -a /etc/synthetic.conf >/dev/null",
+    "  fi",
+    "  sudo -n /System/Library/Filesystems/apfs.fs/Contents/Resources/apfs.util -t || true",
+    "  if [ ! -e /nix ]; then",
+    "    echo \"synthetic /nix was not materialized\" >&2",
+    "    exit 1",
+    "  fi",
+    "fi"
+  ]
+  for d in b.sharedDirs:
+    lines.add("sudo -n mkdir -p " & d.guestPath)
+    lines.add("attempt=1")
+    lines.add("while :; do")
+    lines.add("  if mount | grep -F \" on " & d.guestPath & " \" >/dev/null 2>&1; then")
+    lines.add("    break")
+    lines.add("  fi")
+    lines.add("  if sudo -n mount_virtiofs " & d.tag & " " & d.guestPath & " 2>&1; then")
+    lines.add("    break")
+    lines.add("  fi")
+    lines.add("  if [ \"$attempt\" -ge 5 ]; then")
+    lines.add("    echo \"mount_virtiofs failed for tag " & d.tag & " at " & d.guestPath & "\" >&2")
+    lines.add("    exit 1")
+    lines.add("  fi")
+    lines.add("  attempt=$((attempt + 1))")
+    lines.add("  sleep 1")
+    lines.add("done")
+    lines.add("test -d " & d.guestPath)
+  let hostScript = getTempDir() / "vm-harness-tart-mount-shares-" &
+                   $getCurrentProcessId() & ".sh"
+  let guestScript = "/tmp/vm-harness-mount-shares.sh"
+  writeFile(hostScript, lines.join("\n") & "\n")
+  defer:
+    try: removeFile(hostScript)
+    except CatchableError: discard
+  b.scpCopy(vm.ipAddress.get(), hostScript, guestScript,
+            toGuest = true, recursive = false, timeoutSec = 60)
+  let r = b.execInGuest(vm, initTable[string, string](),
+                        @["/bin/sh", guestScript], timeoutSec = 120)
+  if r.exitCode != 0:
+    let hostLog = getTempDir() / "vm-harness-tart-mount-shares-" &
+                  $getCurrentProcessId() & ".log"
+    var mountLog = ""
+    try:
+      b.scpCopy(vm.ipAddress.get(), "/tmp/vm-harness-mount-shares.log",
+                hostLog, toGuest = false, recursive = false, timeoutSec = 30)
+      mountLog = readFile(hostLog)
+      removeFile(hostLog)
+    except CatchableError:
+      discard
+    raise newVmHarnessError($b.id, lpStartup,
+      "TartBackend: mounting shared directories failed (exit " &
+      $r.exitCode & "): " & r.stdout & r.stderr & mountLog)
 
 # ---------------------------------------------------------------------------
 # VmBackend method overrides.
@@ -381,6 +496,8 @@ method provisionBaseline*(b: TartBackend, spec: BaselineSpec) =
   ##    SIGKILL'd before the ``finally`` block could fire.
   if spec.sourceImage.len > 0:
     b.goldenImage = spec.sourceImage
+  if "ephemeralPrefix" in spec.backendOptions:
+    b.ephemeralPrefix = spec.backendOptions["ephemeralPrefix"]
   if b.goldenImage.len == 0:
     raise newVmHarnessError($b.id, lpProvisioning,
       "TartBackend: no golden image configured (set BaselineSpec." &
@@ -419,7 +536,7 @@ method revertToBaseline*(b: TartBackend, baselineName: string): VmHandle =
       msg: "TartBackend: SSH did not become ready on " & ip &
            " within " & $b.sshReadyTimeoutSec & "s",
       backend: $b.id, phase: lpStartup)
-  result = VmHandle(
+  var handle = VmHandle(
     backend: b,
     name: ephemeral,
     baseline: baselineName,
@@ -428,6 +545,15 @@ method revertToBaseline*(b: TartBackend, baselineName: string): VmHandle =
     sshUser: b.sshUser,
     sshAuth: SshAuth(kind: saPassword, password: b.sshPassword),
     extra: {"tartRunPid": $pid, "goldenImage": b.goldenImage}.toTable)
+  if b.id == biTartMacos:
+    try:
+      b.mountMacosSharedDirs(handle)
+    except CatchableError:
+      b.stopTartVm(ephemeral)
+      b.deleteTartVm(ephemeral)
+      b.ephemeralPids.del(ephemeral)
+      raise
+  result = handle
 
 method execInGuest*(b: TartBackend, vm: VmHandle,
                    env: Table[string, string],
@@ -509,6 +635,9 @@ proc scpCopy*(b: TartBackend, host: string, src: string, dest: string,
     "-o", "StrictHostKeyChecking=no",
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "GlobalKnownHostsFile=/dev/null",
+    "-o", "PreferredAuthentications=password",
+    "-o", "PubkeyAuthentication=no",
+    "-o", "IdentitiesOnly=yes",
     "-o", "LogLevel=ERROR",
     "-o", "ConnectTimeout=10",
     "-P", $b.sshPort]
