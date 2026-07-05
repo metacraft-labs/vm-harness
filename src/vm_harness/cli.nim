@@ -393,6 +393,12 @@ proc resolveBackend(opts: CliOpts): tuple[id: BackendId, backend: VmBackend] =
     let b = newBackend(id, noopFallback = opts.allowNoopFallback)
     (id: id, backend: b)
 
+proc probeBackendIds*(opts: CliOpts): seq[BackendId] =
+  if opts.backend == "" or opts.backend == "auto":
+    registeredBackends()
+  else:
+    @[parseBackendId(opts.backend)]
+
 proc applyDefaults(spec: var BaselineSpec, opts: CliOpts) =
   spec.name = opts.baseline
   spec.sourceImage = opts.sourceImage
@@ -460,7 +466,7 @@ proc cmdRun(opts: CliOpts): int =
 proc cmdProbe(opts: CliOpts): int =
   let host = detectHostPlatform()
   var arr = newJArray()
-  for id in registeredBackends():
+  for id in probeBackendIds(opts):
     var backend: VmBackend
     try:
       backend = newBackend(id, noopFallback = opts.allowNoopFallback)

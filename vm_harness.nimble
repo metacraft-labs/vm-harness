@@ -17,6 +17,7 @@ task test, "Run the vm-harness test suite":
   exec "nim r --hints:off tests/unit/t_output_envelope.nim"
   exec "nim r --hints:off tests/unit/t_auto_selection.nim"
   exec "nim r --hints:off tests/unit/t_guest_scripts.nim"
+  exec "nim r --hints:off tests/unit/t_cli_probe.nim"
   exec "nim r --hints:off tests/unit/t_hyperv_parsers.nim"
   exec "nim r --hints:off tests/unit/t_wsl_parsers.nim"
   exec "nim r --hints:off tests/unit/t_utm_parsers.nim"
