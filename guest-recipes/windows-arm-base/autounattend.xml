@@ -17,12 +17,16 @@
       the install; this approach drives Setup itself.
     - processorArchitecture="arm64" everywhere (vs amd64).
     - The specialize pass copies provision-openssh.ps1 and, when
-      present, openssh\OpenSSH-ARM64.zip from the autounattend ISO to
-      C:\Windows\Temp while the install media is still attached.
+      present, openssh\OpenSSH-ARM64.zip plus the
+      virtio\NetKVM\w11\ARM64 driver directory from the autounattend
+      ISO to C:\Windows\Temp while the install media is still attached.
       FirstLogonCommands runs that local copy to install OpenSSH
       Server via DISM, then falls back to the portable ARM64 zip when
-      the Windows capability is unavailable. Durable diagnostics go to
-      C:\Windows\Temp\vmh-openssh-provision.log. OpenSSH failure writes
+      the Windows capability is unavailable. The helper also installs
+      the ARM64 VirtIO NetKVM driver with pnputil when staged, so direct
+      QEMU virtio-net boots can receive hostfwd SSH. Durable diagnostics
+      go to C:\Windows\Temp\vmh-openssh-provision.log. OpenSSH or staged
+      NetKVM install failure writes
       C:\Windows\Temp\vmh-openssh-provision-failed instead of the
       install-done sentinel.
       The Hyper-V harness deliberately removes OpenSSH because its
@@ -175,6 +179,11 @@
           <Order>2</Order>
           <Path>cmd.exe /c "for %i in (D E F G H) do if exist %i:\openssh\OpenSSH-ARM64.zip copy /Y %i:\openssh\OpenSSH-ARM64.zip C:\Windows\Temp\OpenSSH-ARM64.zip"</Path>
           <Description>Stage OpenSSH ARM64 portable zip locally when present</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>cmd.exe /c "for %i in (D E F G H) do if exist %i:\virtio\NetKVM\w11\ARM64\netkvm.inf xcopy /E /I /Y %i:\virtio C:\Windows\Temp\virtio"</Path>
+          <Description>Stage VirtIO NetKVM ARM64 driver locally when present</Description>
         </RunSynchronousCommand>
       </RunSynchronous>
     </component>

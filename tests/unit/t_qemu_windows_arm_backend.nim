@@ -100,7 +100,7 @@ suite "QemuWindowsArmBackend pure behavior":
 
   test "windows-arm specialize stages OpenSSH provisioning script locally":
     let commands = windowsArmAutounattend().specializeDeploymentCommands()
-    check commands.mapIt(it.elementText("Order")) == @["1", "2"]
+    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3"]
 
     let stage = commands[0].elementText("Path")
     check commands[0].elementText("Description") ==
@@ -113,7 +113,7 @@ suite "QemuWindowsArmBackend pure behavior":
 
   test "windows-arm specialize stages offline OpenSSH ARM64 zip locally when present":
     let commands = windowsArmAutounattend().specializeDeploymentCommands()
-    check commands.mapIt(it.elementText("Order")) == @["1", "2"]
+    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3"]
 
     let stage = commands[1].elementText("Path")
     check commands[1].elementText("Description") ==
@@ -123,6 +123,18 @@ suite "QemuWindowsArmBackend pure behavior":
     check "if exist %i:\\openssh\\OpenSSH-ARM64.zip" in stage
     check "copy /Y %i:\\openssh\\OpenSSH-ARM64.zip C:\\Windows\\Temp\\OpenSSH-ARM64.zip" in
       stage
+
+  test "windows-arm specialize stages offline VirtIO NetKVM ARM64 driver locally when present":
+    let commands = windowsArmAutounattend().specializeDeploymentCommands()
+    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3"]
+
+    let stage = commands[2].elementText("Path")
+    check commands[2].elementText("Description") ==
+      "Stage VirtIO NetKVM ARM64 driver locally when present"
+    check stage.len < 260
+    check "for %i in (D E F G H)" in stage
+    check "if exist %i:\\virtio\\NetKVM\\w11\\ARM64\\netkvm.inf" in stage
+    check "xcopy /E /I /Y %i:\\virtio C:\\Windows\\Temp\\virtio" in stage
 
   test "windows-arm FirstLogon launches staged local OpenSSH provisioning script":
     let commands = windowsArmAutounattend().firstLogonCommands()
@@ -152,9 +164,23 @@ suite "QemuWindowsArmBackend pure behavior":
     check "C:\\Windows\\Temp\\vmh-openssh-provision-failed" in provision
     check "C:\\Windows\\Temp\\repro-install-done" in provision
     check "$portableZip = 'C:\\Windows\\Temp\\OpenSSH-ARM64.zip'" in provision
+    check "$netKvmDir = 'C:\\Windows\\Temp\\virtio\\NetKVM\\w11\\ARM64'" in
+      provision
     check "$installDir = 'C:\\Program Files\\OpenSSH'" in provision
     check "Remove-Item -LiteralPath $fail, $done" in provision
     check "$script:provisionFailed = $false" in provision
+    check "function InstallNetKvmDriver" in provision
+    check "Join-Path $netKvmDir 'netkvm.inf'" in provision
+    check "NetKVM ARM64 driver not staged at" in provision
+    check "skipping virtio-net driver install" in provision
+    check "directory is staged but netkvm.inf is missing" in provision
+    check "pnputil.exe /add-driver $netKvmInf /install" in provision
+    check "END pnputil add NetKVM LASTEXITCODE=" in provision
+    check "staged NetKVM ARM64 driver install failed" in provision
+    check "SUCCESS NetKVM ARM64 driver install" in provision
+    check "try {\n  InstallNetKvmDriver" in provision
+    check provision.find("try {\n  InstallNetKvmDriver") <
+      provision.find("Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'")
     check "CapabilityState 'before'" in provision
     check "CapabilityState 'after'" in provision
     check "' capability state: '" in provision
@@ -210,6 +236,21 @@ suite "QemuWindowsArmBackend pure behavior":
     check "OpenSSH ARM64 zip not embedded; offline fallback will be unavailable" in
       buildScript
 
+  test "windows-arm autounattend ISO builder stages VirtIO NetKVM ARM64 driver when available":
+    let buildScript = readFile(windowsArmRecipeFile("build-autounattend-iso.sh"))
+
+    check "VIRTIO_NETKVM_SRC" in buildScript
+    check "--virtio-netkvm-arm64-dir" in buildScript
+    check "--require-virtio-netkvm-arm64" in buildScript
+    check "VMH_VIRTIO_NETKVM_ARM64_DIR" in buildScript
+    check "./build/virtio/NetKVM/w11/ARM64" in buildScript
+    check "netkvm.inf" in buildScript
+    check "mkdir -p \"${STAGE_DIR}/virtio/NetKVM/w11/ARM64\"" in buildScript
+    check "cp -R \"${VIRTIO_NETKVM_SRC}/.\" \"${STAGE_DIR}/virtio/NetKVM/w11/ARM64/\"" in
+      buildScript
+    check "NetKVM ARM64 driver dir not embedded; virtio networking offline install will be unavailable" in
+      buildScript
+
   test "windows-arm OpenSSH ARM64 fetch helper pins official release checksum":
     let fetchScript = readFile(windowsArmRecipeFile("fetch-openssh-arm64.sh"))
 
@@ -220,6 +261,21 @@ suite "QemuWindowsArmBackend pure behavior":
     check "curl -fL --retry 3" in fetchScript
     check "checksum mismatch" in fetchScript
     check "VMH_OPENSSH_ARM64_ZIP_OUT" in fetchScript
+
+  test "windows-arm VirtIO NetKVM ARM64 fetch helper pins qemus release checksum and validates contents":
+    let fetchScript = readFile(windowsArmRecipeFile("fetch-virtio-netkvm-arm64.sh"))
+
+    check "qemus/virtiso-arm/releases/download/v0.1.285-1/virtio-win-0.1.285.tar.xz" in
+      fetchScript
+    check "c6712f8d5730c09c1212be9fc3baa18b78534f3c8c136cf02b2cca46515ca310" in
+      fetchScript
+    check "MEMBER_ROOT=\"NetKVM/w11/ARM64\"" in fetchScript
+    check "tar -tf \"${tmp}\" > \"${member_list}\"" in fetchScript
+    check "grep -qx \"${MEMBER_ROOT}/netkvm.inf\" \"${member_list}\"" in fetchScript
+    check "tar -xf \"${ARCHIVE_OUT}\" -C \"${extract_tmp}\" \"NetKVM\"" in
+      fetchScript
+    check "VMH_VIRTIO_NETKVM_ARM64_ARCHIVE_OUT" in fetchScript
+    check "VMH_VIRTIO_NETKVM_ARM64_DIR_OUT" in fetchScript
 
   test "windows-arm install-done marker is gated on OpenSSH success":
     let commands = windowsArmAutounattend().firstLogonCommands()
@@ -275,6 +331,8 @@ suite "QemuWindowsArmBackend pure behavior":
     check "user,id=net0,hostfwd=tcp:127.0.0.1:2230-:22" in args
     check "virtio-blk-device,drive=disk0,bootindex=1" in args
     check "virtio-net-device,netdev=net0" in args
+    check args.filterIt("e1000" in it or "e1000e" in it or
+                        "usb-net" in it or "rtl8139" in it).len == 0
     check "file:" & tmp / "serial.log" in args
     check "-bios" in args
     check args[args.find("-bios") + 1] == tmp / "QEMU_EFI.fd"

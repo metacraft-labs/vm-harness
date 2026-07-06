@@ -20,6 +20,9 @@ containing:
   capability payload is unavailable, the recipe falls back to the
   official PowerShell/Win32-OpenSSH ARM64 portable zip staged on the
   autounattend ISO.
+- ARM64 VirtIO NetKVM driver staged and installed offline when present,
+  so direct `qemu-system-aarch64` cached boots can use
+  `virtio-net-device` with user-mode hostfwd SSH.
 - Firewall rule allowing inbound TCP/22.
 - WinRM disabled (we use SSH, not PSRemoting, to mirror the cross-
   backend transport contract).
@@ -78,7 +81,7 @@ set `VMH_WIN11_ARM_ISO` to its path and re-run `./fetch-iso.sh`.
 If you already have a Windows 11 Arm64 ISO on disk, set `VMH_WIN11_ARM_ISO`
 to its path and the rest of the recipe will use it directly.
 
-### 3. Cache the offline OpenSSH fallback
+### 3. Cache the offline OpenSSH fallback and VirtIO network driver
 
 Some Windows 11 Arm64 ISOs only include OpenSSH replacement manifests,
 not the local optional-capability payload. In NAT-only installs,
@@ -98,25 +101,44 @@ git. Do not commit it. To use a pre-fetched copy instead, pass
 `--openssh-arm64-zip PATH` to `build-autounattend-iso.sh` or set
 `VMH_OPENSSH_ARM64_ZIP`.
 
+Direct QEMU/HVF cached boots use a VirtIO network adapter
+(`virtio-net-device`) because Windows ARM does not reliably get an SSH
+banner through QEMU user-mode hostfwd with the emulated e1000/e1000e
+or USB network devices. Cache the slim ARM64 VirtIO driver bundle and
+extract `NetKVM\w11\ARM64`:
+
+```bash
+./fetch-virtio-netkvm-arm64.sh
+# Writes: ./build/virtio-win-0.1.285.tar.xz
+# Extracts: ./build/virtio/NetKVM/w11/ARM64
+# Verifies SHA-256:
+# c6712f8d5730c09c1212be9fc3baa18b78534f3c8c136cf02b2cca46515ca310
+```
+
+The tarball is about 1 MB and lives under `./build/`, which is ignored
+by git. To use a pre-extracted copy instead, pass
+`--virtio-netkvm-arm64-dir PATH` to `build-autounattend-iso.sh` or set
+`VMH_VIRTIO_NETKVM_ARM64_DIR`.
+
 ### 4. Assemble the autounattend ISO
 
 ```bash
-./build-autounattend-iso.sh --require-openssh-arm64-zip
+./build-autounattend-iso.sh --require-openssh-arm64-zip --require-virtio-netkvm-arm64
 # Writes: ./build/autounattend.iso
 ```
 
 This wraps `autounattend.xml`, `repro-sysprep.xml`,
-`provision-openssh.ps1`, and `openssh/OpenSSH-ARM64.zip` as an ISO
-that UTM can attach as a second CD-ROM. Windows Setup looks for
-`autounattend.xml` on every attached removable media at first boot and
-applies it automatically.
+`provision-openssh.ps1`, `openssh/OpenSSH-ARM64.zip`, and
+`virtio/NetKVM/w11/ARM64` as an ISO that UTM can attach as a second
+CD-ROM. Windows Setup looks for `autounattend.xml` on every attached
+removable media at first boot and applies it automatically.
 
 The autounattend.xml mirrors the Hyper-V harness's Panther-override
 pattern from
 [`reprobuild/tools/hyperv-m69-system/provision-base-vm.ps1`][hyperv-script]:
 admin user, locale flags, OOBE skip, a `specialize` hook that stages
-the OpenSSH helper and portable zip locally, and a
-`FirstLogonCommands` hook that runs that local copy.
+the OpenSSH helper, portable zip, and NetKVM ARM64 driver locally, and
+a `FirstLogonCommands` hook that runs that local copy.
 
 [hyperv-script]: ../../../reprobuild/tools/hyperv-m69-system/provision-base-vm.ps1
 
@@ -136,9 +158,12 @@ configured for:
 
 Then opens UTM via `open -a UTM ./build/repro-windows-arm-base.utm`. The
 first boot runs Windows Setup unattended (5–20 minutes); the
-autounattend.xml drives the install through to OpenSSH-server enabled
-and the admin user auto-logging in. The provisioning script first
-tries the Windows `OpenSSH.Server` capability, then falls back to
+autounattend.xml drives the install through to NetKVM installed,
+OpenSSH-server enabled, and the admin user auto-logging in. The
+provisioning script first installs
+`C:\Windows\Temp\virtio\NetKVM\w11\ARM64\netkvm.inf` with
+`pnputil /add-driver /install` when that staged driver is present. It
+then tries the Windows `OpenSSH.Server` capability and falls back to
 `C:\Windows\Temp\OpenSSH-ARM64.zip` when the capability remains
 NotPresent. **You can watch the install through the UTM console window
 or simply wait** — the recipe is complete when the guest reaches the
@@ -151,6 +176,12 @@ If the desktop appears but the marker is absent, inspect:
 C:\Windows\Temp\vmh-openssh-provision.log
 C:\Windows\Temp\vmh-openssh-provision-failed
 ```
+
+If a NetKVM directory was staged but `pnputil` fails, the failure file
+is written and `repro-install-done` is intentionally not created. If no
+NetKVM directory was staged, provisioning logs a skip message and
+continues; use `--require-virtio-netkvm-arm64` when building QEMU-ready
+goldens.
 
 ### 6. SysPrep and capture
 
@@ -234,6 +265,7 @@ Rough budget on Apple M2 Pro / 16 GB RAM:
 |---|---|
 | Download Windows 11 Arm64 ISO | 5–15 min (browser/manual Microsoft download) |
 | Download OpenSSH ARM64 zip | <1 min |
+| Download VirtIO NetKVM ARM64 driver | <1 min |
 | Assemble autounattend ISO | <1 min |
 | Create UTM bundle | <1 min |
 | Windows install (autounattend) | 15–30 min |
@@ -257,18 +289,23 @@ built, every per-gate revert is the harness's ≤20s clone budget.
   used by the step-5 SysPrep invocation.
 - `provision-openssh.ps1` — helper staged to `C:\Windows\Temp\` during
   `specialize`, then run by FirstLogonCommands to install and start
-  OpenSSH Server. It tries the Windows capability first, falls back to
-  `C:\Windows\Temp\OpenSSH-ARM64.zip`, writes diagnostics under
-  `C:\Windows\Temp\`, and gates the install-done marker on `sshd`
-  readiness.
+  OpenSSH Server. It installs staged NetKVM first, tries the Windows
+  capability, falls back to `C:\Windows\Temp\OpenSSH-ARM64.zip`, writes
+  diagnostics under `C:\Windows\Temp\`, and gates the install-done
+  marker on NetKVM and `sshd` readiness.
 - `fetch-openssh-arm64.sh` — downloads and verifies the official
   PowerShell/Win32-OpenSSH `OpenSSH-ARM64.zip` release asset into
   `./build/` for offline guest install.
+- `fetch-virtio-netkvm-arm64.sh` — downloads and verifies the slim
+  qemus/virtiso-arm ARM64 `virtio-win-0.1.285.tar.xz` release asset,
+  then extracts `NetKVM/w11/ARM64` into `./build/virtio/` for offline
+  guest driver install.
 - `fetch-iso.sh` — validates `VMH_WIN11_ARM_ISO` or points at the
   official Microsoft Windows 11 Arm64 ISO page.
 - `build-autounattend-iso.sh` — wraps `autounattend.xml` +
   `repro-sysprep.xml` + `provision-openssh.ps1` and, when available
-  or required, `openssh/OpenSSH-ARM64.zip` as a CD-ROM ISO.
+  or required, `openssh/OpenSSH-ARM64.zip` and
+  `virtio/NetKVM/w11/ARM64` as a CD-ROM ISO.
 - `create-utm-bundle.sh` — assembles the UTM bundle skeleton and opens
   UTM so the install can proceed.
 - `finalize-golden.sh` — strips ISOs, renames to `repro-windows-arm-base`.

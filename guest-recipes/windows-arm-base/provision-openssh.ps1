@@ -4,6 +4,7 @@ $log = 'C:\Windows\Temp\vmh-openssh-provision.log'
 $fail = 'C:\Windows\Temp\vmh-openssh-provision-failed'
 $done = 'C:\Windows\Temp\repro-install-done'
 $portableZip = 'C:\Windows\Temp\OpenSSH-ARM64.zip'
+$netKvmDir = 'C:\Windows\Temp\virtio\NetKVM\w11\ARM64'
 $installDir = 'C:\Program Files\OpenSSH'
 $expandedDir = 'C:\Program Files\OpenSSH-ARM64'
 $script:provisionFailed = $false
@@ -45,6 +46,51 @@ function LogPipeline([string]$Prefix, [scriptblock]$Block) {
       Log ($Prefix + ': ' + $text)
     }
   }
+}
+
+function LogNetKvmDiagnostics([string]$Label) {
+  Log ('BEGIN NetKVM diagnostics ' + $Label)
+  try {
+    LogPipeline ('pnputil enum net ' + $Label) { & pnputil.exe /enum-drivers /class Net }
+  } catch {
+    LogError ('pnputil enum net ' + $Label) $_
+  }
+  try {
+    Get-PnpDevice -Class Net -ErrorAction Stop |
+      Select-Object -Property Status, Class, FriendlyName, InstanceId |
+      Format-List |
+      Out-String |
+      ForEach-Object {
+        if ($_.Trim()) {
+          Log (('pnp net {0}: ' -f $Label) + $_.Trim())
+        }
+      }
+  } catch {
+    LogError ('Get-PnpDevice Net ' + $Label) $_
+  }
+  Log ('END NetKVM diagnostics ' + $Label)
+}
+
+function InstallNetKvmDriver {
+  $netKvmInf = Join-Path $netKvmDir 'netkvm.inf'
+  if (-not (Test-Path -LiteralPath $netKvmDir)) {
+    Log ('NetKVM ARM64 driver not staged at ' + $netKvmDir + '; skipping virtio-net driver install')
+    return
+  }
+  if (-not (Test-Path -LiteralPath $netKvmInf)) {
+    throw ('NetKVM ARM64 driver directory is staged but netkvm.inf is missing at ' + $netKvmInf)
+  }
+
+  Log ('BEGIN NetKVM ARM64 driver install from ' + $netKvmInf)
+  LogNetKvmDiagnostics 'before'
+  LogPipeline 'pnputil add NetKVM' { & pnputil.exe /add-driver $netKvmInf /install }
+  $code = $global:LASTEXITCODE
+  Log ('END pnputil add NetKVM LASTEXITCODE=' + $code)
+  if ($code -ne 0) {
+    throw ('pnputil failed to install NetKVM ARM64 driver from ' + $netKvmInf + ' with exit code ' + $code)
+  }
+  LogNetKvmDiagnostics 'after'
+  Log 'SUCCESS NetKVM ARM64 driver install'
 }
 
 function InstallPortableOpenSsh {
@@ -144,31 +190,41 @@ function ConfigureOpenSsh {
   }
 }
 
-Log 'BEGIN OpenSSH provisioning'
-$capBefore = CapabilityState 'before'
+Log 'BEGIN Windows ARM provisioning'
 
 try {
-  Log 'BEGIN Add-WindowsCapability OpenSSH.Server~~~~0.0.1.0'
-  Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' -ErrorAction Stop |
-    Out-String |
-    ForEach-Object {
-      if ($_.Trim()) {
-        Log ($_.Trim())
-      }
-    }
-  Log ('END Add-WindowsCapability LASTEXITCODE=' + $global:LASTEXITCODE)
+  InstallNetKvmDriver
 } catch {
-  LogError 'Add-WindowsCapability' $_
+  LogError 'NetKVM ARM64 driver install' $_
+  Fail ('staged NetKVM ARM64 driver install failed: ' + $_.Exception.Message)
 }
 
-$capAfter = CapabilityState 'after'
-if (($null -eq $capAfter) -or ($capAfter.State -ne 'Installed')) {
-  Log 'OpenSSH.Server capability is not installed; trying portable OpenSSH ARM64 fallback'
+if (-not $script:provisionFailed) {
+  $capBefore = CapabilityState 'before'
+
   try {
-    InstallPortableOpenSsh
+    Log 'BEGIN Add-WindowsCapability OpenSSH.Server~~~~0.0.1.0'
+    Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' -ErrorAction Stop |
+      Out-String |
+      ForEach-Object {
+        if ($_.Trim()) {
+          Log ($_.Trim())
+        }
+      }
+    Log ('END Add-WindowsCapability LASTEXITCODE=' + $global:LASTEXITCODE)
   } catch {
-    LogError 'portable OpenSSH fallback' $_
-    Fail ('OpenSSH.Server capability is not installed and portable fallback failed: ' + $_.Exception.Message)
+    LogError 'Add-WindowsCapability' $_
+  }
+
+  $capAfter = CapabilityState 'after'
+  if (($null -eq $capAfter) -or ($capAfter.State -ne 'Installed')) {
+    Log 'OpenSSH.Server capability is not installed; trying portable OpenSSH ARM64 fallback'
+    try {
+      InstallPortableOpenSsh
+    } catch {
+      LogError 'portable OpenSSH fallback' $_
+      Fail ('OpenSSH.Server capability is not installed and portable fallback failed: ' + $_.Exception.Message)
+    }
   }
 }
 
