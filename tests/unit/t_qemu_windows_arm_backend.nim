@@ -92,6 +92,7 @@ suite "QemuWindowsArmBackend pure behavior":
     check "C:\\Windows\\Temp\\vmh-openssh-provision-failed" in provision
     check "C:\\Windows\\Temp\\repro-install-done" in provision
     check "Remove-Item -LiteralPath $fail,$done" in provision
+    check "$script:provisionFailed=$false" in provision
     check "CapabilityState 'before'" in provision
     check "CapabilityState 'after'" in provision
     check "' capability state: '" in provision
@@ -101,11 +102,16 @@ suite "QemuWindowsArmBackend pure behavior":
     check "LASTEXITCODE=" in provision
     check "LogError 'Add-WindowsCapability' $_" in provision
     check "OpenSSH.Server capability is not installed" in provision
+    check "Set-Content -LiteralPath $fail -Value $Message" in provision
+    check "$script:provisionFailed=$true" in provision
+    check "if (-not $script:provisionFailed) { try" in provision
     check "Set-Service -Name sshd -StartupType Automatic" in provision
     check "Start-Service -Name sshd" in provision
     check "service sshd status:" in provision
     check "sshd is unavailable" in provision
     check "SUCCESS OpenSSH provisioning" in provision
+    check "exit 0" in provision
+    check "exit 1" notin provision
 
   test "windows-arm install-done marker is gated on OpenSSH success":
     let commands = windowsArmAutounattend().firstLogonCommands()
@@ -117,9 +123,16 @@ suite "QemuWindowsArmBackend pure behavior":
       marker
     check "Get-Service -Name sshd" in marker
     check ".Status -ne 'Running'" in marker
-    check "exit 1" in marker
+    check "{ exit 0 }" in marker
+    check "exit 1" notin marker
     check "Set-Content -LiteralPath 'C:\\Windows\\Temp\\repro-install-done'" in
       marker
+
+  test "windows-arm FirstLogonCommands do not abort OOBE":
+    let commands = windowsArmAutounattend().firstLogonCommands()
+
+    for command in commands:
+      check "exit 1" notin command.elementText("CommandLine")
 
   test "baseline directory validation requires windows.qcow2":
     let tmp = createTempDir("vmh-qemu-win-arm-validate-", "")
