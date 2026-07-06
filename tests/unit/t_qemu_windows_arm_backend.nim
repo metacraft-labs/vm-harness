@@ -100,7 +100,7 @@ suite "QemuWindowsArmBackend pure behavior":
 
   test "windows-arm specialize stages OpenSSH provisioning script locally":
     let commands = windowsArmAutounattend().specializeDeploymentCommands()
-    check commands.mapIt(it.elementText("Order")) == @["1"]
+    check commands.mapIt(it.elementText("Order")) == @["1", "2"]
 
     let stage = commands[0].elementText("Path")
     check commands[0].elementText("Description") ==
@@ -109,6 +109,19 @@ suite "QemuWindowsArmBackend pure behavior":
     check "for %i in (D E F G H)" in stage
     check "if exist %i:\\provision-openssh.ps1" in stage
     check "copy /Y %i:\\provision-openssh.ps1 C:\\Windows\\Temp\\provision-openssh.ps1" in
+      stage
+
+  test "windows-arm specialize stages offline OpenSSH ARM64 zip locally when present":
+    let commands = windowsArmAutounattend().specializeDeploymentCommands()
+    check commands.mapIt(it.elementText("Order")) == @["1", "2"]
+
+    let stage = commands[1].elementText("Path")
+    check commands[1].elementText("Description") ==
+      "Stage OpenSSH ARM64 portable zip locally when present"
+    check stage.len < 260
+    check "for %i in (D E F G H)" in stage
+    check "if exist %i:\\openssh\\OpenSSH-ARM64.zip" in stage
+    check "copy /Y %i:\\openssh\\OpenSSH-ARM64.zip C:\\Windows\\Temp\\OpenSSH-ARM64.zip" in
       stage
 
   test "windows-arm FirstLogon launches staged local OpenSSH provisioning script":
@@ -138,6 +151,8 @@ suite "QemuWindowsArmBackend pure behavior":
     check "C:\\Windows\\Temp\\vmh-openssh-provision.log" in provision
     check "C:\\Windows\\Temp\\vmh-openssh-provision-failed" in provision
     check "C:\\Windows\\Temp\\repro-install-done" in provision
+    check "$portableZip = 'C:\\Windows\\Temp\\OpenSSH-ARM64.zip'" in provision
+    check "$installDir = 'C:\\Program Files\\OpenSSH'" in provision
     check "Remove-Item -LiteralPath $fail, $done" in provision
     check "$script:provisionFailed = $false" in provision
     check "CapabilityState 'before'" in provision
@@ -149,9 +164,22 @@ suite "QemuWindowsArmBackend pure behavior":
     check "LASTEXITCODE=" in provision
     check "LogError 'Add-WindowsCapability' $_" in provision
     check "OpenSSH.Server capability is not installed" in provision
+    check "trying portable OpenSSH ARM64 fallback" in provision
+    check "InstallPortableOpenSsh" in provision
+    check "portable OpenSSH fallback zip not found at" in provision
+    check "Expand-Archive -LiteralPath $portableZip" in provision
+    check "Move-Item -LiteralPath $expandedDir -Destination $installDir" in provision
+    check "install-sshd.ps1" in provision
+    check "bundled install-sshd.ps1 not found; registering sshd service manually" in
+      provision
+    check "New-Service `" in provision
+    check "ssh-keygen -A" in provision
+    check "OpenSSH.Server capability is not installed and portable fallback failed" in
+      provision
     check "Set-Content -LiteralPath $fail -Value $Message" in provision
     check "$script:provisionFailed = $true" in provision
     check "if (-not $script:provisionFailed)" in provision
+    check "function ConfigureOpenSsh" in provision
     check "Set-Service -Name sshd -StartupType Automatic" in provision
     check "Start-Service -Name sshd" in provision
     check "service sshd status:" in provision
@@ -167,6 +195,31 @@ suite "QemuWindowsArmBackend pure behavior":
     check "missing provision-openssh.ps1" in buildScript
     check "cp \"${SCRIPT_DIR}/provision-openssh.ps1\" \"${STAGE_DIR}/provision-openssh.ps1\"" in
       buildScript
+
+  test "windows-arm autounattend ISO builder stages OpenSSH ARM64 zip when available":
+    let buildScript = readFile(windowsArmRecipeFile("build-autounattend-iso.sh"))
+
+    check "OPENSSH_ZIP_SRC" in buildScript
+    check "--openssh-arm64-zip" in buildScript
+    check "--require-openssh-arm64-zip" in buildScript
+    check "VMH_OPENSSH_ARM64_ZIP" in buildScript
+    check "./build/OpenSSH-ARM64.zip" in buildScript
+    check "mkdir -p \"${STAGE_DIR}/openssh\"" in buildScript
+    check "cp \"${OPENSSH_ZIP_SRC}\" \"${STAGE_DIR}/openssh/OpenSSH-ARM64.zip\"" in
+      buildScript
+    check "OpenSSH ARM64 zip not embedded; offline fallback will be unavailable" in
+      buildScript
+
+  test "windows-arm OpenSSH ARM64 fetch helper pins official release checksum":
+    let fetchScript = readFile(windowsArmRecipeFile("fetch-openssh-arm64.sh"))
+
+    check "PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-ARM64.zip" in
+      fetchScript
+    check "698c6aec31c1dd0fb996206e8741f4531a97355686b5431ef347d531b07fcd42" in
+      fetchScript
+    check "curl -fL --retry 3" in fetchScript
+    check "checksum mismatch" in fetchScript
+    check "VMH_OPENSSH_ARM64_ZIP_OUT" in fetchScript
 
   test "windows-arm install-done marker is gated on OpenSSH success":
     let commands = windowsArmAutounattend().firstLogonCommands()

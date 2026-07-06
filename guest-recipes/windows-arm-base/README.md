@@ -16,7 +16,10 @@ containing:
 - OOBE skipped via autounattend.xml (no first-run dialogs, no
   Microsoft account, no telemetry prompts).
 - Windows OpenSSH server (`Server` capability) enabled and set to
-  start automatically on boot.
+  start automatically on boot. If Windows Update or the optional
+  capability payload is unavailable, the recipe falls back to the
+  official PowerShell/Win32-OpenSSH ARM64 portable zip staged on the
+  autounattend ISO.
 - Firewall rule allowing inbound TCP/22.
 - WinRM disabled (we use SSH, not PSRemoting, to mirror the cross-
   backend transport contract).
@@ -75,28 +78,49 @@ set `VMH_WIN11_ARM_ISO` to its path and re-run `./fetch-iso.sh`.
 If you already have a Windows 11 Arm64 ISO on disk, set `VMH_WIN11_ARM_ISO`
 to its path and the rest of the recipe will use it directly.
 
-### 3. Assemble the autounattend ISO
+### 3. Cache the offline OpenSSH fallback
+
+Some Windows 11 Arm64 ISOs only include OpenSSH replacement manifests,
+not the local optional-capability payload. In NAT-only installs,
+`Add-WindowsCapability OpenSSH.Server~~~~0.0.1.0` can also fail before
+Windows Update is usable. Cache the official PowerShell/Win32-OpenSSH
+ARM64 zip so the guest can install `sshd` entirely offline:
 
 ```bash
-./build-autounattend-iso.sh
+./fetch-openssh-arm64.sh
+# Writes: ./build/OpenSSH-ARM64.zip
+# Verifies SHA-256:
+# 698c6aec31c1dd0fb996206e8741f4531a97355686b5431ef347d531b07fcd42
+```
+
+The zip is about 5 MB and lives under `./build/`, which is ignored by
+git. Do not commit it. To use a pre-fetched copy instead, pass
+`--openssh-arm64-zip PATH` to `build-autounattend-iso.sh` or set
+`VMH_OPENSSH_ARM64_ZIP`.
+
+### 4. Assemble the autounattend ISO
+
+```bash
+./build-autounattend-iso.sh --require-openssh-arm64-zip
 # Writes: ./build/autounattend.iso
 ```
 
-This wraps `autounattend.xml` (the SysPrep override file in this
-directory) as an ISO that UTM can attach as a second CD-ROM. Windows
-Setup looks for `autounattend.xml` on every attached removable media
-at first boot and applies it automatically.
+This wraps `autounattend.xml`, `repro-sysprep.xml`,
+`provision-openssh.ps1`, and `openssh/OpenSSH-ARM64.zip` as an ISO
+that UTM can attach as a second CD-ROM. Windows Setup looks for
+`autounattend.xml` on every attached removable media at first boot and
+applies it automatically.
 
 The autounattend.xml mirrors the Hyper-V harness's Panther-override
 pattern from
 [`reprobuild/tools/hyperv-m69-system/provision-base-vm.ps1`][hyperv-script]:
 admin user, locale flags, OOBE skip, a `specialize` hook that stages
-the OpenSSH helper locally, and a `FirstLogonCommands` hook that runs
-that local copy.
+the OpenSSH helper and portable zip locally, and a
+`FirstLogonCommands` hook that runs that local copy.
 
 [hyperv-script]: ../../../reprobuild/tools/hyperv-m69-system/provision-base-vm.ps1
 
-### 4. Create the UTM bundle and run first-boot install
+### 5. Create the UTM bundle and run first-boot install
 
 ```bash
 ./create-utm-bundle.sh
@@ -113,12 +137,22 @@ configured for:
 Then opens UTM via `open -a UTM ./build/repro-windows-arm-base.utm`. The
 first boot runs Windows Setup unattended (5–20 minutes); the
 autounattend.xml drives the install through to OpenSSH-server enabled
-and the admin user auto-logging in. **You can watch the install
-through the UTM console window or simply wait** — the recipe is
-complete when the guest reaches the desktop and the `repro-install-
-done` marker file appears at `C:\Windows\Temp\repro-install-done`.
+and the admin user auto-logging in. The provisioning script first
+tries the Windows `OpenSSH.Server` capability, then falls back to
+`C:\Windows\Temp\OpenSSH-ARM64.zip` when the capability remains
+NotPresent. **You can watch the install through the UTM console window
+or simply wait** — the recipe is complete when the guest reaches the
+desktop and the `repro-install-done` marker file appears at
+`C:\Windows\Temp\repro-install-done`.
 
-### 5. SysPrep and capture
+If the desktop appears but the marker is absent, inspect:
+
+```text
+C:\Windows\Temp\vmh-openssh-provision.log
+C:\Windows\Temp\vmh-openssh-provision-failed
+```
+
+### 6. SysPrep and capture
 
 Once Windows is installed and OpenSSH is up, log in as `admin` (the
 auto-logon should already have you there) and run:
@@ -132,7 +166,7 @@ auto-logon should already have you there) and run:
 to `C:\` by the FirstLogonCommands hook. The guest shuts down once
 SysPrep finishes (10–20 minutes).
 
-### 6. Mark the bundle as the golden
+### 7. Mark the bundle as the golden
 
 ```bash
 # From the host.
@@ -158,7 +192,7 @@ utmctl list   # repro-windows-arm-base should appear with status 'stopped'
 utmctl status repro-windows-arm-base
 ```
 
-### 7. Run a smoke test
+### 8. Run a smoke test
 
 ```bash
 # From the vm-harness repo root.
@@ -199,6 +233,7 @@ Rough budget on Apple M2 Pro / 16 GB RAM:
 | Step | Time |
 |---|---|
 | Download Windows 11 Arm64 ISO | 5–15 min (browser/manual Microsoft download) |
+| Download OpenSSH ARM64 zip | <1 min |
 | Assemble autounattend ISO | <1 min |
 | Create UTM bundle | <1 min |
 | Windows install (autounattend) | 15–30 min |
@@ -222,12 +257,18 @@ built, every per-gate revert is the harness's ≤20s clone budget.
   used by the step-5 SysPrep invocation.
 - `provision-openssh.ps1` — helper staged to `C:\Windows\Temp\` during
   `specialize`, then run by FirstLogonCommands to install and start
-  OpenSSH Server, write diagnostics under `C:\Windows\Temp\`, and gate
-  the install-done marker on `sshd` readiness.
+  OpenSSH Server. It tries the Windows capability first, falls back to
+  `C:\Windows\Temp\OpenSSH-ARM64.zip`, writes diagnostics under
+  `C:\Windows\Temp\`, and gates the install-done marker on `sshd`
+  readiness.
+- `fetch-openssh-arm64.sh` — downloads and verifies the official
+  PowerShell/Win32-OpenSSH `OpenSSH-ARM64.zip` release asset into
+  `./build/` for offline guest install.
 - `fetch-iso.sh` — validates `VMH_WIN11_ARM_ISO` or points at the
   official Microsoft Windows 11 Arm64 ISO page.
 - `build-autounattend-iso.sh` — wraps `autounattend.xml` +
-  `repro-sysprep.xml` + `provision-openssh.ps1` as a CD-ROM ISO.
+  `repro-sysprep.xml` + `provision-openssh.ps1` and, when available
+  or required, `openssh/OpenSSH-ARM64.zip` as a CD-ROM ISO.
 - `create-utm-bundle.sh` — assembles the UTM bundle skeleton and opens
   UTM so the install can proceed.
 - `finalize-golden.sh` — strips ISOs, renames to `repro-windows-arm-base`.

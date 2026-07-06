@@ -3,6 +3,9 @@ $ErrorActionPreference = 'Stop'
 $log = 'C:\Windows\Temp\vmh-openssh-provision.log'
 $fail = 'C:\Windows\Temp\vmh-openssh-provision-failed'
 $done = 'C:\Windows\Temp\repro-install-done'
+$portableZip = 'C:\Windows\Temp\OpenSSH-ARM64.zip'
+$installDir = 'C:\Program Files\OpenSSH'
+$expandedDir = 'C:\Program Files\OpenSSH-ARM64'
 $script:provisionFailed = $false
 
 Remove-Item -LiteralPath $fail, $done -Force -ErrorAction SilentlyContinue
@@ -35,6 +38,112 @@ function CapabilityState([string]$Label) {
   }
 }
 
+function LogPipeline([string]$Prefix, [scriptblock]$Block) {
+  & $Block 2>&1 | ForEach-Object {
+    $text = $_.ToString().Trim()
+    if ($text) {
+      Log ($Prefix + ': ' + $text)
+    }
+  }
+}
+
+function InstallPortableOpenSsh {
+  if (Test-Path -LiteralPath (Join-Path $installDir 'sshd.exe')) {
+    Log ('portable OpenSSH already present at ' + $installDir)
+    return
+  }
+  if (-not (Test-Path -LiteralPath $portableZip)) {
+    throw ('portable OpenSSH fallback zip not found at ' + $portableZip)
+  }
+
+  Log ('BEGIN portable OpenSSH fallback from ' + $portableZip)
+  Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+  Stop-Service -Name ssh-agent -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $expandedDir -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
+
+  Expand-Archive -LiteralPath $portableZip -DestinationPath 'C:\Program Files' -Force
+  if (Test-Path -LiteralPath $expandedDir) {
+    Move-Item -LiteralPath $expandedDir -Destination $installDir -Force
+  }
+
+  if (-not (Test-Path -LiteralPath (Join-Path $installDir 'sshd.exe'))) {
+    $candidate = Get-ChildItem -LiteralPath 'C:\Program Files' -Directory -Filter 'OpenSSH*' -ErrorAction SilentlyContinue |
+      Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'sshd.exe') } |
+      Select-Object -First 1
+    if ($null -ne $candidate) {
+      Move-Item -LiteralPath $candidate.FullName -Destination $installDir -Force
+    }
+  }
+
+  $sshdExe = Join-Path $installDir 'sshd.exe'
+  if (-not (Test-Path -LiteralPath $sshdExe)) {
+    throw ('portable OpenSSH expanded without sshd.exe under ' + $installDir)
+  }
+
+  $installScript = Join-Path $installDir 'install-sshd.ps1'
+  if (Test-Path -LiteralPath $installScript) {
+    Log ('BEGIN bundled install-sshd.ps1 at ' + $installScript)
+    LogPipeline 'install-sshd.ps1' { & $installScript -Confirm:$false }
+    Log ('END bundled install-sshd.ps1 LASTEXITCODE=' + $global:LASTEXITCODE)
+  } else {
+    Log 'bundled install-sshd.ps1 not found; registering sshd service manually'
+    $programDataSsh = Join-Path $env:ProgramData 'ssh'
+    New-Item -ItemType Directory -Path $programDataSsh -Force -ErrorAction Stop | Out-Null
+    $defaultConfig = Join-Path $installDir 'sshd_config_default'
+    $config = Join-Path $programDataSsh 'sshd_config'
+    if ((Test-Path -LiteralPath $defaultConfig) -and (-not (Test-Path -LiteralPath $config))) {
+      Copy-Item -LiteralPath $defaultConfig -Destination $config -Force -ErrorAction Stop
+    }
+    $sshKeygen = Join-Path $installDir 'ssh-keygen.exe'
+    if (Test-Path -LiteralPath $sshKeygen) {
+      LogPipeline 'ssh-keygen -A' { & $sshKeygen -A }
+    }
+    if (-not (Get-Service -Name sshd -ErrorAction SilentlyContinue)) {
+      New-Service `
+        -Name sshd `
+        -DisplayName 'OpenSSH SSH Server' `
+        -BinaryPathName ('"{0}"' -f $sshdExe) `
+        -StartupType Manual `
+        -ErrorAction Stop | Out-Null
+    }
+  }
+
+  Log 'END portable OpenSSH fallback'
+}
+
+function ConfigureOpenSsh {
+  Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
+  Start-Service -Name sshd -ErrorAction Stop
+  New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force -ErrorAction Stop | Out-Null
+  New-ItemProperty `
+    -Path 'HKLM:\SOFTWARE\OpenSSH' `
+    -Name DefaultShell `
+    -Value (Get-Command powershell.exe).Source `
+    -PropertyType String `
+    -Force `
+    -ErrorAction Stop | Out-Null
+
+  if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule `
+      -Name 'OpenSSH-Server-In-TCP' `
+      -DisplayName 'OpenSSH Server (sshd)' `
+      -Enabled True `
+      -Direction Inbound `
+      -Protocol TCP `
+      -Action Allow `
+      -LocalPort 22 `
+      -ErrorAction Stop | Out-Null
+  }
+
+  $svc = Get-Service -Name sshd -ErrorAction Stop
+  $startMode = (Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction Stop).StartMode
+  Log ('service sshd status: ' + $svc.Status + '; startType: ' + $startMode)
+  if ($svc.Status -ne 'Running') {
+    Fail 'sshd service is not running'
+  }
+}
+
 Log 'BEGIN OpenSSH provisioning'
 $capBefore = CapabilityState 'before'
 
@@ -54,40 +163,18 @@ try {
 
 $capAfter = CapabilityState 'after'
 if (($null -eq $capAfter) -or ($capAfter.State -ne 'Installed')) {
-  Fail 'OpenSSH.Server capability is not installed'
+  Log 'OpenSSH.Server capability is not installed; trying portable OpenSSH ARM64 fallback'
+  try {
+    InstallPortableOpenSsh
+  } catch {
+    LogError 'portable OpenSSH fallback' $_
+    Fail ('OpenSSH.Server capability is not installed and portable fallback failed: ' + $_.Exception.Message)
+  }
 }
 
 if (-not $script:provisionFailed) {
   try {
-    Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
-    Start-Service -Name sshd -ErrorAction Stop
-    New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force -ErrorAction Stop | Out-Null
-    New-ItemProperty `
-      -Path 'HKLM:\SOFTWARE\OpenSSH' `
-      -Name DefaultShell `
-      -Value (Get-Command powershell.exe).Source `
-      -PropertyType String `
-      -Force `
-      -ErrorAction Stop | Out-Null
-
-    if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
-      New-NetFirewallRule `
-        -Name 'OpenSSH-Server-In-TCP' `
-        -DisplayName 'OpenSSH Server (sshd)' `
-        -Enabled True `
-        -Direction Inbound `
-        -Protocol TCP `
-        -Action Allow `
-        -LocalPort 22 `
-        -ErrorAction Stop | Out-Null
-    }
-
-    $svc = Get-Service -Name sshd -ErrorAction Stop
-    $startMode = (Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction Stop).StartMode
-    Log ('service sshd status: ' + $svc.Status + '; startType: ' + $startMode)
-    if ($svc.Status -ne 'Running') {
-      Fail 'sshd service is not running'
-    }
+    ConfigureOpenSsh
     if (-not $script:provisionFailed) {
       Log 'SUCCESS OpenSSH provisioning'
     }
