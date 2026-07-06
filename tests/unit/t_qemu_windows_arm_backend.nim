@@ -331,11 +331,19 @@ suite "QemuWindowsArmBackend pure behavior":
     check "user,id=net0,hostfwd=tcp:127.0.0.1:2230-:22" in args
     check "nvme,drive=disk0,serial=winarm0,bootindex=1" in args
     check "virtio-net-pci,netdev=net0,id=net0,mac=52:54:00:c9:18:27" in args
+    let tpmArg = args[args.find("-chardev") + 1]
+    check tpmArg.startsWith("socket,id=chrtpm,path=/tmp/vmh-qwa-tpm-")
+    check tpmArg.endsWith(".sock")
+    check "emulator,id=tpm0,chardev=chrtpm" in args
+    check "tpm-tis-device,tpmdev=tpm0" in args
     check args.filterIt("e1000" in it or "e1000e" in it or
                         "usb-net" in it or "rtl8139" in it or
                         "virtio-net-device" in it or
                         "virtio-blk-device" in it).len == 0
     check "file:" & tmp / "serial.log" in args
+    let monArg = args[args.find("-monitor") + 1]
+    check monArg.startsWith("unix:/tmp/vmh-qwa-mon-")
+    check monArg.endsWith(".sock,server=on,wait=off")
     check "-bios" in args
     check args[args.find("-bios") + 1] == tmp / "QEMU_EFI.fd"
 
@@ -348,19 +356,25 @@ suite "QemuWindowsArmBackend pure behavior":
     writeFile(base / "windows.qcow2", "disk")
     writeFile(base / "AAVMF_VARS.fd", "vars")
     writeFile(base / "notes.txt", "skip")
+    createDir(base / "tpm")
+    writeFile(base / "tpm" / "tpm2-00.permall", "tpm-state")
+    writeFile(base / "tpm" / ".lock", "stale-lock")
 
     let dest = state / "instances" / "vm"
     createEphemeralCopy(base, dest)
     check fileExists(dest / "windows.qcow2")
     check fileExists(dest / "AAVMF_VARS.fd")
+    check fileExists(dest / "tpm" / "tpm2-00.permall")
+    check not fileExists(dest / "tpm" / ".lock")
     check not fileExists(dest / "notes.txt")
     check readFile(base / "windows.qcow2") == "disk"
+    check readFile(dest / "tpm" / "tpm2-00.permall") == "tpm-state"
 
   test "Windows SSH command quoting preserves argv boundaries and env":
-    let env = {"VMH_TEST": "a&b"}.toTable
+    let env = {"VMH_TEST": "a&b'c", "VMH_SECOND": "two words"}.toTable
     let remote = buildWindowsRemoteCommand(env,
       @["powershell", "-NoProfile", "-Command", "Write-Output \"hello world\""])
-    check remote == "cmd /c \"set \"VMH_TEST=a&b\" & powershell -NoProfile -Command \"Write-Output \"\"hello world\"\"\"\""
+    check remote == "$env:VMH_SECOND = 'two words'; $env:VMH_TEST = 'a&b''c'; & 'powershell' '-NoProfile' '-Command' 'Write-Output \"hello world\"'"
 
     let b = newQemuWindowsArmBackend(sshpassCmd = "sshpass-test",
                                      sshCmd = "ssh-test",
@@ -378,15 +392,46 @@ suite "QemuWindowsArmBackend pure behavior":
       defer: removeDir(tmp)
       let silent = tmp / "silent-qemu"
       let sshpass = tmp / "sshpass"
+      let swtpm = tmp / "swtpm"
       writeExecutable(silent, "#!/bin/sh\nsleep 5\n")
       writeExecutable(sshpass, "#!/bin/sh\necho 'sshpass 1.10'\n")
+      writeExecutable(swtpm, "#!/bin/sh\necho 'swtpm 0.10.1'\n")
 
       let b = newQemuWindowsArmBackend(qemuCmd = silent,
+                                       swtpmCmd = swtpm,
                                        sshpassCmd = sshpass,
                                        probeTimeoutSec = 1)
       let started = epochTime()
       check not b.probeAvailability()
       check epochTime() - started < 3.0
+    else:
+      let b = newQemuWindowsArmBackend()
+      check not b.probeAvailability()
+
+  test "probeAvailability requires qemu, swtpm, and sshpass":
+    when defined(macosx):
+      let tmp = createTempDir("vmh-qemu-win-arm-probe-ok-", "")
+      defer: removeDir(tmp)
+      let qemu = tmp / "qemu-system-aarch64"
+      let swtpm = tmp / "swtpm"
+      let badSwtpm = tmp / "bad-swtpm"
+      let sshpass = tmp / "sshpass"
+      writeExecutable(qemu, "#!/bin/sh\necho 'QEMU emulator version 9.2.0 aarch64'\n")
+      writeExecutable(swtpm, "#!/bin/sh\necho 'swtpm 0.10.1'\n")
+      writeExecutable(badSwtpm, "#!/bin/sh\necho 'swtpm unavailable' >&2\nexit 42\n")
+      writeExecutable(sshpass, "#!/bin/sh\necho 'sshpass 1.10'\n")
+
+      let good = newQemuWindowsArmBackend(qemuCmd = qemu,
+                                          swtpmCmd = swtpm,
+                                          sshpassCmd = sshpass,
+                                          probeTimeoutSec = 1)
+      check good.probeAvailability()
+
+      let missingTpm = newQemuWindowsArmBackend(qemuCmd = qemu,
+                                                swtpmCmd = badSwtpm,
+                                                sshpassCmd = sshpass,
+                                                probeTimeoutSec = 1)
+      check not missingTpm.probeAvailability()
     else:
       let b = newQemuWindowsArmBackend()
       check not b.probeAvailability()
