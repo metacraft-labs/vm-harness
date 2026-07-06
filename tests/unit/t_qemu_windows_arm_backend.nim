@@ -329,10 +329,12 @@ suite "QemuWindowsArmBackend pure behavior":
     check "id=disk0,file=" & tmp / "windows.qcow2" &
           ",format=qcow2,if=none,cache=writeback,discard=unmap" in args
     check "user,id=net0,hostfwd=tcp:127.0.0.1:2230-:22" in args
-    check "virtio-blk-device,drive=disk0,bootindex=1" in args
-    check "virtio-net-device,netdev=net0" in args
+    check "nvme,drive=disk0,serial=winarm0,bootindex=1" in args
+    check "virtio-net-pci,netdev=net0,id=net0,mac=52:54:00:c9:18:27" in args
     check args.filterIt("e1000" in it or "e1000e" in it or
-                        "usb-net" in it or "rtl8139" in it).len == 0
+                        "usb-net" in it or "rtl8139" in it or
+                        "virtio-net-device" in it or
+                        "virtio-blk-device" in it).len == 0
     check "file:" & tmp / "serial.log" in args
     check "-bios" in args
     check args[args.find("-bios") + 1] == tmp / "QEMU_EFI.fd"
