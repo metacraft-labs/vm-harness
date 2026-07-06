@@ -344,6 +344,9 @@ suite "QemuWindowsArmBackend pure behavior":
     let monArg = args[args.find("-monitor") + 1]
     check monArg.startsWith("unix:/tmp/vmh-qwa-mon-")
     check monArg.endsWith(".sock,server=on,wait=off")
+    check "-rtc" in args
+    check args[args.find("-rtc") + 1] == "base=utc"
+    check "base=localtime" notin args
     check "-bios" in args
     check args[args.find("-bios") + 1] == tmp / "QEMU_EFI.fd"
 

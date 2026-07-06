@@ -218,7 +218,7 @@ proc buildQemuWindowsArmArgs*(vmDir: string, sshPort: int,
     "-serial", "file:" & serialLog,
     "-monitor", "unix:" & monitorSock & ",server=on,wait=off",
     "-D", vmDir / "qemu.log",
-    "-rtc", "base=localtime",
+    "-rtc", "base=utc",
     "-no-reboot"
   ]
   result.add(qemuFirmwareArgs(vmDir))
