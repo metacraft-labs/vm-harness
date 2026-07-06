@@ -218,10 +218,13 @@ built, every per-gate revert is the harness's ≤20s clone budget.
 - `repro-sysprep.xml` — the shutdown-after-generalize unattend.xml
   that's copied onto `C:\` by autounattend's FirstLogonCommands and
   used by the step-5 SysPrep invocation.
+- `provision-openssh.ps1` — FirstLogonCommands helper that installs and
+  starts OpenSSH Server, writes diagnostics under `C:\Windows\Temp\`,
+  and gates the install-done marker on `sshd` readiness.
 - `fetch-iso.sh` — validates `VMH_WIN11_ARM_ISO` or points at the
   official Microsoft Windows 11 Arm64 ISO page.
 - `build-autounattend-iso.sh` — wraps `autounattend.xml` +
-  `repro-sysprep.xml` as a CD-ROM ISO.
+  `repro-sysprep.xml` + `provision-openssh.ps1` as a CD-ROM ISO.
 - `create-utm-bundle.sh` — assembles the UTM bundle skeleton and opens
   UTM so the install can proceed.
 - `finalize-golden.sh` — strips ISOs, renames to `repro-windows-arm-base`.

@@ -27,10 +27,16 @@ if [[ ! -f "${SCRIPT_DIR}/repro-sysprep.xml" ]]; then
   echo "build-autounattend-iso: missing repro-sysprep.xml in ${SCRIPT_DIR}" >&2
   exit 1
 fi
+if [[ ! -f "${SCRIPT_DIR}/provision-openssh.ps1" ]]; then
+  echo "build-autounattend-iso: missing provision-openssh.ps1 in ${SCRIPT_DIR}" >&2
+  exit 1
+fi
 
+rm -rf "${STAGE_DIR}"
 mkdir -p "${BUILD_DIR}" "${STAGE_DIR}"
 cp "${SCRIPT_DIR}/autounattend.xml" "${STAGE_DIR}/autounattend.xml"
 cp "${SCRIPT_DIR}/repro-sysprep.xml" "${STAGE_DIR}/repro-sysprep.xml"
+cp "${SCRIPT_DIR}/provision-openssh.ps1" "${STAGE_DIR}/provision-openssh.ps1"
 
 rm -f "${ISO_PATH}"
 

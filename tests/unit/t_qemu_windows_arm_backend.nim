@@ -47,6 +47,13 @@ proc windowsArmAutounattend(): XmlNode =
     "guest-recipes" / "windows-arm-base" / "autounattend.xml"
   parseXml(newStringStream(readFile(recipe)))
 
+proc windowsArmRecipeFile(name: string): string =
+  currentSourcePath().parentDir.parentDir.parentDir /
+    "guest-recipes" / "windows-arm-base" / name
+
+proc windowsArmProvisionOpenSshScript(): string =
+  readFile(windowsArmRecipeFile("provision-openssh.ps1"))
+
 proc firstLogonCommands(xml: XmlNode): seq[XmlNode] =
   for settings in xml.elements("settings"):
     if settings.attr("pass") != "oobeSystem":
@@ -81,30 +88,43 @@ suite "QemuWindowsArmBackend pure behavior":
     check commands.mapIt(it.elementText("Order")) == @["1", "2", "3"]
     check commands.mapIt(it.elementText("Path")) == expectedPaths
 
-  test "windows-arm autounattend logs OpenSSH provisioning and failure marker":
+  test "windows-arm autounattend launches staged OpenSSH provisioning script":
     let commands = windowsArmAutounattend().firstLogonCommands()
     check commands.mapIt(it.elementText("Order")) == @["1", "2", "3"]
 
     let provision = commands[0].elementText("CommandLine")
     check commands[0].elementText("Description") ==
       "Provision OpenSSH Server with diagnostics"
+    check provision.len < 1024
+    check "provision-openssh.ps1" in provision
+    check "foreach ($drive in 'D','E','F','G','H','C')" in provision
+    check "Test-Path -LiteralPath $path" in provision
+    check "vmh-openssh-provision-failed" in provision
+    check "Add-WindowsCapability" notin provision
+    check "function LogError" notin provision
+    check "exit 0" in provision
+    check "exit 1" notin provision
+
+  test "windows-arm staged OpenSSH script logs diagnostics and failure marker":
+    let provision = windowsArmProvisionOpenSshScript()
+
     check "C:\\Windows\\Temp\\vmh-openssh-provision.log" in provision
     check "C:\\Windows\\Temp\\vmh-openssh-provision-failed" in provision
     check "C:\\Windows\\Temp\\repro-install-done" in provision
-    check "Remove-Item -LiteralPath $fail,$done" in provision
-    check "$script:provisionFailed=$false" in provision
+    check "Remove-Item -LiteralPath $fail, $done" in provision
+    check "$script:provisionFailed = $false" in provision
     check "CapabilityState 'before'" in provision
     check "CapabilityState 'after'" in provision
     check "' capability state: '" in provision
     check "Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'" in
       provision
-    check "function LogError([string]$Step,[object]$Err)" in provision
+    check "function LogError([string]$Step, [object]$Err)" in provision
     check "LASTEXITCODE=" in provision
     check "LogError 'Add-WindowsCapability' $_" in provision
     check "OpenSSH.Server capability is not installed" in provision
     check "Set-Content -LiteralPath $fail -Value $Message" in provision
-    check "$script:provisionFailed=$true" in provision
-    check "if (-not $script:provisionFailed) { try" in provision
+    check "$script:provisionFailed = $true" in provision
+    check "if (-not $script:provisionFailed)" in provision
     check "Set-Service -Name sshd -StartupType Automatic" in provision
     check "Start-Service -Name sshd" in provision
     check "service sshd status:" in provision
@@ -112,6 +132,14 @@ suite "QemuWindowsArmBackend pure behavior":
     check "SUCCESS OpenSSH provisioning" in provision
     check "exit 0" in provision
     check "exit 1" notin provision
+
+  test "windows-arm autounattend ISO builder stages OpenSSH script":
+    let buildScript = readFile(windowsArmRecipeFile("build-autounattend-iso.sh"))
+
+    check "provision-openssh.ps1" in buildScript
+    check "missing provision-openssh.ps1" in buildScript
+    check "cp \"${SCRIPT_DIR}/provision-openssh.ps1\" \"${STAGE_DIR}/provision-openssh.ps1\"" in
+      buildScript
 
   test "windows-arm install-done marker is gated on OpenSSH success":
     let commands = windowsArmAutounattend().firstLogonCommands()
