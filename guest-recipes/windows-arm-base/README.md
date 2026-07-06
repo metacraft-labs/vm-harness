@@ -90,8 +90,9 @@ at first boot and applies it automatically.
 The autounattend.xml mirrors the Hyper-V harness's Panther-override
 pattern from
 [`reprobuild/tools/hyperv-m69-system/provision-base-vm.ps1`][hyperv-script]:
-admin user, locale flags, OOBE skip, OpenSSH server install via the
-`FirstLogonCommands` hook.
+admin user, locale flags, OOBE skip, a `specialize` hook that stages
+the OpenSSH helper locally, and a `FirstLogonCommands` hook that runs
+that local copy.
 
 [hyperv-script]: ../../../reprobuild/tools/hyperv-m69-system/provision-base-vm.ps1
 
@@ -147,8 +148,8 @@ This:
 - Sets the UTM bundle's auto-snapshot config so first-boot of any
   clone uses the post-SysPrep `oobeSystem` pass (admin user is
   recreated at first boot of every clone, but the OpenSSH service +
-  firewall rule survive — they were configured via the autounattend's
-  `specialize` pass which runs before generalize, so it sticks).
+  firewall rule survive because they were configured before SysPrep
+  generalize).
 
 Verify:
 
@@ -213,14 +214,16 @@ built, every per-gate revert is the harness's ≤20s clone budget.
 
 - `README.md` — this document.
 - `autounattend.xml` — the SysPrep answer file. Single source of truth
-  for admin credentials, locale, OOBE skip flags, FirstLogonCommands
-  (OpenSSH install, firewall rule, repro-install-done marker).
+  for admin credentials, locale, OOBE skip flags, `specialize`
+  staging, and FirstLogonCommands (OpenSSH install, firewall rule,
+  repro-install-done marker).
 - `repro-sysprep.xml` — the shutdown-after-generalize unattend.xml
   that's copied onto `C:\` by autounattend's FirstLogonCommands and
   used by the step-5 SysPrep invocation.
-- `provision-openssh.ps1` — FirstLogonCommands helper that installs and
-  starts OpenSSH Server, writes diagnostics under `C:\Windows\Temp\`,
-  and gates the install-done marker on `sshd` readiness.
+- `provision-openssh.ps1` — helper staged to `C:\Windows\Temp\` during
+  `specialize`, then run by FirstLogonCommands to install and start
+  OpenSSH Server, write diagnostics under `C:\Windows\Temp\`, and gate
+  the install-done marker on `sshd` readiness.
 - `fetch-iso.sh` — validates `VMH_WIN11_ARM_ISO` or points at the
   official Microsoft Windows 11 Arm64 ISO page.
 - `build-autounattend-iso.sh` — wraps `autounattend.xml` +

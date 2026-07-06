@@ -16,8 +16,10 @@
       VHDX. The Panther approach assumes Setup has already extracted
       the install; this approach drives Setup itself.
     - processorArchitecture="arm64" everywhere (vs amd64).
-    - FirstLogonCommands attempts to install OpenSSH Server via DISM
-      and writes durable diagnostics to
+    - The specialize pass copies provision-openssh.ps1 from the
+      autounattend ISO to C:\Windows\Temp while the install media is
+      still attached. FirstLogonCommands runs that local copy to
+      install OpenSSH Server via DISM and writes durable diagnostics to
       C:\Windows\Temp\vmh-openssh-provision.log. Some Windows ARM ISO
       builds do not carry a usable local capability source, so OpenSSH
       failure writes C:\Windows\Temp\vmh-openssh-provision-failed
@@ -158,6 +160,18 @@
       <ComputerName>*</ComputerName>
       <TimeZone>UTC</TimeZone>
     </component>
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <!-- Stage the OpenSSH helper while the autounattend ISO is
+             still mounted. FirstLogon runs after the install ISO has
+             been removed, so it must not depend on removable media. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd.exe /c "for %i in (D E F G H) do if exist %i:\provision-openssh.ps1 copy /Y %i:\provision-openssh.ps1 C:\Windows\Temp\provision-openssh.ps1"</Path>
+          <Description>Stage OpenSSH provisioning script locally</Description>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
   </settings>
 
   <settings pass="oobeSystem">
@@ -213,7 +227,7 @@
              desktop without sshd does not look provisioned. -->
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <CommandLine><![CDATA[powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$script=$null; foreach ($drive in 'D','E','F','G','H','C') { $path=($drive + ':\provision-openssh.ps1'); if (Test-Path -LiteralPath $path) { $script=$path; break } }; if ($script) { & $script } else { Set-Content -LiteralPath 'C:\Windows\Temp\vmh-openssh-provision-failed' -Value 'provision-openssh.ps1 not found' -Encoding UTF8 -Force }; exit 0"]]></CommandLine>
+          <CommandLine><![CDATA[powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$p='C:\Windows\Temp\provision-openssh.ps1'; if (Test-Path -LiteralPath $p) { & $p } else { Set-Content -LiteralPath 'C:\Windows\Temp\vmh-openssh-provision-failed' -Value 'provision-openssh.ps1 not found' -Encoding UTF8 -Force }; exit 0"]]></CommandLine>
           <Description>Provision OpenSSH Server with diagnostics</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>

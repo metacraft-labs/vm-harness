@@ -64,6 +64,16 @@ proc firstLogonCommands(xml: XmlNode): seq[XmlNode] =
         if firstLogon != nil:
           return firstLogon.elements("SynchronousCommand")
 
+proc specializeDeploymentCommands(xml: XmlNode): seq[XmlNode] =
+  for settings in xml.elements("settings"):
+    if settings.attr("pass") != "specialize":
+      continue
+    for component in settings.elements("component"):
+      if component.attr("name") == "Microsoft-Windows-Deployment":
+        let runSync = component.childElement("RunSynchronous")
+        if runSync != nil:
+          return runSync.elements("RunSynchronousCommand")
+
 suite "QemuWindowsArmBackend pure behavior":
   test "windows-arm autounattend has exact LabConfig bypasses in windowsPE":
     let xml = windowsArmAutounattend()
@@ -88,7 +98,20 @@ suite "QemuWindowsArmBackend pure behavior":
     check commands.mapIt(it.elementText("Order")) == @["1", "2", "3"]
     check commands.mapIt(it.elementText("Path")) == expectedPaths
 
-  test "windows-arm autounattend launches staged OpenSSH provisioning script":
+  test "windows-arm specialize stages OpenSSH provisioning script locally":
+    let commands = windowsArmAutounattend().specializeDeploymentCommands()
+    check commands.mapIt(it.elementText("Order")) == @["1"]
+
+    let stage = commands[0].elementText("Path")
+    check commands[0].elementText("Description") ==
+      "Stage OpenSSH provisioning script locally"
+    check stage.len < 260
+    check "for %i in (D E F G H)" in stage
+    check "if exist %i:\\provision-openssh.ps1" in stage
+    check "copy /Y %i:\\provision-openssh.ps1 C:\\Windows\\Temp\\provision-openssh.ps1" in
+      stage
+
+  test "windows-arm FirstLogon launches staged local OpenSSH provisioning script":
     let commands = windowsArmAutounattend().firstLogonCommands()
     check commands.mapIt(it.elementText("Order")) == @["1", "2", "3"]
 
@@ -96,10 +119,14 @@ suite "QemuWindowsArmBackend pure behavior":
     check commands[0].elementText("Description") ==
       "Provision OpenSSH Server with diagnostics"
     check provision.len < 1024
-    check "provision-openssh.ps1" in provision
-    check "foreach ($drive in 'D','E','F','G','H','C')" in provision
-    check "Test-Path -LiteralPath $path" in provision
+    check "$p='C:\\Windows\\Temp\\provision-openssh.ps1'" in provision
+    check "Test-Path -LiteralPath $p" in provision
+    check "& $p" in provision
+    check "foreach ($drive" notin provision
+    check ":\\provision-openssh.ps1" notin provision.replace(
+      "C:\\Windows\\Temp\\provision-openssh.ps1", "")
     check "vmh-openssh-provision-failed" in provision
+    check "provision-openssh.ps1 not found" in provision
     check "Add-WindowsCapability" notin provision
     check "function LogError" notin provision
     check "exit 0" in provision
