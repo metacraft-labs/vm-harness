@@ -65,6 +65,30 @@ RUNNER_USER="${VMH_RUNNER_USER:-runner}"
 RUNNER_CACHE="${VMH_RUNNER_CACHE:-/home/${RUNNER_USER}/actions-runner}"
 BLD="im2-bld-runner"
 
+# HR1 (nested Docker): when VMH_RUNNER_DOCKER is set (=1), bake docker/moby +
+# fuse-overlayfs into the image so a per-job container launched with the
+# provider's `incusSecurityNesting=true` (security.nesting + the
+# mknod/setxattr syscall intercepts) can run an UNPRIVILEGED in-guest Docker
+# daemon (`docker run` / `docker build`). Off by default ⇒ the live
+# `vmh-linux-runner` image is byte-unchanged. Point VMH_RUNNER_ALIAS at a SIDE
+# alias (eg vmh-linux-runner-docker) so the live image is never overwritten.
+DOCKER="${VMH_RUNNER_DOCKER:-}"
+DOCKER_VERSION="${VMH_DOCKER_VERSION:-27.5.1}"
+# Pre-downloaded docker static bundle on the HOST (containers have egress only
+# once a static IP + gateway are configured — see the egress step below); the
+# static bundle is STREAMED in (cat|incus exec tar) rather than `incus file
+# push`ed, working around blocker A (incus file push corrupts large tarballs).
+DOCKER_TARBALL="${VMH_DOCKER_TARBALL:-}"
+DOCKER_STORAGE_DRIVER="${VMH_DOCKER_STORAGE_DRIVER:-fuse-overlayfs}"
+# incusbr0 DHCP does not lease on this host, so give the build container a
+# STATIC egress IP for the docker apt step. Auto-detected from the bridge
+# (gateway = the incusbr0 host address; build IP = same /24, host .249) but
+# env-overridable.
+BUILD_EGRESS_IP="${VMH_BUILD_EGRESS_IP:-}"
+BUILD_EGRESS_GW="${VMH_BUILD_EGRESS_GW:-}"
+BUILD_EGRESS_DNS="${VMH_BUILD_EGRESS_DNS:-1.1.1.1}"
+INCUS_BRIDGE="${VMH_CLOUD_BRIDGE:-incusbr0}"
+
 log() { echo "[build-runner-image] $*"; }
 
 cleanup() { "${INCUS[@]}" delete --force "$BLD" >/dev/null 2>&1 || true; }
@@ -159,10 +183,156 @@ log "clearing root-owned runtime dirs + re-asserting ${RUNNER_USER} ownership"
   chown -R ${RUNNER_USER}:${RUNNER_USER} '${RUNNER_CACHE}'
 "
 
+# 5b. HR1 — bake docker/moby + fuse-overlayfs for NESTED Docker (opt-in). The
+#     per-job container must be launched with the provider's
+#     `incusSecurityNesting=true` (security.nesting + mknod/setxattr intercepts)
+#     for the daemon to actually run; the storage driver is fuse-overlayfs so an
+#     UNPRIVILEGED nested container (which cannot use the kernel overlay2 driver)
+#     can still build layered images. `docker run` / `docker build` then work
+#     inside the ephemeral runner (proven by the t_incus_nested_docker gate).
+if [ -n "$DOCKER" ]; then
+  log "HR1: baking docker ${DOCKER_VERSION} + fuse-overlayfs (nested Docker)"
+
+  # (a) Give the build container egress (incusbr0 DHCP does not lease here) so
+  #     the apt step for the docker RUNTIME deps (iptables/uidmap/dbus/
+  #     fuse-overlayfs) works. Gateway defaults to the incusbr0 host address;
+  #     the build IP defaults to host .249 of that /24. Both env-overridable.
+  gw="$BUILD_EGRESS_GW"
+  if [ -z "$gw" ]; then
+    gw="$("${INCUS[@]}" network get "$INCUS_BRIDGE" ipv4.address 2>/dev/null | cut -d/ -f1)"
+  fi
+  bip="$BUILD_EGRESS_IP"
+  if [ -z "$bip" ] && [ -n "$gw" ]; then
+    bip="$(printf '%s' "$gw" | awk -F. '{printf "%s.%s.%s.249", $1,$2,$3}')"
+  fi
+  if [ -z "$gw" ] || [ -z "$bip" ]; then
+    echo "[build-runner-image] HR1: could not derive build egress IP/gateway (set VMH_BUILD_EGRESS_IP / VMH_BUILD_EGRESS_GW)" >&2
+    exit 1
+  fi
+  log "HR1: build-container egress ${bip} via ${gw} (dns ${BUILD_EGRESS_DNS})"
+  "${INCUS[@]}" exec "$BLD" -- sh -c "
+    set -e
+    ip addr add ${bip}/24 dev eth0 2>/dev/null || true
+    ip link set eth0 up
+    ip route replace default via ${gw}
+    rm -f /etc/resolv.conf
+    printf 'nameserver %s\n' '${BUILD_EGRESS_DNS}' > /etc/resolv.conf
+  "
+
+  # (b) Runtime deps from Debian (small): iptables (docker bridge NAT), uidmap
+  #     (rootless helpers), dbus, and fuse-overlayfs (the unprivileged storage
+  #     driver + its /dev/fuse mount helper).
+  log "HR1: apt-get install docker runtime deps"
+  "${INCUS[@]}" exec "$BLD" -- sh -c "
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq iptables uidmap dbus fuse-overlayfs
+  "
+
+  # (c) Docker static binaries. STREAMED in (cat|incus exec tar), NOT `incus
+  #     file push`ed — the latter corrupts large locally-built tarballs on this
+  #     host (blocker A). Downloaded on the HOST if not pre-supplied.
+  if [ -z "$DOCKER_TARBALL" ] || [ ! -f "$DOCKER_TARBALL" ]; then
+    DOCKER_TARBALL="/tmp/docker-${DOCKER_VERSION}.tgz"
+    if [ ! -f "$DOCKER_TARBALL" ]; then
+      durl="https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz"
+      log "HR1: downloading docker static bundle on the host: $durl"
+      curl --retry 5 --retry-delay 3 --retry-connrefused -fL -o "$DOCKER_TARBALL" "$durl"
+    fi
+  fi
+  log "HR1: streaming docker static bundle into /usr/local/bin (blocker-A workaround)"
+  cat "$DOCKER_TARBALL" | "${INCUS[@]}" exec "$BLD" -- sh -c "
+    set -e
+    cat > /tmp/docker.tgz
+    tar xzf /tmp/docker.tgz -C /usr/local/bin --strip-components=1
+    rm -f /tmp/docker.tgz
+    test -x /usr/local/bin/dockerd && test -x /usr/local/bin/docker
+  "
+
+  # (d) daemon.json (fuse-overlayfs driver) + a docker group the runner joins +
+  #     a systemd service/socket so dockerd is up on first boot of a per-job
+  #     container. The socket is group-owned by `docker` so the runner user can
+  #     reach it without sudo (GitHub Actions' docker steps expect this).
+  log "HR1: writing daemon.json (${DOCKER_STORAGE_DRIVER}) + docker.service/socket + docker group"
+  "${INCUS[@]}" exec "$BLD" -- sh -c "
+    set -e
+    getent group docker >/dev/null 2>&1 || groupadd docker
+    usermod -aG docker '${RUNNER_USER}'
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json <<EOF
+{
+  \"storage-driver\": \"${DOCKER_STORAGE_DRIVER}\",
+  \"iptables\": true
+}
+EOF
+    cat > /etc/systemd/system/docker.socket <<EOF
+[Unit]
+Description=Docker Socket for the API
+[Socket]
+ListenStream=/run/docker.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=docker
+[Install]
+WantedBy=sockets.target
+EOF
+    cat > /etc/systemd/system/docker.service <<EOF
+[Unit]
+Description=Docker Application Container Engine (static, HR1 nested)
+After=network-online.target docker.socket
+Wants=network-online.target
+Requires=docker.socket
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/dockerd --containerd=/run/containerd/containerd.sock
+ExecReload=/bin/kill -s HUP \\\$MAINPID
+LimitNOFILE=1048576
+Delegate=yes
+KillMode=process
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+    cat > /etc/systemd/system/containerd.service <<EOF
+[Unit]
+Description=containerd container runtime (static, HR1 nested)
+After=network.target
+[Service]
+ExecStart=/usr/local/bin/containerd
+Restart=always
+Delegate=yes
+KillMode=process
+LimitNOFILE=1048576
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl enable containerd.service docker.socket docker.service >/dev/null 2>&1 || true
+  "
+
+  # (e) Smoke: dockerd starts + selects the expected storage driver (offline —
+  #     no image pull here; the gate does the online docker run/build).
+  log "HR1: smoke — dockerd starts with ${DOCKER_STORAGE_DRIVER}"
+  "${INCUS[@]}" exec "$BLD" -- sh -c "
+    set -e
+    /usr/local/bin/containerd >/var/log/containerd.log 2>&1 &
+    /usr/local/bin/dockerd >/var/log/dockerd.log 2>&1 &
+    for i in \$(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+    sd=\$(docker info 2>/dev/null | sed -n 's/^ Storage Driver: //p')
+    echo \"[build-runner-image] HR1 dockerd storage driver: \$sd\"
+    test \"\$sd\" = \"${DOCKER_STORAGE_DRIVER}\"
+    kill %1 %2 2>/dev/null || true
+  "
+
+  # (f) Undo the build-time egress IP so the published image carries no stray
+  #     static address (the provider injects the real per-job IP via cloud-init).
+  "${INCUS[@]}" exec "$BLD" -- sh -c "ip addr del ${bip}/24 dev eth0 2>/dev/null || true" || true
+fi
+
 # 6. Record the image provenance.
 "${INCUS[@]}" exec "$BLD" -- sh -c "
-  printf 'vmh-linux-runner: %s (cloud) + actions-runner %s + cloud-init\n' \
-    '${CLOUD_BASE}' '${RUNNER_VERSION}' > /etc/vmh-linux-runner-release
+  printf 'vmh-linux-runner: %s (cloud) + actions-runner %s + cloud-init%s\n' \
+    '${CLOUD_BASE}' '${RUNNER_VERSION}' \"${DOCKER:+ + docker ${DOCKER_VERSION} (${DOCKER_STORAGE_DRIVER}) [HR1 nested]}\" > /etc/vmh-linux-runner-release
 "
 
 # 7. Stop + publish as the runner image alias (replace any prior copy).
