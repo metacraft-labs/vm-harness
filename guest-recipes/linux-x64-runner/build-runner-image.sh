@@ -23,8 +23,9 @@
 # the script copies `images:debian/12/cloud` into it (needs host network —
 # available; the CONTAINERS have no external network on this host because
 # nixos-fw does not trust incusbr0, which is why the runner tarball is
-# downloaded on the HOST and `incus file push`ed in rather than curled
-# in-guest).
+# downloaded on the HOST and STREAMED in (cat|incus exec tar) rather than
+# curled in-guest. It is streamed, NOT `incus file push`ed, because on this
+# host `incus file push` corrupts large tarballs (blocker A).
 #
 # Reproducible + idempotent: safe to re-run. Uses ONLY the `im2-bld-runner`
 # throwaway container name + the `vmh-linux-runner` alias — never touches
@@ -151,12 +152,17 @@ log "creating '${RUNNER_USER}' user with passwordless sudo"
   chmod 440 /etc/sudoers.d/90-${RUNNER_USER}
 "
 
-# 5. Stage the actions-runner into the image cache (push from host; extract).
-log "staging actions runner ${RUNNER_VERSION} into ${RUNNER_CACHE}"
+# 5. Stage the actions-runner into the image cache. The tarball is STREAMED in
+#    (cat|incus exec tar) rather than `incus file push`ed: on this host
+#    `incus file push` corrupts large (~200 MB) locally-built tarballs (blocker
+#    A — the same failure mode the HR1 docker bundle hits below), so the runner
+#    tree would extract truncated/garbled and the apphost would fail to load.
+#    Streaming through `incus exec` is byte-exact.
+log "staging actions runner ${RUNNER_VERSION} into ${RUNNER_CACHE} (streamed; blocker-A workaround)"
 "${INCUS[@]}" exec "$BLD" -- sh -c "rm -rf '${RUNNER_CACHE}'; mkdir -p '${RUNNER_CACHE}'"
-"${INCUS[@]}" file push "$TARBALL" "$BLD/tmp/runner.tar.gz"
-"${INCUS[@]}" exec "$BLD" -- sh -c "
+cat "$TARBALL" | "${INCUS[@]}" exec "$BLD" -- sh -c "
   set -e
+  cat > /tmp/runner.tar.gz
   tar xzf /tmp/runner.tar.gz -C '${RUNNER_CACHE}'
   rm -f /tmp/runner.tar.gz
   chown -R ${RUNNER_USER}:${RUNNER_USER} '${RUNNER_CACHE}'
