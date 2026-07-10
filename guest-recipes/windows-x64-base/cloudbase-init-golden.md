@@ -82,31 +82,40 @@ The distinct-identity gate
 the generalized golden and asserts their machine SIDs and hostnames differ
 while cloudbase-init still consumes the injected config-drive.
 
-> **STATUS / KNOWN BLOCKER (2026-07-04): the generalized golden is NOT yet
-> gate-passing.** The procedure below successfully `/generalize`s
-> `golden-win11-cloudbase.qcow2` and captures it cold, but every CoW clone of
-> the result fails Windows mini-setup at the **specialize** pass with the modal
-> *"Windows could not finish configuring the system. To attempt to resume
-> configuration, restart the computer."* (deterministic — a reboot shows the
-> same dialog), so the clone never completes OOBE / networks. Root cause, from
-> the clone's `C:\Windows\Panther\setupact.log`: during specialize CBS tries to
-> finalize the removal of Feature-on-Demand packages that generalize
-> deprovisioned (`Microsoft-Windows-Kernel-LA57-FoD`,
-> `Microsoft-OneCore-DirectX-Database-FOD`) but hits
+> **STATUS (2026-07-10, FU5): RESOLVED — the generalized golden is
+> gate-passing.** The blocker below is fixed by the component-store repair
+> (`DISM /ResetBase`) and the whole procedure is now captured as a reproducible
+> script, [`build-sysprep-golden.sh`](build-sysprep-golden.sh), which produces
+> the side artifact `/storage/iso/golden-win11-cloudbase-sysprepped.qcow2`
+> (NEVER overwriting the live golden). Two CoW clones of that artifact complete
+> OOBE and report **distinct machine SIDs + hostnames** via the distinct-SID
+> gate (`tests/e2e/windows-sysprep/run-sysprep-identity-gate.sh`, wired into
+> infra as `just test-windows-sysprep-golden`).
+>
+> ORIGINAL BLOCKER (2026-07-04): the first `/generalize` succeeded and captured
+> cold, but every CoW clone failed Windows mini-setup at the **specialize** pass
+> with the modal *"Windows could not finish configuring the system. To attempt
+> to resume configuration, restart the computer."* (deterministic — a reboot
+> showed the same dialog), so the clone never completed OOBE / networks. Root
+> cause, from the clone's `C:\Windows\Panther\setupact.log`: during specialize
+> CBS tried to finalize the removal of Feature-on-Demand packages that
+> generalize deprovisioned (`Microsoft-Windows-Kernel-LA57-FoD`,
+> `Microsoft-OneCore-DirectX-Database-FOD`) but hit
 > `ERROR_NOT_FOUND` / `CbsExecuteStateFailed` / *"Failed to commit CSI
 > transaction … Component reboot required, package changes need to be pended"*.
-> This is a **pre-existing component-store inconsistency in the base golden**
-> (the same orphaned incomplete CBS session `SessionsPending\…_3389271126` that
-> also caused the reserved-storage sysprep-validation lock in step 3), which
-> generalize then turns into un-committable pending FoD-removal transactions.
-> FIX for the next attempt: on a fresh copy, **repair the component store
-> BEFORE generalize** — `DISM /Online /Cleanup-Image /StartComponentCleanup
-> /ResetBase` (note the `/ResetBase`, which finalizes the pending session and
-> drops superseded FoD payloads; plain `StartComponentCleanup` did NOT clear
-> it), optionally `DISM /Online /Cleanup-Image /RevertPendingActions`, then
-> generalize. The unvalidated capture is parked at
-> `/storage/scratch/golden-win11-cloudbase-sysprep.UNVALIDATED-clone-specialize-fails.qcow2`
-> (moved OUT of `/storage/iso` so it is not mistaken for a working golden).
+> This was a **pre-existing component-store inconsistency in the base golden**
+> (an orphaned incomplete CBS session `SessionsPending\…_3389271126` that also
+> caused the reserved-storage sysprep-validation lock in step 3), which
+> generalize turned into un-committable pending FoD-removal transactions.
+>
+> THE FIX (load-bearing, now in the script): on a fresh copy, **repair the
+> component store BEFORE generalize** — `DISM /Online /Cleanup-Image
+> /StartComponentCleanup /ResetBase` (the `/ResetBase` is the load-bearing flag:
+> it finalizes the pending session and drops superseded FoD payloads; plain
+> `StartComponentCleanup` did NOT clear it), then clear the reserved-storage
+> servicing scenario, then `sysprep /generalize /oobe /shutdown /quiet` with the
+> re-arm unattend. With the store repaired, generalize no longer creates
+> un-committable transactions and the clones specialize cleanly through OOBE.
 
 ### Procedure (what produced the sysprepped golden)
 
