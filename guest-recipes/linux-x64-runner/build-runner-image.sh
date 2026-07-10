@@ -36,6 +36,10 @@
 #   VMH_INCUS_CMD="sudo -n incus" ./build-runner-image.sh
 #   VMH_RUNNER_VERSION=2.335.1 ./build-runner-image.sh
 #   VMH_RUNNER_TARBALL=/path/to/actions-runner-linux-x64-X.tar.gz ./build-runner-image.sh
+#   # FU3 (HR-BAKE): the prod nested-capability image (`incus-nested` class) —
+#   # bake BOTH docker (HR1) + qemu/kvm (HR2) under a SIDE alias:
+#   VMH_RUNNER_DOCKER=1 VMH_RUNNER_KVM=1 \
+#     VMH_RUNNER_ALIAS=vmh-linux-runner-nested ./build-runner-image.sh
 #
 # Env:
 #   VMH_INCUS_CMD       incus invocation        (default: incus)
@@ -46,6 +50,8 @@
 #   VMH_RUNNER_VERSION  actions runner version   (default: 2.335.1)
 #   VMH_RUNNER_TARBALL  pre-downloaded tarball    (default: download to /tmp)
 #   VMH_RUNNER_CACHE    in-image runner dir       (default: /home/<user>/actions-runner)
+#   VMH_RUNNER_DOCKER   bake nested Docker (HR1)  (default: off; set =1)
+#   VMH_RUNNER_KVM      bake nested KVM (HR2)     (default: off; set =1)
 #
 # IM4 note: the cache path MUST match GARM's Linux install template, which
 # looks for a cached runner at exactly `/home/<RunnerUsername>/actions-runner`
@@ -75,6 +81,17 @@ BLD="im2-bld-runner"
 # alias (eg vmh-linux-runner-docker) so the live image is never overwritten.
 DOCKER="${VMH_RUNNER_DOCKER:-}"
 DOCKER_VERSION="${VMH_DOCKER_VERSION:-27.5.1}"
+# HR2 (nested KVM): when VMH_RUNNER_KVM is set (=1), bake the qemu/kvm
+# USERSPACE (qemu-system-x86 + a guest kernel for the boot smoke) into the
+# image so a per-job container launched with the provider's
+# `incusNestedKvm=true` (security.nesting + a /dev/kvm unix-char device) can run
+# `qemu-system-x86_64 -enable-kvm` with HARDWARE acceleration (the nested-VM
+# path proven by the t_incus_nested_vm gate). Off by default ⇒ the live image is
+# byte-unchanged. Point VMH_RUNNER_ALIAS at a SIDE alias (eg
+# vmh-linux-runner-nested) so the live image is never overwritten. KVM shares
+# the same egress + apt seam as HR1, so VMH_RUNNER_DOCKER=1 VMH_RUNNER_KVM=1
+# bakes BOTH into one image (the `incus-nested` prod class needs both).
+KVM="${VMH_RUNNER_KVM:-}"
 # Pre-downloaded docker static bundle on the HOST (containers have egress only
 # once a static IP + gateway are configured — see the egress step below); the
 # static bundle is STREAMED in (cat|incus exec tar) rather than `incus file
@@ -189,20 +206,14 @@ log "clearing root-owned runtime dirs + re-asserting ${RUNNER_USER} ownership"
   chown -R ${RUNNER_USER}:${RUNNER_USER} '${RUNNER_CACHE}'
 "
 
-# 5b. HR1 — bake docker/moby + fuse-overlayfs for NESTED Docker (opt-in). The
-#     per-job container must be launched with the provider's
-#     `incusSecurityNesting=true` (security.nesting + mknod/setxattr intercepts)
-#     for the daemon to actually run; the storage driver is fuse-overlayfs so an
-#     UNPRIVILEGED nested container (which cannot use the kernel overlay2 driver)
-#     can still build layered images. `docker run` / `docker build` then work
-#     inside the ephemeral runner (proven by the t_incus_nested_docker gate).
-if [ -n "$DOCKER" ]; then
-  log "HR1: baking docker ${DOCKER_VERSION} + fuse-overlayfs (nested Docker)"
-
-  # (a) Give the build container egress (incusbr0 DHCP does not lease here) so
-  #     the apt step for the docker RUNTIME deps (iptables/uidmap/dbus/
-  #     fuse-overlayfs) works. Gateway defaults to the incusbr0 host address;
-  #     the build IP defaults to host .249 of that /24. Both env-overridable.
+# 5b. HR1/HR2 — build-time egress for the nested-capability apt steps (opt-in).
+#     Both the HR1 docker bake and the HR2 kvm bake below need Debian packages
+#     from the network. incusbr0 DHCP does not lease here, so give the build
+#     container a STATIC egress IP once (shared by both blocks). Gateway defaults
+#     to the incusbr0 host address; the build IP defaults to host .249 of that
+#     /24. Both env-overridable. Set up iff docker OR kvm is being baked; torn
+#     down at the end so the published image carries no stray static address.
+if [ -n "$DOCKER" ] || [ -n "$KVM" ]; then
   gw="$BUILD_EGRESS_GW"
   if [ -z "$gw" ]; then
     gw="$("${INCUS[@]}" network get "$INCUS_BRIDGE" ipv4.address 2>/dev/null | cut -d/ -f1)"
@@ -212,10 +223,10 @@ if [ -n "$DOCKER" ]; then
     bip="$(printf '%s' "$gw" | awk -F. '{printf "%s.%s.%s.249", $1,$2,$3}')"
   fi
   if [ -z "$gw" ] || [ -z "$bip" ]; then
-    echo "[build-runner-image] HR1: could not derive build egress IP/gateway (set VMH_BUILD_EGRESS_IP / VMH_BUILD_EGRESS_GW)" >&2
+    echo "[build-runner-image] nested-bake: could not derive build egress IP/gateway (set VMH_BUILD_EGRESS_IP / VMH_BUILD_EGRESS_GW)" >&2
     exit 1
   fi
-  log "HR1: build-container egress ${bip} via ${gw} (dns ${BUILD_EGRESS_DNS})"
+  log "nested-bake: build-container egress ${bip} via ${gw} (dns ${BUILD_EGRESS_DNS})"
   "${INCUS[@]}" exec "$BLD" -- sh -c "
     set -e
     ip addr add ${bip}/24 dev eth0 2>/dev/null || true
@@ -224,6 +235,17 @@ if [ -n "$DOCKER" ]; then
     rm -f /etc/resolv.conf
     printf 'nameserver %s\n' '${BUILD_EGRESS_DNS}' > /etc/resolv.conf
   "
+fi
+
+# 5c. HR1 — bake docker/moby + fuse-overlayfs for NESTED Docker (opt-in). The
+#     per-job container must be launched with the provider's
+#     `incusSecurityNesting=true` (security.nesting + mknod/setxattr intercepts)
+#     for the daemon to actually run; the storage driver is fuse-overlayfs so an
+#     UNPRIVILEGED nested container (which cannot use the kernel overlay2 driver)
+#     can still build layered images. `docker run` / `docker build` then work
+#     inside the ephemeral runner (proven by the t_incus_nested_docker gate).
+if [ -n "$DOCKER" ]; then
+  log "HR1: baking docker ${DOCKER_VERSION} + fuse-overlayfs (nested Docker)"
 
   # (b) Runtime deps from Debian (small): iptables (docker bridge NAT), uidmap
   #     (rootless helpers), dbus, and fuse-overlayfs (the unprivileged storage
@@ -329,16 +351,53 @@ EOF
     test \"\$sd\" = \"${DOCKER_STORAGE_DRIVER}\"
     kill %1 %2 2>/dev/null || true
   "
+fi
 
-  # (f) Undo the build-time egress IP so the published image carries no stray
-  #     static address (the provider injects the real per-job IP via cloud-init).
+# 5d. HR2 — bake the qemu/kvm USERSPACE for NESTED KVM (opt-in). The per-job
+#     container must be launched with the provider's `incusNestedKvm=true`
+#     (security.nesting + a /dev/kvm unix-char device) for acceleration to be
+#     available; this step installs `qemu-system-x86` + a guest kernel so an
+#     in-guest `qemu-system-x86_64 -enable-kvm` boots a HW-accelerated VM (proven
+#     by the t_incus_nested_vm gate). Pure apt — no static bundle, no systemd
+#     unit (qemu is invoked ad hoc by the job, not a daemon). The host must
+#     itself expose /dev/kvm with nested virt enabled (kvm_intel/amd.nested=Y).
+if [ -n "$KVM" ]; then
+  log "HR2: baking qemu-system-x86 + guest kernel (nested KVM)"
+
+  # (a) qemu-system-x86 (the -enable-kvm accelerator) + linux-image-cloud-amd64
+  #     (a tiny guest kernel for the boot smoke / the gate's boot proof) +
+  #     python3 (the gate probes /dev/kvm via a python ioctl; harmless to bake).
+  log "HR2: apt-get install qemu-system-x86 + guest kernel"
+  "${INCUS[@]}" exec "$BLD" -- sh -c "
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends qemu-system-x86 linux-image-cloud-amd64 python3
+  "
+
+  # (b) Smoke: qemu is present + reports a version (offline — the actual
+  #     -enable-kvm boot needs /dev/kvm, which the BUILD container does not have;
+  #     the t_incus_nested_vm gate does the real accelerated boot in a per-job
+  #     container that the provider attaches /dev/kvm to).
+  log "HR2: smoke — qemu-system-x86_64 --version + guest kernel present"
+  "${INCUS[@]}" exec "$BLD" -- sh -c "
+    set -e
+    qemu-system-x86_64 --version | head -1
+    ls -1 /boot/vmlinuz-* >/dev/null 2>&1 || { echo '[build-runner-image] HR2: no guest kernel staged in /boot' >&2; exit 1; }
+  "
+fi
+
+# 5e. Undo the shared build-time egress IP so the published image carries no
+#     stray static address (the provider injects the real per-job IP via
+#     cloud-init). Only runs if a nested-capability bake configured egress.
+if [ -n "$DOCKER" ] || [ -n "$KVM" ]; then
   "${INCUS[@]}" exec "$BLD" -- sh -c "ip addr del ${bip}/24 dev eth0 2>/dev/null || true" || true
 fi
 
 # 6. Record the image provenance.
 "${INCUS[@]}" exec "$BLD" -- sh -c "
-  printf 'vmh-linux-runner: %s (cloud) + actions-runner %s + cloud-init%s\n' \
-    '${CLOUD_BASE}' '${RUNNER_VERSION}' \"${DOCKER:+ + docker ${DOCKER_VERSION} (${DOCKER_STORAGE_DRIVER}) [HR1 nested]}\" > /etc/vmh-linux-runner-release
+  printf 'vmh-linux-runner: %s (cloud) + actions-runner %s + cloud-init%s%s\n' \
+    '${CLOUD_BASE}' '${RUNNER_VERSION}' \"${DOCKER:+ + docker ${DOCKER_VERSION} (${DOCKER_STORAGE_DRIVER}) [HR1 nested]}\" \"${KVM:+ + qemu-system-x86 [HR2 nested-kvm]}\" > /etc/vmh-linux-runner-release
 "
 
 # 7. Stop + publish as the runner image alias (replace any prior copy).
