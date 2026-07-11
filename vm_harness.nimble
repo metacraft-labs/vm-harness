@@ -22,6 +22,7 @@ task test, "Run the vm-harness test suite":
   exec "nim r --hints:off tests/unit/t_wsl_parsers.nim"
   exec "nim r --hints:off tests/unit/t_utm_parsers.nim"
   exec "nim r --hints:off tests/unit/t_qemu_windows_arm_backend.nim"
+  exec "nim r --hints:off tests/unit/t_tart_backend.nim"
   # M0 integration / e2e (NoopBackend; runs on any platform).
   exec "nim r --hints:off tests/integration/t_noop_lifecycle.nim"
   exec "nim r --hints:off tests/e2e/t_vm_harness_smoke.nim"

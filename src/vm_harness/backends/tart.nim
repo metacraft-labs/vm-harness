@@ -271,13 +271,23 @@ proc deleteTartVm*(b: TartBackend, name: string) =
   discard runProcessCapture(@[b.tartCmd, "delete", name], timeoutSec = 30)
 
 proc cloneTartVm*(b: TartBackend, srcRef: string, ephemeral: string) =
-  ## ``tart clone <src> <dst>``. Raises on failure since revert can't
-  ## continue without the clone.
+  ## ``tart clone <src> <dst>`` followed by ``tart set --random-mac``.
+  ## Tart clones inherit the source VM's MAC address.  Concurrent clones of
+  ## one golden would therefore share a DHCP lease, causing ``tart ip`` to
+  ## resolve both names to the same guest.  Every ephemeral needs a distinct
+  ## MAC before it is started.
   let r = runProcessCapture(@[b.tartCmd, "clone", srcRef, ephemeral],
                             timeoutSec = 300)
   if r.exitCode != 0:
     raise newVmHarnessError($b.id, lpRevert,
       "tart clone failed: " & r.stdout & r.stderr)
+  let randomMac = runProcessCapture(
+    @[b.tartCmd, "set", ephemeral, "--random-mac"], timeoutSec = 30)
+  if randomMac.exitCode != 0:
+    b.deleteTartVm(ephemeral)
+    raise newVmHarnessError($b.id, lpRevert,
+      "tart set --random-mac failed: " &
+      randomMac.stdout & randomMac.stderr)
 
 proc pullTartImage*(b: TartBackend, imageRef: string) =
   ## ``tart pull <ref>``. Idempotent — Tart's OCI cache means re-pulling a
