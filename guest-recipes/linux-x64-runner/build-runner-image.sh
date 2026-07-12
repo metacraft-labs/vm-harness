@@ -112,6 +112,47 @@ log() { echo "[build-runner-image] $*"; }
 cleanup() { "${INCUS[@]}" delete --force "$BLD" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
+# Build-time egress for the in-container apt steps (base git/xz install below +
+# the opt-in HR1/HR2 nested-capability bakes). incusbr0 DHCP does not lease on
+# this host, so give the build container a STATIC egress IP. Gateway defaults to
+# the incusbr0 host address; the build IP defaults to host .249 of that /24. Both
+# env-overridable. Idempotent: the resolved IP is cached in EGRESS_BIP so repeat
+# callers are no-ops, and the address is torn down once at the end so the
+# published image carries no stray static address (the provider injects the real
+# per-job IP via cloud-init).
+EGRESS_BIP=""
+ensure_build_egress() {
+  [ -n "$EGRESS_BIP" ] && return 0
+  local gw bip
+  gw="$BUILD_EGRESS_GW"
+  if [ -z "$gw" ]; then
+    gw="$("${INCUS[@]}" network get "$INCUS_BRIDGE" ipv4.address 2>/dev/null | cut -d/ -f1)"
+  fi
+  bip="$BUILD_EGRESS_IP"
+  if [ -z "$bip" ] && [ -n "$gw" ]; then
+    bip="$(printf '%s' "$gw" | awk -F. '{printf "%s.%s.%s.249", $1,$2,$3}')"
+  fi
+  if [ -z "$gw" ] || [ -z "$bip" ]; then
+    echo "[build-runner-image] could not derive build egress IP/gateway (set VMH_BUILD_EGRESS_IP / VMH_BUILD_EGRESS_GW)" >&2
+    exit 1
+  fi
+  log "build-container egress ${bip} via ${gw} (dns ${BUILD_EGRESS_DNS})"
+  "${INCUS[@]}" exec "$BLD" -- sh -c "
+    set -e
+    ip addr add ${bip}/24 dev eth0 2>/dev/null || true
+    ip link set eth0 up
+    ip route replace default via ${gw}
+    rm -f /etc/resolv.conf
+    printf 'nameserver %s\n' '${BUILD_EGRESS_DNS}' > /etc/resolv.conf
+  "
+  EGRESS_BIP="$bip"
+}
+teardown_build_egress() {
+  [ -z "$EGRESS_BIP" ] && return 0
+  "${INCUS[@]}" exec "$BLD" -- sh -c "ip addr del ${EGRESS_BIP}/24 dev eth0 2>/dev/null || true" || true
+  EGRESS_BIP=""
+}
+
 # 0. Ensure a local cloud base image exists (cloud-init present). If not,
 #    copy it from the remote (host has network).
 if ! "${INCUS[@]}" image info "$CLOUD_BASE" >/dev/null 2>&1; then
@@ -159,6 +200,28 @@ log "checking runner runtime dependencies in the base image"
   fi
   echo "[build-runner-image] runtime deps present (libicu72 libssl3 zlib1g libkrb5-3)"
 '
+
+# 3b. Bake the CI baseline tools every job needs regardless of flavor. The
+#     Debian cloud base ships neither `git` nor `xz`, but:
+#       * the shared `setup-dev-env` action clones cross-repo siblings with
+#         `git` BEFORE any per-flavor toolchain (nix / reprobuild) is installed
+#         — a missing `git` makes that clone-siblings step exit 127 (the whole
+#         reason the CIP-5 incus jobs went red);
+#       * `xz` is needed to unpack the Nix installer's `.xz` payload for the
+#         `nix` flavor;
+#       * `ca-certificates` keeps the authenticated github HTTPS clones valid.
+#     apt needs egress, which incusbr0 does not lease; bring up the shared
+#     static build IP for the install (idempotent — the HR1/HR2 bakes reuse it).
+log "installing CI baseline tools (git, xz-utils, ca-certificates)"
+ensure_build_egress
+"${INCUS[@]}" exec "$BLD" -- sh -c "
+  set -e
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends git xz-utils ca-certificates
+  command -v git
+  command -v xz
+"
 
 # 4. Create the unprivileged runner user with passwordless sudo.
 log "creating '${RUNNER_USER}' user with passwordless sudo"
@@ -208,33 +271,12 @@ log "clearing root-owned runtime dirs + re-asserting ${RUNNER_USER} ownership"
 
 # 5b. HR1/HR2 — build-time egress for the nested-capability apt steps (opt-in).
 #     Both the HR1 docker bake and the HR2 kvm bake below need Debian packages
-#     from the network. incusbr0 DHCP does not lease here, so give the build
-#     container a STATIC egress IP once (shared by both blocks). Gateway defaults
-#     to the incusbr0 host address; the build IP defaults to host .249 of that
-#     /24. Both env-overridable. Set up iff docker OR kvm is being baked; torn
-#     down at the end so the published image carries no stray static address.
+#     from the network. The base git/xz install (step 3b) already brought up the
+#     shared static egress IP; `ensure_build_egress` is idempotent so this is a
+#     no-op then and a first-time setup only if 3b somehow did not run.
 if [ -n "$DOCKER" ] || [ -n "$KVM" ]; then
-  gw="$BUILD_EGRESS_GW"
-  if [ -z "$gw" ]; then
-    gw="$("${INCUS[@]}" network get "$INCUS_BRIDGE" ipv4.address 2>/dev/null | cut -d/ -f1)"
-  fi
-  bip="$BUILD_EGRESS_IP"
-  if [ -z "$bip" ] && [ -n "$gw" ]; then
-    bip="$(printf '%s' "$gw" | awk -F. '{printf "%s.%s.%s.249", $1,$2,$3}')"
-  fi
-  if [ -z "$gw" ] || [ -z "$bip" ]; then
-    echo "[build-runner-image] nested-bake: could not derive build egress IP/gateway (set VMH_BUILD_EGRESS_IP / VMH_BUILD_EGRESS_GW)" >&2
-    exit 1
-  fi
-  log "nested-bake: build-container egress ${bip} via ${gw} (dns ${BUILD_EGRESS_DNS})"
-  "${INCUS[@]}" exec "$BLD" -- sh -c "
-    set -e
-    ip addr add ${bip}/24 dev eth0 2>/dev/null || true
-    ip link set eth0 up
-    ip route replace default via ${gw}
-    rm -f /etc/resolv.conf
-    printf 'nameserver %s\n' '${BUILD_EGRESS_DNS}' > /etc/resolv.conf
-  "
+  ensure_build_egress
+  bip="$EGRESS_BIP"
 fi
 
 # 5c. HR1 — bake docker/moby + fuse-overlayfs for NESTED Docker (opt-in). The
@@ -389,10 +431,9 @@ fi
 
 # 5e. Undo the shared build-time egress IP so the published image carries no
 #     stray static address (the provider injects the real per-job IP via
-#     cloud-init). Only runs if a nested-capability bake configured egress.
-if [ -n "$DOCKER" ] || [ -n "$KVM" ]; then
-  "${INCUS[@]}" exec "$BLD" -- sh -c "ip addr del ${bip}/24 dev eth0 2>/dev/null || true" || true
-fi
+#     cloud-init). Always runs now — step 3b's baseline git/xz install brings
+#     egress up on every build, not just the nested-capability bakes.
+teardown_build_egress
 
 # 6. Record the image provenance.
 "${INCUS[@]}" exec "$BLD" -- sh -c "
