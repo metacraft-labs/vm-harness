@@ -34,3 +34,25 @@ suite "Tart backend commands":
     expect VmHarnessError:
       backend.cloneTartVm("golden", "ephemeral")
     check "delete ephemeral" in readFile(log)
+
+  test "SCP retries a transient authentication failure":
+    let tmp = createTempDir("vmh-tart-unit-", "")
+    defer: removeDir(tmp)
+    let attempts = tmp / "attempts"
+    let scp = tmp / "scp"
+    let sshpass = tmp / "sshpass"
+    let src = tmp / "payload"
+    writeFile(src, "payload")
+    writeExecutable(sshpass, "#!/bin/sh\nshift 2\nexec \"$@\"\n")
+    writeExecutable(scp, "#!/bin/sh\n" &
+      "count=0\n" &
+      "[ ! -f '" & attempts & "' ] || count=$(cat '" & attempts & "')\n" &
+      "count=$((count + 1))\n" &
+      "printf '%s' \"$count\" > '" & attempts & "'\n" &
+      "[ \"$count\" -ge 2 ]\n")
+
+    let backend = newTartBackend(
+      guestOs = goMacos, scpCmd = scp, sshpassCmd = sshpass)
+    backend.scpCopy("192.0.2.1", src, "/tmp/payload",
+      toGuest = true, recursive = false, timeoutSec = 10)
+    check readFile(attempts) == "2"

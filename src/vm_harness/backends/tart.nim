@@ -636,7 +636,11 @@ method execInGuest*(b: TartBackend, vm: VmHandle,
 proc scpCopy*(b: TartBackend, host: string, src: string, dest: string,
               toGuest: bool, recursive: bool = true,
               timeoutSec: int = 600) =
-  ## Internal helper used by both copyToGuest and copyFromGuest.
+  ## Internal helper used by both copyToGuest and copyFromGuest.  A freshly
+  ## booted macOS guest can accept the SSH readiness probe and briefly reject
+  ## the immediately following SCP while launchd finishes settling sshd/PAM.
+  ## Retry within the caller's timeout instead of abandoning an otherwise
+  ## healthy ephemeral runner after one transient authentication failure.
   let pwdFile = writePasswordFile(b.sshPassword)
   defer:
     try: removeFile(pwdFile)
@@ -659,12 +663,22 @@ proc scpCopy*(b: TartBackend, host: string, src: string, dest: string,
   else:
     args.add(b.sshUser & "@" & host & ":" & src)
     args.add(dest)
-  let r = runProcessCapture(args, timeoutSec = timeoutSec)
-  if r.exitCode != 0:
-    raise newVmHarnessError($b.id, lpCopy,
-      "scp " & (if toGuest: "to" else: "from") &
-      " " & host & " failed (exit " & $r.exitCode & "): " &
-      r.stdout & r.stderr)
+  let deadline = epochTime() + timeoutSec.float
+  var last = ExecResult(exitCode: -1)
+  var attempt = 0
+  while epochTime() < deadline:
+    inc attempt
+    let remaining = max(1, int(deadline - epochTime()))
+    last = runProcessCapture(args, timeoutSec = min(30, remaining))
+    if last.exitCode == 0:
+      return
+    if attempt >= 5:
+      break
+    sleep(2000)
+  raise newVmHarnessError($b.id, lpCopy,
+    "scp " & (if toGuest: "to" else: "from") &
+    " " & host & " failed after " & $attempt & " attempts (exit " &
+    $last.exitCode & "): " & last.stdout & last.stderr)
 
 method copyToGuest*(b: TartBackend, vm: VmHandle,
                    hostPath: string, guestPath: string) =
