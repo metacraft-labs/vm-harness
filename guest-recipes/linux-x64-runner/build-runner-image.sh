@@ -452,8 +452,8 @@ log "stopping container + publishing image alias '$ALIAS'"
 "${INCUS[@]}" image delete "$ALIAS" >/dev/null 2>&1 || true
 "${INCUS[@]}" publish "$BLD" --alias "$ALIAS" \
   --public=false \
-  --property "vmh.recipe_revision=${RECIPE_REVISION}" \
   description="vmh linux runner: ${CLOUD_BASE} + actions-runner ${RUNNER_VERSION} + cloud-init"
+"${INCUS[@]}" image set-property "$ALIAS" vmh.recipe_revision "$RECIPE_REVISION"
 
 log "done: image '$ALIAS' built"
 "${INCUS[@]}" image list "$ALIAS"
