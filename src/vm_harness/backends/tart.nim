@@ -349,6 +349,16 @@ proc runTartVmInBackground*(b: TartBackend, name: string): int =
   # the handle; the OS keeps the child alive.
   # Nim's startProcess returns a ref that we let go of.
 
+proc terminateTartRun(b: TartBackend, name: string) =
+  ## Terminate the background `tart run` child and forget its bookkeeping.
+  ## This is the failure-path counterpart to the graceful `tart stop` used
+  ## after a successful runner job.
+  if name in b.ephemeralPids:
+    let pid = b.ephemeralPids[name]
+    when defined(posix):
+      discard execShellCmd("kill " & $pid & " 2>/dev/null || true")
+    b.ephemeralPids.del(name)
+
 proc tartIpWait*(b: TartBackend, name: string,
                 waitSec: int = 90): string =
   ## ``tart ip --wait <s> <name>`` — blocks until the VM has a DHCP lease.
@@ -560,12 +570,22 @@ method revertToBaseline*(b: TartBackend, baselineName: string): VmHandle =
   b.cloneTartVm(b.goldenImage, ephemeral)
   let pid = b.runTartVmInBackground(ephemeral)
   b.ephemeralPids[ephemeral] = pid
-  let ip = b.tartIpWait(ephemeral, b.bootTimeoutSec)
+  var ip: string
+  try:
+    ip = b.tartIpWait(ephemeral, b.bootTimeoutSec)
+  except CatchableError:
+    # `tart run` can fail before the VM reaches networking (for example while
+    # macOS initialises its GUI-session frameworks). Do not leave that child
+    # alive: an orphan can hold Tart's storage lock and block every later
+    # clone on the host.
+    b.terminateTartRun(ephemeral)
+    b.deleteTartVm(ephemeral)
+    raise
   if not b.waitForSshReady(ip, b.sshReadyTimeoutSec):
     # SSH didn't come up; clean up before raising so callers don't have to.
     b.stopTartVm(ephemeral)
     b.deleteTartVm(ephemeral)
-    b.ephemeralPids.del(ephemeral)
+    b.terminateTartRun(ephemeral)
     raise (ref GuestBootFailureError)(
       msg: "TartBackend: SSH did not become ready on " & ip &
            " within " & $b.sshReadyTimeoutSec & "s",
@@ -585,7 +605,7 @@ method revertToBaseline*(b: TartBackend, baselineName: string): VmHandle =
     except CatchableError:
       b.stopTartVm(ephemeral)
       b.deleteTartVm(ephemeral)
-      b.ephemeralPids.del(ephemeral)
+      b.terminateTartRun(ephemeral)
       raise
   result = handle
 
@@ -817,12 +837,7 @@ method stopAndCleanup*(b: TartBackend, vm: VmHandle, deleteVm: bool = true) =
     if deleteVm:
       b.deleteTartVm(vm.name)
     # Cleanup the background `tart run` process if it's still alive.
-    if vm.name in b.ephemeralPids:
-      let pid = b.ephemeralPids[vm.name]
-      when defined(posix):
-        # SIGTERM the process group; ignore errors.
-        discard execShellCmd("kill " & $pid & " 2>/dev/null || true")
-      b.ephemeralPids.del(vm.name)
+    b.terminateTartRun(vm.name)
   except CatchableError:
     discard
 
