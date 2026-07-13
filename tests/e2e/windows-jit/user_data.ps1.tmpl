@@ -1,0 +1,82 @@
+#ps1_sysnative
+# GARM-style Windows JIT bootstrap, delivered as cloudbase-init user_data via
+# the config-drive. Mirrors garm-provider-common's WindowsSetupScriptTemplate
+# (UseJITConfig path): pull .runner/.credentials/.credentials_rsaparams from the
+# GARM metadata endpoint (JWT-authorized), DPAPI-protect the rsaparams, install
+# the runner service, and launch it. Against the M3 MOCK metadata endpoint.
+$ErrorActionPreference = "Stop"
+$MetadataURL = "@METADATA_URL@"
+$Token = "@TOKEN@"
+$runnerDir = "C:\actions-runner"
+
+function Log($m) {
+  $ts = Get-Date -Format "o"
+  Add-Content -Path "C:\m3-bootstrap.log" -Value "$ts $m"
+}
+
+try {
+  Log "M3-BOOTSTRAP-START metadata=$MetadataURL"
+
+  # 1. cert-bundle (JWT-authorized)
+  $bundle = Invoke-WebRequest -UseBasicParsing -Headers @{"Accept"="application/json"; "Authorization"="Bearer $Token"} -Uri "$MetadataURL/system/cert-bundle"
+  Log "CERT-BUNDLE-OK status=$($bundle.StatusCode)"
+
+  # 2. JIT credentials (JWT-authorized)
+  Invoke-WebRequest -UseBasicParsing -Headers @{"Accept"="application/json"; "Authorization"="Bearer $Token"} -Uri "$MetadataURL/credentials/runner" -OutFile (Join-Path $runnerDir ".runner")
+  Invoke-WebRequest -UseBasicParsing -Headers @{"Accept"="application/json"; "Authorization"="Bearer $Token"} -Uri "$MetadataURL/credentials/credentials" -OutFile (Join-Path $runnerDir ".credentials")
+  Log "RUNNER-CREDS-FETCHED"
+
+  Add-Type -AssemblyName System.Security
+  $rsaResp = Invoke-WebRequest -UseBasicParsing -Headers @{"Accept"="application/json"; "Authorization"="Bearer $Token"} -Uri "$MetadataURL/credentials/credentials_rsaparams"
+  $rsaData = $rsaResp.Content
+  $encodedBytes = [System.Text.Encoding]::UTF8.GetBytes($rsaData)
+  $protectedBytes = [Security.Cryptography.ProtectedData]::Protect($encodedBytes, $null, [Security.Cryptography.DataProtectionScope]::LocalMachine)
+  [System.IO.File]::WriteAllBytes((Join-Path $runnerDir ".credentials_rsaparams"), $protectedBytes)
+  Log "RSAPARAMS-DPAPI-PROTECTED"
+
+  # 3. service name (JWT-authorized)
+  $serviceNameFile = (Join-Path $runnerDir ".service")
+  Invoke-WebRequest -UseBasicParsing -Headers @{"Accept"="application/json"; "Authorization"="Bearer $Token"} -Uri "$MetadataURL/system/service-name" -OutFile $serviceNameFile
+  $SVC_NAME = (Get-Content -Raw $serviceNameFile).Trim()
+  Log "SERVICE-NAME=$SVC_NAME"
+
+  # 4. Status callback (JWT-authorized) — progress signal to GARM.
+  try {
+    Invoke-WebRequest -UseBasicParsing -Method Post -Headers @{"Accept"="application/json"; "Authorization"="Bearer $Token"} -Uri "$MetadataURL/status" -Body (ConvertTo-Json @{status="installing"; message="configuring runner"}) | Out-Null
+    Log "STATUS-CALLBACK-OK"
+  } catch { Log "STATUS-CALLBACK-WARN $_" }
+
+  # 5. Launch the runner with the injected JIT config. The .runner file IS the
+  #    JIT config; Runner.Listener reads it and connects to serverUrl. We start
+  #    it detached and capture its stdout so the gate can observe it reach the
+  #    configured/connecting state.
+  $listener = Join-Path $runnerDir "bin\Runner.Listener.exe"
+  Log "LAUNCHING-RUNNER $listener run"
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $listener
+  $psi.Arguments = "run --startuptype service"
+  $psi.WorkingDirectory = $runnerDir
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $proc = New-Object System.Diagnostics.Process
+  $proc.StartInfo = $psi
+  $stdoutFile = "C:\m3-runner-stdout.log"
+  Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action {
+    if ($EventArgs.Data) { Add-Content -Path "C:\m3-runner-stdout.log" -Value $EventArgs.Data }
+  } | Out-Null
+  Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -Action {
+    if ($EventArgs.Data) { Add-Content -Path "C:\m3-runner-stdout.log" -Value ("ERR " + $EventArgs.Data) }
+  } | Out-Null
+  $proc.Start() | Out-Null
+  $proc.BeginOutputReadLine()
+  $proc.BeginErrorReadLine()
+  Log "RUNNER-LISTENER-STARTED pid=$($proc.Id)"
+  Add-Content -Path "C:\m3-runner.pid" -Value $proc.Id
+  # Give it time to read the JIT config + attempt a session.
+  Start-Sleep -Seconds 25
+  Log "M3-BOOTSTRAP-DONE"
+} catch {
+  Log "M3-BOOTSTRAP-ERROR $_"
+  throw
+}

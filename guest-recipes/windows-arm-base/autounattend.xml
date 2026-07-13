@@ -2,7 +2,7 @@
 <!--
   vm-harness Windows-on-ARM golden image autounattend.xml (M3).
 
-  Drives Windows 11 ARM64 Insider Preview Setup from first boot through
+  Drives Windows 11 Arm64 Setup from first boot through
   to a desktop with OpenSSH server enabled and admin auto-logon. Mirrors
   the Hyper-V harness's Panther override pattern from
     reprobuild/tools/hyperv-m69-system/provision-base-vm.ps1
@@ -16,8 +16,19 @@
       VHDX. The Panther approach assumes Setup has already extracted
       the install; this approach drives Setup itself.
     - processorArchitecture="arm64" everywhere (vs amd64).
-    - FirstLogonCommands installs OpenSSH Server via DISM (no Windows
-      Update dependency — DISM uses the in-box capability source).
+    - The specialize pass copies provision-openssh.ps1 and, when
+      present, openssh\OpenSSH-ARM64.zip plus the
+      virtio\NetKVM\w11\ARM64 driver directory from the autounattend
+      ISO to C:\Windows\Temp while the install media is still attached.
+      FirstLogonCommands runs that local copy to install OpenSSH
+      Server via DISM, then falls back to the portable ARM64 zip when
+      the Windows capability is unavailable. The helper also installs
+      the ARM64 VirtIO NetKVM driver with pnputil when staged, so direct
+      QEMU virtio-net boots can receive hostfwd SSH. Durable diagnostics
+      go to C:\Windows\Temp\vmh-openssh-provision.log. OpenSSH or staged
+      NetKVM install failure writes
+      C:\Windows\Temp\vmh-openssh-provision-failed instead of the
+      install-done sentinel.
       The Hyper-V harness deliberately removes OpenSSH because its
       transport is PSDirect; the UTM harness deliberately installs it
       because SSH is the only available transport over user-mode NAT.
@@ -53,6 +64,25 @@
     </component>
 
     <component name="Microsoft-Windows-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <!-- Bypass Win11's system-requirements check for disposable
+           golden-image creation under direct QEMU, where Secure Boot
+           and virtual TPM are intentionally not exposed. Without these
+           LabConfig keys Setup halts with "This PC can't run Windows 11"
+           before partitioning the disk. -->
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
       <DiskConfiguration>
         <Disk wcm:action="add">
           <DiskID>0</DiskID>
@@ -101,8 +131,8 @@
             <DiskID>0</DiskID>
             <PartitionID>3</PartitionID>
           </InstallTo>
-          <!-- Pro is the most permissive SKU that ships in all Win11 ARM
-               Insider ISOs; the recipe scripts validate the available
+          <!-- Pro is the most permissive SKU expected in Win11 Arm64
+               ISOs; the recipe scripts validate the available
                image names and fall back to "Windows 11 Home" or
                "Windows 11 ARM" if Pro isn't present in the ISO. -->
           <InstallFrom>
@@ -134,6 +164,28 @@
            get a fresh name without us having to plug one in. -->
       <ComputerName>*</ComputerName>
       <TimeZone>UTC</TimeZone>
+    </component>
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <!-- Stage the OpenSSH helper while the autounattend ISO is
+             still mounted. FirstLogon runs after the install ISO has
+             been removed, so it must not depend on removable media. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd.exe /c "for %i in (D E F G H) do if exist %i:\provision-openssh.ps1 copy /Y %i:\provision-openssh.ps1 C:\Windows\Temp\provision-openssh.ps1"</Path>
+          <Description>Stage OpenSSH provisioning script locally</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd.exe /c "for %i in (D E F G H) do if exist %i:\openssh\OpenSSH-ARM64.zip copy /Y %i:\openssh\OpenSSH-ARM64.zip C:\Windows\Temp\OpenSSH-ARM64.zip"</Path>
+          <Description>Stage OpenSSH ARM64 portable zip locally when present</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>cmd.exe /c "for %i in (D E F G H) do if exist %i:\virtio\NetKVM\w11\ARM64\netkvm.inf xcopy /E /I /Y %i:\virtio C:\Windows\Temp\virtio"</Path>
+          <Description>Stage VirtIO NetKVM ARM64 driver locally when present</Description>
+        </RunSynchronousCommand>
+      </RunSynchronous>
     </component>
   </settings>
 
@@ -184,62 +236,35 @@
       </AutoLogon>
 
       <FirstLogonCommands>
-        <!-- 1. Install OpenSSH Server (in-box capability — no Windows
-             Update required). -->
+        <!-- 1. Provision OpenSSH Server with durable diagnostics. The
+             install-done marker below is intentionally gated on this
+             command's success marker/state so a guest that reaches the
+             desktop without sshd does not look provisioned. -->
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"</CommandLine>
-          <Description>Install OpenSSH Server capability</Description>
+          <CommandLine><![CDATA[powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$p='C:\Windows\Temp\provision-openssh.ps1'; if (Test-Path -LiteralPath $p) { & $p } else { Set-Content -LiteralPath 'C:\Windows\Temp\vmh-openssh-provision-failed' -Value 'provision-openssh.ps1 not found' -Encoding UTF8 -Force }; exit 0"]]></CommandLine>
+          <Description>Provision OpenSSH Server with diagnostics</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 2. Configure sshd to start automatically and start it now. -->
-        <SynchronousCommand wcm:action="add">
-          <Order>2</Order>
-          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Set-Service -Name sshd -StartupType Automatic; Start-Service sshd"</CommandLine>
-          <Description>Enable and start sshd</Description>
-          <RequiresUserInput>false</RequiresUserInput>
-        </SynchronousCommand>
-
-        <!-- 3. Set PowerShell as the default shell for SSH sessions.
-             The UTM backend's execInGuest currently routes through
-             `cmd /c "..."` so this isn't strictly required, but it's
-             a quality-of-life win for interactive `ssh admin@vm`
-             sessions and matches the Hyper-V harness's PSDirect default. -->
-        <SynchronousCommand wcm:action="add">
-          <Order>3</Order>
-          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "New-ItemProperty -Path HKLM:\SOFTWARE\OpenSSH -Name DefaultShell -Value (Get-Command powershell.exe).Source -PropertyType String -Force"</CommandLine>
-          <Description>Set PowerShell as default SSH shell</Description>
-          <RequiresUserInput>false</RequiresUserInput>
-        </SynchronousCommand>
-
-        <!-- 4. Open inbound TCP/22 on the firewall (the OpenSSH
-             capability install does this, but we re-assert it
-             defensively in case future Insider builds change the
-             default rule shape). -->
-        <SynchronousCommand wcm:action="add">
-          <Order>4</Order>
-          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) { New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 }"</CommandLine>
-          <Description>Ensure inbound TCP/22 is allowed</Description>
-          <RequiresUserInput>false</RequiresUserInput>
-        </SynchronousCommand>
-
-        <!-- 5. Copy the SysPrep answer file from the autounattend ISO
+        <!-- 2. Copy the SysPrep answer file from the autounattend ISO
              to C:\ so the manual step-5 SysPrep invocation finds it. -->
         <SynchronousCommand wcm:action="add">
-          <Order>5</Order>
+          <Order>2</Order>
           <CommandLine>cmd.exe /c "for %i in (D E F G H) do if exist %i:\repro-sysprep.xml copy /Y %i:\repro-sysprep.xml C:\repro-sysprep.xml"</CommandLine>
           <Description>Stage repro-sysprep.xml on C:\</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 6. Marker file the recipe scripts poll for. Written last so
-             a poll-and-found check is sufficient evidence that every
-             earlier FirstLogonCommands step succeeded. -->
+        <!-- 3. Marker file the recipe scripts poll for. Written only if
+             OpenSSH provisioning did not leave a failure marker and the
+             sshd service is running. If OpenSSH is unavailable, inspect
+             C:\Windows\Temp\vmh-openssh-provision.log and
+             C:\Windows\Temp\vmh-openssh-provision-failed. -->
         <SynchronousCommand wcm:action="add">
-          <Order>6</Order>
-          <CommandLine>cmd.exe /c "echo install-done > C:\Windows\Temp\repro-install-done"</CommandLine>
-          <Description>Write install-done sentinel</Description>
+          <Order>3</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "if ((Test-Path -LiteralPath 'C:\Windows\Temp\vmh-openssh-provision-failed') -or ((Get-Service -Name sshd -ErrorAction SilentlyContinue).Status -ne 'Running')) { exit 0 }; Set-Content -LiteralPath 'C:\Windows\Temp\repro-install-done' -Value 'install-done' -Encoding ASCII -Force; exit 0"</CommandLine>
+          <Description>Write install-done sentinel after OpenSSH is ready</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
       </FirstLogonCommands>

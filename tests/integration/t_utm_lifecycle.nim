@@ -67,11 +67,12 @@ suite "UtmBackend lifecycle (Windows ARM guest)":
     let b = makeBackend()
     let available = b.probeAvailability()
     if not available:
-      echo "[skip] utmctl or sshpass missing on PATH; install via " &
-           "`brew install --cask utm` + `brew install sshpass` (or " &
-           "`nix profile install nixpkgs#sshpass`)"
+      echo "[skip] utmctl unavailable, timed out, or sshpass missing; " &
+           "install UTM + sshpass and ensure the UTM control plane " &
+           "responds before running live lifecycle tests"
       skip()
-    check available
+    else:
+      check available
 
   test "full lifecycle: provision -> revert -> exec -> copy -> cleanup":
     let b = makeBackend()

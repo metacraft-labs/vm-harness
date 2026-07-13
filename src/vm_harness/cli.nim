@@ -13,7 +13,8 @@
 ## CLI falls back to NoopBackend if ``--allow-noop-fallback`` is set
 ## (used by the M0 selection test on hosts without real hypervisors).
 
-import std/[json, os, sequtils, strformat, strutils, tables, terminal]
+import std/[json, options, os, sequtils, strformat, strutils, tables,
+            terminal, times]
 import ./types, ./output, ./auto, ./orchestrator
 # Import every backend module so its registerBackend bootstrap runs.
 # Each import is a static side-effect: the backend's factory lands in
@@ -27,8 +28,10 @@ import ./backends/hyperv
 import ./backends/wsl
 import ./backends/tart
 import ./backends/utm
+import ./backends/qemu_windows_arm
 import ./backends/lima
 import ./backends/libvirt
+import ./backends/incus
 {.pop.}
 
 type
@@ -82,6 +85,47 @@ type
     firstBootScript*: string     ## ``--first-boot-script <path>`` — file the
                                  ## recipe's build-autounattend-iso.sh wraps
                                  ## into the per-VM autounattend ISO.
+    ephemeral*: bool             ## ``--ephemeral`` — libvirt-only: run one
+                                 ## per-job CoW-clone VM (fresh overlay from
+                                 ## ``--golden-image``, boot, then destroy +
+                                 ## remove overlay). This is the M2 per-job
+                                 ## reset the GARM provider drives.
+    keepEphemeral*: bool         ## ``--keep`` — libvirt-only (M3): with
+                                 ## ``--ephemeral``, clone + attach the
+                                 ## config-drive + boot (UEFI) and RETURN
+                                 ## LEAVING THE DOMAIN RUNNING (no probe, no
+                                 ## teardown). The caller drives an in-guest
+                                 ## probe (e.g. SSH the Windows JIT bootstrap)
+                                 ## then reclaims the VM via the
+                                 ## ``ephemeral-destroy`` subcommand. Without
+                                 ## ``--keep`` the M2 boot→probe→destroy
+                                 ## lifecycle is unchanged.
+    goldenImage*: string         ## ``--golden-image <path>`` — golden qcow2 the
+                                 ## ephemeral overlay is CoW-cloned from.
+    baseImage*: string           ## ``--base-image <alias>`` — incus-only: the
+                                 ## base image alias/fingerprint the ephemeral
+                                 ## per-job container is launched from. Empty ⇒
+                                 ## the IncusBackend default (``vmh-base``).
+    kernel*: string              ## ``--kernel <path>`` — optional direct-kernel
+                                 ## boot bzImage for the ephemeral clone (the
+                                 ## tiny Linux golden). Omit for a disk-bootable
+                                 ## golden (firmware boots the overlay).
+    initrd*: string              ## ``--initrd <path>`` — optional initramfs for
+                                 ## the direct-kernel ephemeral boot.
+    kernelCmdline*: string       ## ``--kernel-cmdline <str>`` — optional kernel
+                                 ## cmdline for the direct-kernel ephemeral boot.
+    userDataFile*: string        ## ``--user-data <path>`` — libvirt-only (M3):
+                                 ## a file whose contents become the config-drive
+                                 ## ``openstack/latest/user_data`` (the rendered
+                                 ## GARM bootstrap). vm-harness builds a
+                                 ## ``config-2``-labelled ISO and attaches it so
+                                 ## cloudbase-init runs it on first boot.
+    metaDataFile*: string        ## ``--meta-data <path>`` — optional override for
+                                 ## the config-drive ``meta_data.json``.
+    uefiLoader*: string          ## ``--uefi-loader <path>`` — OVMF code fd; when
+                                 ## set the ephemeral clone boots UEFI (Windows).
+    uefiNvramTemplate*: string   ## ``--uefi-nvram-template <path>`` — OVMF vars
+                                 ## template donor for the per-job nvram copy.
     controllerPubKey*: string    ## ``--controller-pubkey <path>`` — SSH public
                                  ## key (``id_ed25519.pub`` or similar) that
                                  ## the recipe's build-autounattend-iso.sh
@@ -96,6 +140,10 @@ vm-harness <subcommand> [flags]
 Subcommands:
   provision               Ensure a baseline image exists (idempotent).
   run                     One-shot revert + exec + harvest + cleanup.
+  ephemeral-destroy       libvirt-only: reclaim an ephemeral clone left
+                          running by `run --ephemeral --keep` (destroy +
+                          undefine --nvram + remove overlay/config-drive/
+                          nvram — no residue). Requires --baseline.
   probe                   Print available backends as JSON.
   shell                   (placeholder) Open an interactive shell into a baseline.
   backends                Tabular listing of every known backend.
@@ -119,7 +167,7 @@ Subcommands:
 
 Common flags:
   --backend <auto|noop|hyperv|wsl|tart-macos|tart-linux-arm|
-             utm-windows-arm|libvirt|lima>
+             utm-windows-arm|qemu-windows-arm|libvirt|lima>
   --guest <linux|windows|macos>   Required when --backend auto.
   --baseline <name>               Logical baseline tag (== libvirt domain name).
   --name <vm>                     Alias for --baseline (canonical libvirt M4
@@ -145,6 +193,27 @@ Common flags:
                                   guest's FirstLogonCommands installs it in
                                   authorized_keys before first boot.
                                   Requires --recipe.
+  --ephemeral                     libvirt-only: run ONE per-job CoW-clone VM
+                                  (fresh overlay from --golden-image, boot on
+                                  KVM, then destroy + remove overlay — no
+                                  residue). The M2 per-job reset the GARM
+                                  provider drives. A positional arg after --
+                                  is treated as an expected serial boot marker.
+  --keep                          libvirt-only: with --ephemeral, clone +
+                                  attach the config-drive + boot (UEFI) and
+                                  LEAVE THE DOMAIN RUNNING (no probe/teardown).
+                                  Reclaim it with `ephemeral-destroy`. Used to
+                                  drive an in-guest probe (e.g. the Windows JIT
+                                  bootstrap over SSH) for a long-lived golden.
+  --golden-image <path>           libvirt-only: golden qcow2 the ephemeral
+                                  overlay is CoW-cloned from. Requires
+                                  --ephemeral.
+  --kernel <path>                 libvirt-only: optional direct-kernel-boot
+                                  bzImage for --ephemeral (tiny Linux golden).
+  --initrd <path>                 libvirt-only: optional initramfs for the
+                                  direct-kernel ephemeral boot.
+  --kernel-cmdline <str>          libvirt-only: optional kernel cmdline for the
+                                  direct-kernel ephemeral boot.
   --output-dir <path>
   --ephemeral-prefix <prefix>     Backend-specific prefix for ephemeral VMs.
   --env KEY=VAL                   (repeatable)
@@ -278,6 +347,30 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.firstBootScript = args[i]; inc i
     of "--controller-pubkey":
       inc i; result.controllerPubKey = args[i]; inc i
+    of "--ephemeral":
+      result.ephemeral = true
+      inc i
+    of "--keep":
+      result.keepEphemeral = true
+      inc i
+    of "--golden-image":
+      inc i; result.goldenImage = args[i]; inc i
+    of "--base-image":
+      inc i; result.baseImage = args[i]; inc i
+    of "--kernel":
+      inc i; result.kernel = args[i]; inc i
+    of "--initrd":
+      inc i; result.initrd = args[i]; inc i
+    of "--kernel-cmdline":
+      inc i; result.kernelCmdline = args[i]; inc i
+    of "--user-data":
+      inc i; result.userDataFile = args[i]; inc i
+    of "--meta-data":
+      inc i; result.metaDataFile = args[i]; inc i
+    of "--uefi-loader":
+      inc i; result.uefiLoader = args[i]; inc i
+    of "--uefi-nvram-template":
+      inc i; result.uefiNvramTemplate = args[i]; inc i
     of "--output-dir":
       inc i; result.outputDir = args[i]; inc i
     of "--ephemeral-prefix":
@@ -437,7 +530,229 @@ proc cmdProvision(opts: CliOpts): int =
            {"backend": $id, "baseline": opts.baseline})
   0
 
+proc cmdRunEphemeralIncus(opts: CliOpts): int =
+  ## Incus per-job ephemeral CONTAINER: launch a FRESH container from the
+  ## base image, run an exec probe, then destroy it (``incus delete
+  ## --force``) leaving NO residue. The container analog of the libvirt
+  ## CoW-clone path — the same create→probe→destroy lifecycle the GARM
+  ## provider's CreateInstance/DeleteInstance drive, but far cheaper (no
+  ## /dev/kvm, sub-second launch).
+  ##
+  ## ``--baseline`` names the per-job container; ``--base-image`` the image
+  ## to launch from (default ``vmh-base``). ``--user-data`` (when set)
+  ## injects cloud-init user-data — the IM2 JIT seam. Args after ``--`` are
+  ## the in-guest probe command (default ``true``).
+  let backend = newBackend(biIncus)
+  if opts.baseline.len == 0:
+    raise newException(ValueError,
+      "run --ephemeral --backend incus: --baseline (container name) is required")
+  let ib = IncusBackend(backend)
+  var userData = ""
+  if opts.userDataFile.len > 0:
+    if not fileExists(opts.userDataFile):
+      raise newException(ValueError,
+        "run --ephemeral: --user-data file not found: " & opts.userDataFile)
+    userData = readFile(opts.userDataFile)
+  let spec = EphemeralIncusSpec(
+    name: opts.baseline,
+    baseImage: opts.baseImage,
+    ephemeral: false,
+    userData: userData,
+    config: initTable[string, string]())
+  logEvent(opts.logFormat, "info", "ephemeral container: launch",
+           {"backend": $biIncus, "name": opts.baseline,
+            "base": (if opts.baseImage.len > 0: opts.baseImage else: ib.baseImage)})
+  var vm = ib.provisionEphemeralClone(spec)
+  if opts.keepEphemeral:
+    logEvent(opts.logFormat, "info", "ephemeral container: kept running",
+             {"name": opts.baseline})
+    echo opts.baseline
+    return 0
+  var verdict = 2
+  try:
+    let readyTimeout = if opts.timeoutSec > 0: opts.timeoutSec else: 60
+    ib.startAndAwaitReady(vm, readyTimeout)
+    let probeCmd = if opts.cmd.len > 0: opts.cmd else: @["true"]
+    let r = ib.execInGuest(vm, initTable[string, string](), probeCmd,
+                           timeoutSec = readyTimeout)
+    if r.exitCode == 0:
+      logEvent(opts.logFormat, "info", "ephemeral probe: ok",
+               {"cmd": probeCmd.join(" "), "stdout": r.stdout.strip()})
+      verdict = 0
+    else:
+      logEvent(opts.logFormat, "error", "ephemeral probe: FAILED",
+               {"cmd": probeCmd.join(" "), "exit": $r.exitCode,
+                "stdout": r.stdout.strip()})
+      verdict = 1
+    if opts.outputDir.len > 0:
+      try:
+        createDir(opts.outputDir)
+        writeFile(opts.outputDir / "probe.log", r.stdout)
+      except CatchableError: discard
+  finally:
+    ib.stopAndCleanup(vm, deleteVm = true)
+    logEvent(opts.logFormat, "info", "ephemeral container: destroyed",
+             {"name": opts.baseline})
+  verdict
+
+proc cmdRunEphemeral(opts: CliOpts): int =
+  ## M2 per-job ephemeral CoW clone: clone a fresh overlay from the
+  ## golden, boot it on KVM, harvest the serial console (boot-marker
+  ## probe), then destroy the domain + remove the overlay (no residue).
+  ## This is the exact create→boot→probe→destroy lifecycle the GARM
+  ## provider's CreateInstance/DeleteInstance will drive (M4).
+  ##
+  ## The probe is a serial boot marker rather than an in-guest exec
+  ## because the OS-agnostic tiny golden self-terminates
+  ## (``poweroff -f``); a real Windows/Linux golden that stays up would
+  ## instead use the SSH ``execInGuest`` path. When ``--`` supplies an
+  ## argument it is treated as the expected serial marker substring.
+  ##
+  ## The Incus container path is a separate lifecycle (no serial console,
+  ## an in-guest exec probe instead) — dispatch to it when the backend is
+  ## ``incus``.
+  if opts.backend == $biIncus:
+    return cmdRunEphemeralIncus(opts)
+  let id = biLibvirt
+  let backend = newBackend(id)
+  if opts.baseline.len == 0:
+    raise newException(ValueError, "run --ephemeral: --baseline is required")
+  if opts.goldenImage.len == 0:
+    raise newException(ValueError,
+      "run --ephemeral: --golden-image is required")
+  let lb = LibvirtBackend(backend)
+  # M3: build the config-drive ISO from --user-data so cloudbase-init runs
+  # the injected bootstrap on first boot. Per-job artifacts (ISO + nvram)
+  # live next to the overlay and are removed on teardown.
+  var configDriveIso = ""
+  if opts.userDataFile.len > 0:
+    if not fileExists(opts.userDataFile):
+      raise newException(ValueError,
+        "run --ephemeral: --user-data file not found: " & opts.userDataFile)
+    let userData = readFile(opts.userDataFile)
+    var metaData = ""
+    if opts.metaDataFile.len > 0 and fileExists(opts.metaDataFile):
+      metaData = readFile(opts.metaDataFile)
+    configDriveIso = lb.configDriveIsoPathFor(opts.baseline)
+    discard buildConfigDriveIso(configDriveIso, userData, metaData)
+  var uefiNvram = ""
+  if opts.uefiLoader.len > 0:
+    uefiNvram = lb.imagePoolDir / (opts.baseline & "_VARS.fd")
+  let spec = EphemeralCloneSpec(
+    name: opts.baseline,
+    goldenImage: opts.goldenImage,
+    cpus: (if opts.cpus > 0: opts.cpus else: 2),
+    memoryMB: (if opts.memoryMB > 0: opts.memoryMB else: 1024),
+    kernel: opts.kernel,
+    initrd: opts.initrd,
+    cmdline: opts.kernelCmdline,
+    configDriveIso: configDriveIso,
+    uefiLoader: opts.uefiLoader,
+    uefiNvramTemplate: opts.uefiNvramTemplate,
+    uefiNvram: uefiNvram)
+  let expectMarker = if opts.cmd.len > 0: opts.cmd[0] else: ""
+  let timeoutSec = if opts.timeoutSec > 0: opts.timeoutSec else: 120
+  logEvent(opts.logFormat, "info", "ephemeral clone: boot",
+           {"backend": $id, "name": opts.baseline,
+            "golden": opts.goldenImage})
+  var vm = lb.provisionEphemeralClone(spec)
+
+  # --keep: leave the domain RUNNING for an out-of-band in-guest probe
+  # (e.g. the Windows JIT gate SSHes in and drives the bootstrap). The
+  # caller reclaims the VM via the ``ephemeral-destroy`` subcommand,
+  # which runs the very same ephemeral ``stopAndCleanup`` teardown. This
+  # is the real CLI path the M3 gate exercises for a long-lived Windows
+  # golden that stays up (as opposed to the M2 tiny golden that
+  # self-terminates and is probed via the serial marker below).
+  if opts.keepEphemeral:
+    logEvent(opts.logFormat, "info", "ephemeral clone: kept running",
+             {"name": opts.baseline,
+              "overlay": vm.extra.getOrDefault("overlayPath", ""),
+              "config_drive": vm.extra.getOrDefault("configDriveIso", ""),
+              "uefi_nvram": vm.extra.getOrDefault("uefiNvram", "")})
+    # Emit the domain name on stdout so a shell caller can capture it.
+    echo opts.baseline
+    return 0
+
+  var verdict = 2
+  try:
+    # Poll for self-poweroff (tiny golden) or timeout.
+    let serialLog = vm.extra.getOrDefault("serialLogPath", "")
+    let deadline = epochTime() + timeoutSec.float
+    var poweredOff = false
+    while epochTime() < deadline:
+      if lb.domainState(opts.baseline) == "shut off":
+        poweredOff = true
+        break
+      sleep(500)
+    var serial = ""
+    if serialLog.len > 0 and fileExists(serialLog):
+      serial = readFile(serialLog)
+    if expectMarker.len > 0:
+      if expectMarker in serial:
+        logEvent(opts.logFormat, "info", "ephemeral probe: marker found",
+                 {"marker": expectMarker, "powered_off": $poweredOff})
+        verdict = 0
+      else:
+        logEvent(opts.logFormat, "error",
+                 "ephemeral probe: marker NOT found",
+                 {"marker": expectMarker})
+        verdict = 1
+    else:
+      # No expected marker: success == the domain booted and reached
+      # power-off within the deadline.
+      verdict = if poweredOff: 0 else: 1
+    if opts.outputDir.len > 0 and serial.len > 0:
+      try:
+        createDir(opts.outputDir)
+        writeFile(opts.outputDir / "serial.log", serial)
+      except CatchableError: discard
+  finally:
+    lb.stopAndCleanup(vm, deleteVm = true)
+    logEvent(opts.logFormat, "info", "ephemeral clone: destroyed",
+             {"name": opts.baseline})
+  verdict
+
+proc cmdEphemeralDestroy(opts: CliOpts): int =
+  ## Reclaim an ephemeral clone left running by ``run --ephemeral --keep``.
+  ## Reconstructs the per-job VmHandle (the ephemeral artifact paths are
+  ## deterministic from ``--baseline``) and runs the SAME ephemeral
+  ## ``stopAndCleanup(deleteVm=true)`` teardown the non-keep path runs:
+  ## ``virsh destroy`` + ``virsh undefine --nvram`` + remove the CoW
+  ## overlay + the injected config-drive ISO + the per-job OVMF nvram —
+  ## leaving NO residue. The golden + the OVMF template are never touched.
+  let backend = newBackend(biLibvirt)
+  if opts.baseline.len == 0:
+    raise newException(ValueError,
+      "ephemeral-destroy: --baseline is required")
+  let lb = LibvirtBackend(backend)
+  var extra = initTable[string, string]()
+  extra["libvirtUri"] = lb.libvirtUri
+  extra["domain"] = opts.baseline
+  extra["ephemeral"] = "true"
+  extra["overlayPath"] = lb.overlayPathFor(opts.baseline)
+  # The config-drive ISO + per-job OVMF nvram are per-job artifacts named
+  # after the domain; point stopAndCleanup at their deterministic paths so
+  # they are removed only if present (a tiny-Linux clone has neither).
+  extra["configDriveIso"] = lb.configDriveIsoPathFor(opts.baseline)
+  extra["uefiNvram"] = lb.imagePoolDir / (opts.baseline & "_VARS.fd")
+  let vm = VmHandle(
+    backend: lb,
+    name: opts.baseline,
+    baseline: opts.goldenImage,
+    ipAddress: none(string),
+    sshPort: lb.sshPort,
+    sshUser: lb.sshUser,
+    sshAuth: SshAuth(kind: saNone),
+    extra: extra)
+  lb.stopAndCleanup(vm, deleteVm = true)
+  logEvent(opts.logFormat, "info", "ephemeral clone: destroyed",
+           {"name": opts.baseline})
+  0
+
 proc cmdRun(opts: CliOpts): int =
+  if opts.ephemeral:
+    return cmdRunEphemeral(opts)
   let (id, backend) = resolveBackend(opts)
   if opts.baseline.len == 0:
     raise newException(ValueError, "run: --baseline is required")
@@ -498,17 +813,20 @@ proc cmdBackends(opts: CliOpts): int =
     let host = case id
                of biNoop: "any"
                of biHyperv, biWsl: "windows"
-               of biTartMacos, biTartLinuxArm, biUtmWindowsArm: "macos-arm"
+               of biTartMacos, biTartLinuxArm, biUtmWindowsArm,
+                  biQemuWindowsArm: "macos-arm"
                of biLibvirt, biLima: "linux/macos"
+               of biIncus: "linux"
     let guests = case id
                  of biNoop: "any"
                  of biHyperv: "linux,windows"
                  of biWsl: "linux"
                  of biTartMacos: "macos"
                  of biTartLinuxArm: "linux"
-                 of biUtmWindowsArm: "windows"
+                 of biUtmWindowsArm, biQemuWindowsArm: "windows"
                  of biLibvirt: "linux,windows"
                  of biLima: "linux"
+                 of biIncus: "linux"
     let marker = if registered: "*" else: " "
     echo($id & marker & " ".repeat(max(1, 20 - len($id) - 1)) & host &
          " ".repeat(max(1, 14 - host.len)) & guests)
@@ -637,6 +955,7 @@ proc runCli*(args: seq[string]): int =
     return 0
   of "provision": return cmdProvision(opts)
   of "run":       return cmdRun(opts)
+  of "ephemeral-destroy": return cmdEphemeralDestroy(opts)
   of "probe":     return cmdProbe(opts)
   of "backends":  return cmdBackends(opts)
   of "shell":     return cmdShell(opts)

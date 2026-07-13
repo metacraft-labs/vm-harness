@@ -7,7 +7,7 @@
 ## merges stderr into stdout so the parser must be tolerant of those
 ## warnings interleaved with real rows.
 
-import std/[unittest]
+import std/[os, times, unittest]
 import vm_harness
 
 suite "utm output parsers":
@@ -92,3 +92,20 @@ NOTE: utmctl does not work ...
     let ips = parseIpAddressOutput(raw)
     check ips.len == 2
     check ips[0] == "192.168.64.42"
+
+  test "probeAvailability: silent hung utmctl returns false promptly":
+    when defined(macosx):
+      let script = getTempDir() / "vmh-utmctl-hang-" &
+                   $getCurrentProcessId() & ".sh"
+      writeFile(script, "#!/bin/sh\nexec /bin/sleep 5\n")
+      try:
+        setFilePermissions(script, {fpUserRead, fpUserWrite, fpUserExec})
+        let b = newUtmBackend(utmctlCmd = script, probeTimeoutSec = 1)
+        let started = epochTime()
+        check not b.probeAvailability()
+        check epochTime() - started < 3.0
+      finally:
+        try: removeFile(script)
+        except CatchableError: discard
+    else:
+      skip()

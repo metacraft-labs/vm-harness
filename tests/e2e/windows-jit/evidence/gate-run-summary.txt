@@ -1,0 +1,7 @@
+[m3-gate] PASS (a): JIT credentials fetched under the per-instance JWT
+[m3-gate] PASS (a'): no-JWT credentials pull rejected (401)
+[m3-gate] PASS (b): injected .runner/.credentials consumed; Runner.Listener launched
+[m3-gate] PASS (c): Runner.Listener read the JIT config + attempted a runner session
+[m3-gate] PASS (c'): runner connected to the mock Actions server (connectionData)
+[m3-gate] PASS (d): no residual domain/overlay/config-drive/nvram; golden intact
+M3_GATE_PASS

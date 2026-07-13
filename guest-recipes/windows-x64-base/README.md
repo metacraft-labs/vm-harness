@@ -9,7 +9,7 @@ scripts that produce one.
 
 The recipe is the x86_64-on-Linux sibling of `windows-arm-base/`
 (which targets UTM on macOS). It exists so the windows-runner-001
-prototype on `solunska-server` can be brought up by a single
+prototype on `high-mem-server` can be brought up by a single
 `vm-harness provision --backend libvirt` invocation.
 
 ## What you get
@@ -75,8 +75,8 @@ Inside the vm-harness dev shell (`nix develop`):
 which virsh virt-install qemu-img genisoimage curl
 ```
 
-If you're on `solunska-server`, libvirtd is already enabled (see
-`infra/machines/server/solunska-server/configuration.nix`); on any
+If you're on `high-mem-server`, libvirtd is already enabled (see
+`infra/machines/server/high-mem-server/configuration.nix`); on any
 other Linux host:
 
 ```bash

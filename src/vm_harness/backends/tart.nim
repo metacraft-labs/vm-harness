@@ -75,7 +75,7 @@ type
       ## How long ``tart ip --wait`` polls for the auto-assigned IP.
       ## Default 90.
     sshReadyTimeoutSec*: int
-      ## How long to retry the post-IP SSH-ready probe. Default 60.
+      ## How long to retry the post-IP SSH-ready probe. Default 180.
     ephemeralPids*: Table[string, int]
       ## VM name → pid of the ``tart run --no-graphics`` background process.
       ## Stored so ``stopAndCleanup`` can issue an extra ``kill`` if the
@@ -95,6 +95,15 @@ const
   DefaultCirrusLabsPassword* = "admin"
   DefaultEphemeralPrefixMacos* = "repro-vm-tart-macos"
   DefaultEphemeralPrefixLinuxArm* = "repro-vm-tart-linux"
+
+when defined(macosx):
+  const
+    DefaultTartSshCmd* = "/usr/bin/ssh"
+    DefaultTartScpCmd* = "/usr/bin/scp"
+else:
+  const
+    DefaultTartSshCmd* = "ssh"
+    DefaultTartScpCmd* = "scp"
 
 proc defaultSharedDirs(guestOs: GuestOs): seq[TartSharedDir] =
   let nixStore = getEnv("MCL_RUNNER_SHARED_NIX_STORE")
@@ -119,14 +128,14 @@ proc newTartBackend*(guestOs: GuestOs = goLinux,
                      goldenImage: string = "",
                      tartCmd: string = "tart",
                      sshpassCmd: string = "sshpass",
-                     sshCmd: string = "ssh",
-                     scpCmd: string = "scp",
+                     sshCmd: string = DefaultTartSshCmd,
+                     scpCmd: string = DefaultTartScpCmd,
                      sshUser: string = DefaultCirrusLabsUser,
                      sshPassword: string = DefaultCirrusLabsPassword,
                      sshPort: int = 22,
                      ephemeralPrefix: string = "",
                      bootTimeoutSec: int = 90,
-                     sshReadyTimeoutSec: int = 60): TartBackend =
+                     sshReadyTimeoutSec: int = 180): TartBackend =
   ## Construct a TartBackend. ``guestOs`` selects which of the two
   ## registered IDs (``biTartMacos`` / ``biTartLinuxArm``) the resulting
   ## backend identifies as; the corresponding default golden image is
@@ -186,6 +195,21 @@ proc runProcessCapture(cmd: seq[string], cwd: string = "",
   if cmd.len == 0:
     raise newException(ValueError, "runProcessCapture: empty cmd")
   let start = epochTime()
+  var processCmd = cmd
+  # PipeStream.readData() is blocking.  A silent command waiting on Tart's
+  # storage flock therefore prevents the polling loop below from observing its
+  # deadline.  On the managed macOS hosts GNU coreutils `timeout` is available;
+  # put it outside the child so the pipe is closed at the real deadline even
+  # when Tart produces no output at all.
+  when defined(posix):
+    if timeoutSec > 0:
+      let timeoutCmd = findExe("timeout")
+      if timeoutCmd.len > 0:
+        # Keep argv[0] as `timeout`: recent Nix coreutils uses a multicall
+        # binary and Nim may otherwise resolve the symlink to `coreutils`,
+        # which requires an extra applet-name argument.
+        processCmd = @["timeout", "--signal=TERM", "--kill-after=5s",
+                       $timeoutSec] & cmd
   var procEnv: StringTableRef = nil
   if env.len > 0:
     procEnv = newStringTable(modeStyleInsensitive)
@@ -195,7 +219,8 @@ proc runProcessCapture(cmd: seq[string], cwd: string = "",
                {poUsePath, poStdErrToStdOut}
              else:
                {poUsePath}
-  var p = startProcess(cmd[0], workingDir = cwd, args = cmd[1 .. ^1],
+  var p = startProcess(processCmd[0], workingDir = cwd,
+                       args = processCmd[1 .. ^1],
                        env = procEnv, options = opts)
   defer: p.close()
   let outStream = p.outputStream
@@ -235,6 +260,8 @@ proc runProcessCapture(cmd: seq[string], cwd: string = "",
           elapsedMs: int((epochTime() - start) * 1000))
       sleep(50)
   let code = p.waitForExit(timeout = -1)
+  if code == 124 and timeoutSec > 0:
+    stderr.add("vm-harness: process timed out after " & $timeoutSec & "s")
   ExecResult(
     exitCode: code,
     stdout: stdout,
@@ -274,13 +301,23 @@ proc deleteTartVm*(b: TartBackend, name: string) =
   discard runProcessCapture(@[b.tartCmd, "delete", name], timeoutSec = 30)
 
 proc cloneTartVm*(b: TartBackend, srcRef: string, ephemeral: string) =
-  ## ``tart clone <src> <dst>``. Raises on failure since revert can't
-  ## continue without the clone.
+  ## ``tart clone <src> <dst>`` followed by ``tart set --random-mac``.
+  ## Tart clones inherit the source VM's MAC address.  Concurrent clones of
+  ## one golden would therefore share a DHCP lease, causing ``tart ip`` to
+  ## resolve both names to the same guest.  Every ephemeral needs a distinct
+  ## MAC before it is started.
   let r = runProcessCapture(@[b.tartCmd, "clone", srcRef, ephemeral],
                             timeoutSec = 300)
   if r.exitCode != 0:
     raise newVmHarnessError($b.id, lpRevert,
       "tart clone failed: " & r.stdout & r.stderr)
+  let randomMac = runProcessCapture(
+    @[b.tartCmd, "set", ephemeral, "--random-mac"], timeoutSec = 30)
+  if randomMac.exitCode != 0:
+    b.deleteTartVm(ephemeral)
+    raise newVmHarnessError($b.id, lpRevert,
+      "tart set --random-mac failed: " &
+      randomMac.stdout & randomMac.stderr)
 
 proc pullTartImage*(b: TartBackend, imageRef: string) =
   ## ``tart pull <ref>``. Idempotent — Tart's OCI cache means re-pulling a
@@ -311,12 +348,28 @@ proc runTartVmInBackground*(b: TartBackend, name: string): int =
   args.add(name)
   let p = startProcess(b.tartCmd,
                        args = args,
-                       options = {poUsePath, poParentStreams, poDaemon})
+                       options = {poUsePath, poParentStreams})
   result = p.processID
-  # Don't close(p): closing detaches our handle, but the process keeps
-  # running. We can't waitForExit either — that would block until tart
-  # stop. Just drop the handle; the OS keeps the child alive.
+  # Do not use poDaemon here.  The provider launches vm-harness in a dedicated
+  # process group and tears an instance down with kill(-vmHarnessPid).  A daemon
+  # starts a new session, escaping that group and leaking `tart run` after GARM
+  # deletes the instance.  The leaked process can retain Tart's global storage
+  # lock and block every later clone on the host.  A normal background child
+  # remains concurrent while inheriting the provider-owned process group.
+  # Don't close(p): closing detaches our handle, but the process keeps running.
+  # We can't waitForExit either — that would block until tart stop. Just drop
+  # the handle; the OS keeps the child alive.
   # Nim's startProcess returns a ref that we let go of.
+
+proc terminateTartRun(b: TartBackend, name: string) =
+  ## Terminate the background `tart run` child and forget its bookkeeping.
+  ## This is the failure-path counterpart to the graceful `tart stop` used
+  ## after a successful runner job.
+  if name in b.ephemeralPids:
+    let pid = b.ephemeralPids[name]
+    when defined(posix):
+      discard execShellCmd("kill " & $pid & " 2>/dev/null || true")
+    b.ephemeralPids.del(name)
 
 proc tartIpWait*(b: TartBackend, name: string,
                 waitSec: int = 90): string =
@@ -537,12 +590,22 @@ method revertToBaseline*(b: TartBackend, baselineName: string): VmHandle =
   b.cloneTartVm(b.goldenImage, ephemeral)
   let pid = b.runTartVmInBackground(ephemeral)
   b.ephemeralPids[ephemeral] = pid
-  let ip = b.tartIpWait(ephemeral, b.bootTimeoutSec)
+  var ip: string
+  try:
+    ip = b.tartIpWait(ephemeral, b.bootTimeoutSec)
+  except CatchableError:
+    # `tart run` can fail before the VM reaches networking (for example while
+    # macOS initialises its GUI-session frameworks). Do not leave that child
+    # alive: an orphan can hold Tart's storage lock and block every later
+    # clone on the host.
+    b.terminateTartRun(ephemeral)
+    b.deleteTartVm(ephemeral)
+    raise
   if not b.waitForSshReady(ip, b.sshReadyTimeoutSec):
     # SSH didn't come up; clean up before raising so callers don't have to.
     b.stopTartVm(ephemeral)
     b.deleteTartVm(ephemeral)
-    b.ephemeralPids.del(ephemeral)
+    b.terminateTartRun(ephemeral)
     raise (ref GuestBootFailureError)(
       msg: "TartBackend: SSH did not become ready on " & ip &
            " within " & $b.sshReadyTimeoutSec & "s",
@@ -562,7 +625,7 @@ method revertToBaseline*(b: TartBackend, baselineName: string): VmHandle =
     except CatchableError:
       b.stopTartVm(ephemeral)
       b.deleteTartVm(ephemeral)
-      b.ephemeralPids.del(ephemeral)
+      b.terminateTartRun(ephemeral)
       raise
   result = handle
 
@@ -605,7 +668,19 @@ method execInGuest*(b: TartBackend, vm: VmHandle,
   # stderr; SSH already does the right thing forwarding stderr from the
   # guest to its own stderr.
   if stdin.len == 0:
-    return runProcessCapture(sshCmd, timeoutSec = timeoutSec)
+    var last = ExecResult(exitCode: -1)
+    for attempt in 1 .. 5:
+      last = runProcessCapture(sshCmd, timeoutSec = timeoutSec)
+      let output = (last.stdout & last.stderr).toLowerAscii()
+      if last.exitCode != 255 or "permission denied" notin output:
+        return last
+      if attempt < 5:
+        # Tart guests can briefly reject the next password-authenticated SSH
+        # session after a successful SCP while sshd/PAM settles. Retrying only
+        # pre-execution authentication failures is safe: the remote command
+        # has not started, so it cannot be duplicated.
+        sleep(2000)
+    return last
   # Stdin path — same as runProcessCapture but writes `stdin` first.
   let start = epochTime()
   var p = startProcess(sshCmd[0], args = sshCmd[1 .. ^1],
@@ -637,7 +712,11 @@ method execInGuest*(b: TartBackend, vm: VmHandle,
 proc scpCopy*(b: TartBackend, host: string, src: string, dest: string,
               toGuest: bool, recursive: bool = true,
               timeoutSec: int = 600) =
-  ## Internal helper used by both copyToGuest and copyFromGuest.
+  ## Internal helper used by both copyToGuest and copyFromGuest.  A freshly
+  ## booted macOS guest can accept the SSH readiness probe and briefly reject
+  ## the immediately following SCP while launchd finishes settling sshd/PAM.
+  ## Retry within the caller's timeout instead of abandoning an otherwise
+  ## healthy ephemeral runner after one transient authentication failure.
   let pwdFile = writePasswordFile(b.sshPassword)
   defer:
     try: removeFile(pwdFile)
@@ -660,12 +739,22 @@ proc scpCopy*(b: TartBackend, host: string, src: string, dest: string,
   else:
     args.add(b.sshUser & "@" & host & ":" & src)
     args.add(dest)
-  let r = runProcessCapture(args, timeoutSec = timeoutSec)
-  if r.exitCode != 0:
-    raise newVmHarnessError($b.id, lpCopy,
-      "scp " & (if toGuest: "to" else: "from") &
-      " " & host & " failed (exit " & $r.exitCode & "): " &
-      r.stdout & r.stderr)
+  let deadline = epochTime() + timeoutSec.float
+  var last = ExecResult(exitCode: -1)
+  var attempt = 0
+  while epochTime() < deadline:
+    inc attempt
+    let remaining = max(1, int(deadline - epochTime()))
+    last = runProcessCapture(args, timeoutSec = min(30, remaining))
+    if last.exitCode == 0:
+      return
+    if attempt >= 5:
+      break
+    sleep(2000)
+  raise newVmHarnessError($b.id, lpCopy,
+    "scp " & (if toGuest: "to" else: "from") &
+    " " & host & " failed after " & $attempt & " attempts (exit " &
+    $last.exitCode & "): " & last.stdout & last.stderr)
 
 method copyToGuest*(b: TartBackend, vm: VmHandle,
                    hostPath: string, guestPath: string) =
@@ -780,12 +869,7 @@ method stopAndCleanup*(b: TartBackend, vm: VmHandle, deleteVm: bool = true) =
     if deleteVm:
       b.deleteTartVm(vm.name)
     # Cleanup the background `tart run` process if it's still alive.
-    if vm.name in b.ephemeralPids:
-      let pid = b.ephemeralPids[vm.name]
-      when defined(posix):
-        # SIGTERM the process group; ignore errors.
-        discard execShellCmd("kill " & $pid & " 2>/dev/null || true")
-      b.ephemeralPids.del(vm.name)
+    b.terminateTartRun(vm.name)
   except CatchableError:
     discard
 

@@ -4,7 +4,7 @@ OS-bootstrap recipes that produce baseline images for each backend. M0
 ships the empty skeleton; M3 onward fills it in:
 
 - `windows-arm-base/` — M3 (UTM Windows ARM autounattend.xml + ISO
-  assembly recipe).
+  assembly recipe, including an offline Win32-OpenSSH ARM64 fallback).
 - `ubuntu-server-base/` — M4 (libvirt + cloud-init seed).
 - `tart-macos-customized/` — M18 (AH-branded macOS golden via Packer).
 

@@ -7,7 +7,7 @@ libvirt/QEMU adapter to vm-harness so Linux hosts can manage Windows
 or Linux guests through the same `VmBackend` contract every other
 backend implements. The first slice of M4 (Phase A — this document's
 subject) targets the windows-runner-001 prototype on
-`solunska-server`: a single libvirt-managed Win11 24H2 Pro guest
+`high-mem-server`: a single libvirt-managed Win11 24H2 Pro guest
 running a self-hosted GitHub Actions runner. Per-gate snapshot
 revert, GPU passthrough, and SR-IOV are out of scope for Phase A.
 
@@ -43,7 +43,7 @@ discover the gap loudly instead of seeing a silent no-op.
 
 The narrow, load-bearing use case is:
 
-1. An operator runs `vm-harness provision` on `solunska-server`
+1. An operator runs `vm-harness provision` on `high-mem-server`
    (Linux host with KVM + libvirtd).
 2. The harness invokes `virt-install` against the Win11 ISO + the
    autounattend ISO + the virtio-win driver ISO and waits for the
@@ -66,7 +66,7 @@ is `revertToBaseline + execInGuest + copyFromGuest`.
 ### Provision the windows-runner-001 baseline
 
 ```bash
-# On solunska-server (or any host with libvirtd + KVM):
+# On high-mem-server (or any host with libvirtd + KVM):
 vm-harness provision \
     --backend libvirt \
     --recipe windows-x64-base \
@@ -106,7 +106,7 @@ vm-harness run \
 
 ```bash
 vm-harness probe
-# Expected on solunska-server:
+# Expected on high-mem-server:
 #   {"id":"libvirt","available":true,"host":"linux", ...}
 ```
 
@@ -174,7 +174,7 @@ virsh --connect qemu:///system shutdown windows-runner-001
 - USB device passthrough.
 
 Phase C is gated on a host with the right hardware
-(`solunska-server` has neither a discrete GPU nor SR-IOV-capable
+(`high-mem-server` has neither a discrete GPU nor SR-IOV-capable
 NIC, so the work waits for an applicable runner host).
 
 ## Related files

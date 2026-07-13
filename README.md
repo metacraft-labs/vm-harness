@@ -28,9 +28,24 @@ Shipped milestones:
 - **M4 Phase A slice — libvirt / QEMU/KVM** (`src/vm_harness/backends/libvirt.nim`).
   Linux host, x86_64 Windows or Linux guests via `virt-install` +
   `virsh`. Targets the windows-runner-001 prototype on
-  `solunska-server`. See `docs/m4-libvirt.md` for Phase B/C scope.
+  `high-mem-server`. See `docs/m4-libvirt.md` for Phase B/C scope.
 - **M5 — Lima** (`src/vm_harness/backends/lima.nim`). macOS / Linux
   host, Linux guest via `limactl`.
+- **Incus — Linux system containers** (`src/vm_harness/backends/incus.nim`).
+  Linux host, Linux guest via the `incus` CLI. Ephemeral per-job
+  containers: `incus launch <base> <name>` → `incus exec` probe →
+  `incus delete --force` (no residual container or storage volume).
+  Sub-second launch, no `/dev/kvm` needed — the container analog of the
+  libvirt per-job CoW-clone path. `provisionEphemeralClone` leaves a
+  cloud-init `user-data` injection seam (`incus config set <name>
+  cloud-init.user-data ...`) for the GARM JIT bootstrap. The base image
+  is pinned locally (`incus image copy images:debian/12 local: --alias
+  vmh-base`); the daemon is initialized declaratively via the host's
+  NixOS `virtualisation.incus` config (storage pool + `incusbr0` NAT),
+  and the runner/service user is in the `incus-admin` group for socket
+  access. In a session that pre-dates the group grant, export
+  `VMH_INCUS_CMD="sudo -n incus"`. Gate:
+  `tests/e2e/t_vmharness_incus_ephemeral_run.nim`.
 
 Cross-cutting infrastructure that ships across all of the above:
 

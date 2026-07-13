@@ -32,7 +32,7 @@ VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/sta
 VIRTIO_OUT="${BUILD_DIR}/virtio-win.iso"
 
 # Default path the operator is expected to place the Win11 ISO at.
-# `solunska-server` already uses this exact convention per
+# `high-mem-server` already uses this exact convention per
 # infra/machines/server/_windows-runner-001/README.md.
 DEFAULT_WIN11_ISO_PATH="/storage/iso/Win11_24H2_EnglishInternational_x64.iso"
 WIN11_ISO_PATH="${VMH_WIN11_X64_ISO:-${DEFAULT_WIN11_ISO_PATH}}"

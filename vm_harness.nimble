@@ -22,6 +22,8 @@ task test, "Run the vm-harness test suite":
   exec "nim r --hints:off tests/unit/t_wsl_parsers.nim"
   exec "nim r --hints:off tests/unit/t_utm_parsers.nim"
   exec "nim r --hints:off tests/unit/t_tart_shared_dirs.nim"
+  exec "nim r --hints:off tests/unit/t_qemu_windows_arm_backend.nim"
+  exec "nim r --hints:off tests/unit/t_tart_backend.nim"
   # M0 integration / e2e (NoopBackend; runs on any platform).
   exec "nim r --hints:off tests/integration/t_noop_lifecycle.nim"
   exec "nim r --hints:off tests/e2e/t_vm_harness_smoke.nim"
@@ -60,6 +62,37 @@ task test, "Run the vm-harness test suite":
   # command (--recipe / --name / --vcpu / --memory-gb / --network-bridge
   # / --first-boot-script). NoopBackend-style: no virsh, no libvirtd.
   exec "nim r --hints:off tests/integration/t_cli_libvirt_flags.nim"
+  # Campaign M2 — libvirt per-job ephemeral CoW-clone reset gate. Boots
+  # a FRESH per-job VM from a small Linux golden on REAL libvirt + KVM,
+  # probes the serial boot marker, tears it down (no residue), and
+  # asserts two-run independence. Self-skips cleanly unless
+  # VMH_GOLDEN_TINY points at a `golden-linux-tiny` bundle AND /dev/kvm +
+  # a reachable libvirtd (LIBVIRT_DEFAULT_URI=qemu:///session) are
+  # present. Build the golden with `nix build .#golden-linux-tiny`.
+  exec "nim r --hints:off tests/e2e/t_vmharness_libvirt_ephemeral_run.nim"
+  # Campaign M3 — Windows golden + cloudbase-init config-drive JIT injection
+  # gate. Boots a FRESH per-job CoW clone of the cloudbase-init Windows
+  # golden on REAL libvirt + KVM (UEFI/OVMF) with an INJECTED config-drive
+  # carrying the GARM Windows JIT bootstrap, drives it against a MOCK GARM
+  # metadata+actions endpoint (per-instance JWT), and asserts the runner
+  # fetches the JIT credentials under the JWT + launches Runner.Listener +
+  # attempts a runner session, then tears the clone down with no residue.
+  # Self-skips unless the golden (VMH_WIN_GOLDEN) + OVMF + /dev/kvm + a
+  # system libvirtd + python3/sshpass/genisoimage are present. NEVER touches
+  # windows-runner-001.
+  exec "nim r --hints:off tests/e2e/t_windows_golden_jit_boot.nim"
+  # Campaign IM1 — Incus per-job ephemeral CONTAINER reset gate. Launches
+  # a FRESH per-job container from the small `vmh-base` (Debian 12) image
+  # on REAL Incus, runs an in-guest `incus exec` probe, tears it down with
+  # `incus delete --force` (no residual container, no residual storage
+  # volume), and asserts two-run independence (a marker file written into
+  # run 1's guest is absent in run 2's fresh container). Fast, no /dev/kvm.
+  # Self-skips cleanly unless the Incus daemon is reachable (set
+  # VMH_INCUS_CMD="sudo incus" if the incus-admin group isn't active in the
+  # session) AND the base image is present (pull via
+  # `incus image copy images:debian/12 local: --alias vmh-base`). NEVER
+  # touches windows-runner-001 or unrelated production containers.
+  exec "nim r --hints:off tests/e2e/t_vmharness_incus_ephemeral_run.nim"
 
 task buildCli, "Build the vm-harness CLI binary":
   exec "nim c --hints:off -o:build/bin/vm-harness src/vm_harness/cli.nim"
