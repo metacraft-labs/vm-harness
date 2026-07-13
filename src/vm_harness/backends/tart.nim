@@ -453,23 +453,32 @@ proc mountMacosSharedDirs*(b: TartBackend, vm: VmHandle) =
   if vm.ipAddress.isNone:
     raise newVmHarnessError($b.id, lpStartup,
       "TartBackend: cannot mount shared directories without VM IP address")
+  var needsSyntheticNix = false
+  for d in b.sharedDirs:
+    if d.guestPath == "/nix" or d.guestPath.startsWith("/nix/"):
+      needsSyntheticNix = true
   var lines: seq[string] = @[
     "exec >/tmp/vm-harness-mount-shares.log 2>&1",
     "set -x",
     "set -eu",
-    "sleep 3",
-    "if [ ! -e /nix ]; then",
-    "  sudo -n mkdir -p /System/Volumes/Data/nix",
-    "  if [ ! -f /etc/synthetic.conf ] || ! grep -q '^nix[[:space:]]' /etc/synthetic.conf; then",
-    "    printf \"nix\\tSystem/Volumes/Data/nix\\n\" | sudo -n tee -a /etc/synthetic.conf >/dev/null",
-    "  fi",
-    "  sudo -n /System/Library/Filesystems/apfs.fs/Contents/Resources/apfs.util -t || true",
-    "  if [ ! -e /nix ]; then",
-    "    echo \"synthetic /nix was not materialized\" >&2",
-    "    exit 1",
-    "  fi",
-    "fi"
+    "sleep 3"
   ]
+  # Only the optional host-Nix-store share needs a synthetic /nix root. A
+  # repro-store-only runner may already have a real APFS-backed /nix volume;
+  # rewriting synthetic.conf in that guest replaces it with a symlink and
+  # makes modern Nix reject the store on the next bootstrap.
+  if needsSyntheticNix:
+    lines.add("if [ ! -e /nix ]; then")
+    lines.add("  sudo -n mkdir -p /System/Volumes/Data/nix")
+    lines.add("  if [ ! -f /etc/synthetic.conf ] || ! grep -q '^nix[[:space:]]' /etc/synthetic.conf; then")
+    lines.add("    printf \"nix\\tSystem/Volumes/Data/nix\\n\" | sudo -n tee -a /etc/synthetic.conf >/dev/null")
+    lines.add("  fi")
+    lines.add("  sudo -n /System/Library/Filesystems/apfs.fs/Contents/Resources/apfs.util -t || true")
+    lines.add("  if [ ! -e /nix ]; then")
+    lines.add("    echo \"synthetic /nix was not materialized\" >&2")
+    lines.add("    exit 1")
+    lines.add("  fi")
+    lines.add("fi")
   for d in b.sharedDirs:
     lines.add("sudo -n mkdir -p " & d.guestPath)
     lines.add("attempt=1")
