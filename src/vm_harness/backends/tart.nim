@@ -96,9 +96,12 @@ const
   DefaultEphemeralPrefixMacos* = "repro-vm-tart-macos"
   DefaultEphemeralPrefixLinuxArm* = "repro-vm-tart-linux"
 
-proc defaultSharedDirs(): seq[TartSharedDir] =
+proc defaultSharedDirs(guestOs: GuestOs): seq[TartSharedDir] =
   let nixStore = getEnv("MCL_RUNNER_SHARED_NIX_STORE")
-  if nixStore.len > 0 and dirExists(nixStore):
+  # A raw read-only store cannot back a fresh macOS Nix installation: there is
+  # no host daemon for writes, and exposing it through synthetic.conf makes
+  # /nix a symlink that current Nix rejects during evaluation.
+  if guestOs != goMacos and nixStore.len > 0 and dirExists(nixStore):
     result.add(TartSharedDir(
       tag: "mcl-nix-store",
       hostPath: nixStore,
@@ -169,7 +172,7 @@ proc newTartBackend*(guestOs: GuestOs = goLinux,
     bootTimeoutSec: bootTimeoutSec,
     sshReadyTimeoutSec: sshReadyTimeoutSec,
     ephemeralPids: initTable[string, int](),
-    sharedDirs: defaultSharedDirs())
+    sharedDirs: defaultSharedDirs(guestOs))
 
 # ---------------------------------------------------------------------------
 # Process helper. Same shape as the helper used by hyperv.nim and wsl.nim
@@ -400,23 +403,31 @@ proc mountMacosSharedDirs*(b: TartBackend, vm: VmHandle) =
   if vm.ipAddress.isNone:
     raise newVmHarnessError($b.id, lpStartup,
       "TartBackend: cannot mount shared directories without VM IP address")
+  var needsNixRoot = false
+  for d in b.sharedDirs:
+    if d.guestPath == "/nix" or d.guestPath.startsWith("/nix/"):
+      needsNixRoot = true
+      break
   var lines: seq[string] = @[
     "exec >/tmp/vm-harness-mount-shares.log 2>&1",
     "set -x",
     "set -eu",
-    "sleep 3",
-    "if [ ! -e /nix ]; then",
-    "  sudo -n mkdir -p /System/Volumes/Data/nix",
-    "  if [ ! -f /etc/synthetic.conf ] || ! grep -q '^nix[[:space:]]' /etc/synthetic.conf; then",
-    "    printf \"nix\\tSystem/Volumes/Data/nix\\n\" | sudo -n tee -a /etc/synthetic.conf >/dev/null",
-    "  fi",
-    "  sudo -n /System/Library/Filesystems/apfs.fs/Contents/Resources/apfs.util -t || true",
-    "  if [ ! -e /nix ]; then",
-    "    echo \"synthetic /nix was not materialized\" >&2",
-    "    exit 1",
-    "  fi",
-    "fi"
+    "sleep 3"
   ]
+  if needsNixRoot:
+    lines.add(@[
+      "if [ ! -e /nix ]; then",
+      "  sudo -n mkdir -p /System/Volumes/Data/nix",
+      "  if [ ! -f /etc/synthetic.conf ] || ! grep -q '^nix[[:space:]]' /etc/synthetic.conf; then",
+      "    printf \"nix\\tSystem/Volumes/Data/nix\\n\" | sudo -n tee -a /etc/synthetic.conf >/dev/null",
+      "  fi",
+      "  sudo -n /System/Library/Filesystems/apfs.fs/Contents/Resources/apfs.util -t || true",
+      "  if [ ! -e /nix ]; then",
+      "    echo \"synthetic /nix was not materialized\" >&2",
+      "    exit 1",
+      "  fi",
+      "fi"
+    ])
   for d in b.sharedDirs:
     lines.add("sudo -n mkdir -p " & d.guestPath)
     lines.add("attempt=1")
