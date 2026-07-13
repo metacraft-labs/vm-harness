@@ -123,7 +123,7 @@ proc newTartBackend*(guestOs: GuestOs = goLinux,
                      sshPort: int = 22,
                      ephemeralPrefix: string = "",
                      bootTimeoutSec: int = 90,
-                     sshReadyTimeoutSec: int = 60): TartBackend =
+                     sshReadyTimeoutSec: int = 180): TartBackend =
   ## Construct a TartBackend. ``guestOs`` selects which of the two
   ## registered IDs (``biTartMacos`` / ``biTartLinuxArm``) the resulting
   ## backend identifies as; the corresponding default golden image is
