@@ -183,6 +183,21 @@ proc runProcessCapture(cmd: seq[string], cwd: string = "",
   if cmd.len == 0:
     raise newException(ValueError, "runProcessCapture: empty cmd")
   let start = epochTime()
+  var processCmd = cmd
+  # PipeStream.readData() is blocking.  A silent command waiting on Tart's
+  # storage flock therefore prevents the polling loop below from observing its
+  # deadline.  On the managed macOS hosts GNU coreutils `timeout` is available;
+  # put it outside the child so the pipe is closed at the real deadline even
+  # when Tart produces no output at all.
+  when defined(posix):
+    if timeoutSec > 0:
+      let timeoutCmd = findExe("timeout")
+      if timeoutCmd.len > 0:
+        # Keep argv[0] as `timeout`: recent Nix coreutils uses a multicall
+        # binary and Nim may otherwise resolve the symlink to `coreutils`,
+        # which requires an extra applet-name argument.
+        processCmd = @["timeout", "--signal=TERM", "--kill-after=5s",
+                       $timeoutSec] & cmd
   var procEnv: StringTableRef = nil
   if env.len > 0:
     procEnv = newStringTable(modeStyleInsensitive)
@@ -192,7 +207,8 @@ proc runProcessCapture(cmd: seq[string], cwd: string = "",
                {poUsePath, poStdErrToStdOut}
              else:
                {poUsePath}
-  var p = startProcess(cmd[0], workingDir = cwd, args = cmd[1 .. ^1],
+  var p = startProcess(processCmd[0], workingDir = cwd,
+                       args = processCmd[1 .. ^1],
                        env = procEnv, options = opts)
   defer: p.close()
   let outStream = p.outputStream
@@ -232,6 +248,8 @@ proc runProcessCapture(cmd: seq[string], cwd: string = "",
           elapsedMs: int((epochTime() - start) * 1000))
       sleep(50)
   let code = p.waitForExit(timeout = -1)
+  if code == 124 and timeoutSec > 0:
+    stderr.add("vm-harness: process timed out after " & $timeoutSec & "s")
   ExecResult(
     exitCode: code,
     stdout: stdout,
@@ -318,11 +336,17 @@ proc runTartVmInBackground*(b: TartBackend, name: string): int =
   args.add(name)
   let p = startProcess(b.tartCmd,
                        args = args,
-                       options = {poUsePath, poParentStreams, poDaemon})
+                       options = {poUsePath, poParentStreams})
   result = p.processID
-  # Don't close(p): closing detaches our handle, but the process keeps
-  # running. We can't waitForExit either — that would block until tart
-  # stop. Just drop the handle; the OS keeps the child alive.
+  # Do not use poDaemon here.  The provider launches vm-harness in a dedicated
+  # process group and tears an instance down with kill(-vmHarnessPid).  A daemon
+  # starts a new session, escaping that group and leaking `tart run` after GARM
+  # deletes the instance.  The leaked process can retain Tart's global storage
+  # lock and block every later clone on the host.  A normal background child
+  # remains concurrent while inheriting the provider-owned process group.
+  # Don't close(p): closing detaches our handle, but the process keeps running.
+  # We can't waitForExit either — that would block until tart stop. Just drop
+  # the handle; the OS keeps the child alive.
   # Nim's startProcess returns a ref that we let go of.
 
 proc tartIpWait*(b: TartBackend, name: string,

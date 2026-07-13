@@ -2,11 +2,28 @@ import std/[os, strutils, tempfiles, unittest]
 import vm_harness/backends/tart
 import vm_harness/types
 
+when defined(posix):
+  import std/posix
+
 proc writeExecutable(path, body: string) =
   writeFile(path, body)
   setFilePermissions(path, {fpUserRead, fpUserWrite, fpUserExec})
 
 suite "Tart backend commands":
+  when defined(posix):
+    test "background Tart run remains in the provider-owned process group":
+      let tmp = createTempDir("vmh-tart-unit-", "")
+      defer: removeDir(tmp)
+      let tart = tmp / "tart"
+      writeExecutable(tart, "#!/bin/sh\nexec sleep 60\n")
+
+      let backend = newTartBackend(guestOs = goMacos, tartCmd = tart)
+      let pid = backend.runTartVmInBackground("ephemeral")
+      defer: discard posix.kill(Pid(pid), SIGTERM)
+      sleep(100)
+
+      check getpgid(Pid(pid)) == getpgrp()
+
   test "clone randomizes the ephemeral MAC before boot":
     let tmp = createTempDir("vmh-tart-unit-", "")
     defer: removeDir(tmp)
