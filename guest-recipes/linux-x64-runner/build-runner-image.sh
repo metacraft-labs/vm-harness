@@ -52,6 +52,8 @@
 #   VMH_RUNNER_CACHE    in-image runner dir       (default: /home/<user>/actions-runner)
 #   VMH_RUNNER_DOCKER   bake nested Docker (HR1)  (default: off; set =1)
 #   VMH_RUNNER_KVM      bake nested KVM (HR2)     (default: off; set =1)
+#   VMH_RUNNER_RECIPE_REVISION
+#                       image recipe revision property (default: linux-x64-runner-v1)
 #
 # IM4 note: the cache path MUST match GARM's Linux install template, which
 # looks for a cached runner at exactly `/home/<RunnerUsername>/actions-runner`
@@ -92,6 +94,7 @@ DOCKER_VERSION="${VMH_DOCKER_VERSION:-27.5.1}"
 # the same egress + apt seam as HR1, so VMH_RUNNER_DOCKER=1 VMH_RUNNER_KVM=1
 # bakes BOTH into one image (the `incus-nested` prod class needs both).
 KVM="${VMH_RUNNER_KVM:-}"
+RECIPE_REVISION="${VMH_RUNNER_RECIPE_REVISION:-linux-x64-runner-v1}"
 # Pre-downloaded docker static bundle on the HOST (containers have egress only
 # once a static IP + gateway are configured — see the egress step below); the
 # static bundle is STREAMED in (cat|incus exec tar) rather than `incus file
@@ -415,6 +418,8 @@ if [ -n "$KVM" ]; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends qemu-system-x86 linux-image-cloud-amd64 python3
+    getent group kvm >/dev/null 2>&1 || groupadd kvm
+    usermod -aG kvm '${RUNNER_USER}'
   "
 
   # (b) Smoke: qemu is present + reports a version (offline — the actual
@@ -447,6 +452,7 @@ log "stopping container + publishing image alias '$ALIAS'"
 "${INCUS[@]}" image delete "$ALIAS" >/dev/null 2>&1 || true
 "${INCUS[@]}" publish "$BLD" --alias "$ALIAS" \
   --public=false \
+  --property "vmh.recipe_revision=${RECIPE_REVISION}" \
   description="vmh linux runner: ${CLOUD_BASE} + actions-runner ${RUNNER_VERSION} + cloud-init"
 
 log "done: image '$ALIAS' built"
