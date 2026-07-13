@@ -10,6 +10,12 @@ proc writeExecutable(path, body: string) =
   setFilePermissions(path, {fpUserRead, fpUserWrite, fpUserExec})
 
 suite "Tart backend commands":
+  when defined(macosx):
+    test "defaults to the system OpenSSH transport on macOS":
+      let backend = newTartBackend(guestOs = goMacos)
+      check backend.sshCmd == "/usr/bin/ssh"
+      check backend.scpCmd == "/usr/bin/scp"
+
   when defined(posix):
     test "background Tart run remains in the provider-owned process group":
       let tmp = createTempDir("vmh-tart-unit-", "")
