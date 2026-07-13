@@ -71,7 +71,7 @@
 ## helpers can run anywhere. Backend *registration* is unconditional,
 ## but ``probeAvailability`` returns false on non-Linux hosts.
 
-import std/[options, os, osproc, streams, strtabs,
+import std/[os, osproc, streams, strtabs,
             strutils, tables, times]
 import ../types
 import ../auto

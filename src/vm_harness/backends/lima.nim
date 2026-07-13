@@ -90,10 +90,10 @@ minimumLimaVersion: 2.0.0
 
 base:
 - template:_images/ubuntu-lts
-- template:_default/mounts
 
-# Disable all mounts; vm-harness uses limactl copy for explicit
-# host<->guest file transfer per gate.
+# Do not inherit _default/mounts: Lima merges base lists, so adding
+# `mounts: []` cannot remove the default host-home mount afterward.
+# vm-harness uses limactl copy for explicit host<->guest transfer.
 mounts: []
 
 # Headless: no display, no audio, no port-forward beyond SSH.
@@ -494,7 +494,14 @@ method revertToBaseline*(b: LimaBackend, baselineName: string): VmHandle =
     b.stopLimaInstance(ephemeral)
     b.deleteLimaInstance(ephemeral)
   b.createLimaInstance(ephemeral)
-  b.startLimaInstance(ephemeral)
+  try:
+    b.startLimaInstance(ephemeral)
+  except CatchableError:
+    # Creation succeeded but the guest never became ready. Do not leak a
+    # running VZ/QEMU process or a stale instance into the next test/job.
+    b.stopLimaInstance(ephemeral)
+    b.deleteLimaInstance(ephemeral)
+    raise
   # ``limactl start`` returns after the instance reaches Running; SSH
   # is already up because Lima's start path blocks on hostagent
   # readiness which includes the SSH probe. No extra wait needed.

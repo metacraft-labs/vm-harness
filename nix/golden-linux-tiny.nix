@@ -89,13 +89,27 @@ let
   '';
 
   applets = [
-    "sh" "mount" "insmod" "dd" "tr" "sleep" "poweroff" "mkdir" "sync"
-    "cat" "ln"
+    "sh"
+    "mount"
+    "insmod"
+    "dd"
+    "tr"
+    "sleep"
+    "poweroff"
+    "mkdir"
+    "sync"
+    "cat"
+    "ln"
   ];
 in
 pkgs.runCommand "golden-linux-tiny"
   {
-    nativeBuildInputs = [ pkgs.cpio pkgs.gzip pkgs.xz pkgs.qemu ];
+    nativeBuildInputs = [
+      pkgs.cpio
+      pkgs.gzip
+      pkgs.xz
+      pkgs.qemu
+    ];
     inherit baselineMarker kernelVersion;
   }
   ''

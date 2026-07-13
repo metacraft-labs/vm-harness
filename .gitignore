@@ -1,6 +1,7 @@
 # Build artifacts
 build/
 nimcache/
+/result
 *.exe
 *.dylib
 *.so
@@ -8,8 +9,10 @@ nimcache/
 # Direnv cache
 .direnv/
 .envrc.cache
+.pre-commit-config.yaml
 
 # Test scratch
+test-logs/
 tests/**/*.tmp
 tests/**/nimcache/
 
