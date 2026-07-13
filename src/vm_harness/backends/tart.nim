@@ -657,7 +657,19 @@ method execInGuest*(b: TartBackend, vm: VmHandle,
   # stderr; SSH already does the right thing forwarding stderr from the
   # guest to its own stderr.
   if stdin.len == 0:
-    return runProcessCapture(sshCmd, timeoutSec = timeoutSec)
+    var last = ExecResult(exitCode: -1)
+    for attempt in 1 .. 5:
+      last = runProcessCapture(sshCmd, timeoutSec = timeoutSec)
+      let output = (last.stdout & last.stderr).toLowerAscii()
+      if last.exitCode != 255 or "permission denied" notin output:
+        return last
+      if attempt < 5:
+        # Tart guests can briefly reject the next password-authenticated SSH
+        # session after a successful SCP while sshd/PAM settles. Retrying only
+        # pre-execution authentication failures is safe: the remote command
+        # has not started, so it cannot be duplicated.
+        sleep(2000)
+    return last
   # Stdin path — same as runProcessCapture but writes `stdin` first.
   let start = epochTime()
   var p = startProcess(sshCmd[0], args = sshCmd[1 .. ^1],
