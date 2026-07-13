@@ -73,6 +73,8 @@
 
 import std/[os, osproc, streams, strtabs,
             strutils, tables, times]
+when defined(linux):
+  import std/options
 import ../types
 import ../auto
 
