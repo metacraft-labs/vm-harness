@@ -9,6 +9,8 @@
 
 import std/[algorithm, hashes, net, options, os, osproc, streams,
             strutils, tables, times]
+when defined(posix):
+  import std/posix
 import ../types
 import ../auto
 
@@ -37,6 +39,15 @@ const
   DefaultQemuWindowsArmPrefix* = "repro-vm-qemu-windows-arm"
   DefaultQemuWindowsArmUser* = "admin"
   DefaultQemuWindowsArmPassword* = "repro-windows-arm"
+  QemuPortAllocationLockName = ".qemu-port-allocation.lock"
+  QemuPortClaimTimeoutMs = 5000
+  QemuPortAllocationAttempts = 5
+
+type
+  PortAllocationLock* = object
+    held*: bool
+    when defined(posix):
+      fd*: cint
 
 proc defaultStateDir*(): string =
   let override = getEnv("VM_HARNESS_QEMU_WINDOWS_ARM_STATE_DIR")
@@ -133,19 +144,51 @@ proc ephemeralName*(prefix: string, epochMs: int64, pid: int): string =
 proc ephemeralDirFor*(stateDir, name: string): string =
   stateDir / "instances" / name
 
+proc tcpPortAvailable(port: int): bool =
+  try:
+    var s = newSocket()
+    defer: s.close()
+    s.bindAddr(Port(port), "127.0.0.1")
+    true
+  except OSError:
+    false
+
 proc pickTcpPort*(preferred: int): int =
-  if preferred > 0:
-    try:
-      var s = newSocket()
-      defer: s.close()
-      s.bindAddr(Port(preferred), "127.0.0.1")
-      return preferred
-    except OSError:
-      discard
+  if preferred > 0 and tcpPortAvailable(preferred):
+    return preferred
   var s = newSocket()
   defer: s.close()
   s.bindAddr(Port(0), "127.0.0.1")
   result = int(s.getLocalAddr()[1])
+
+proc acquirePortAllocationLock*(stateDir: string): PortAllocationLock =
+  ## Serialize the short port-selection/QEMU-bind window across vm-harness
+  ## processes. The advisory lock is tied to the file descriptor, so the OS
+  ## releases it automatically if a launcher crashes.
+  when defined(posix):
+    createDir(stateDir)
+    let lockPath = stateDir / QemuPortAllocationLockName
+    let fd = posix.open(lockPath.cstring, O_CREAT or O_RDWR, Mode(0o600))
+    if fd < 0:
+      raise newException(OSError,
+        "QemuWindowsArmBackend: cannot open port allocation lock " & lockPath)
+    if posix.lockf(fd, F_LOCK, Off(0)) != 0:
+      discard posix.close(fd)
+      raise newException(OSError,
+        "QemuWindowsArmBackend: cannot acquire port allocation lock " & lockPath)
+    result = PortAllocationLock(held: true, fd: fd)
+  else:
+    raise newException(OSError,
+      "QemuWindowsArmBackend: atomic port allocation requires POSIX lockf")
+
+proc releasePortAllocationLock*(allocationLock: var PortAllocationLock) =
+  when defined(posix):
+    if allocationLock.held:
+      discard posix.lockf(allocationLock.fd, F_ULOCK, Off(0))
+      discard posix.close(allocationLock.fd)
+      allocationLock.held = false
+  else:
+    allocationLock.held = false
 
 proc shortSocketPath(prefix, vmDir: string): string =
   "/tmp" / (prefix & "-" & $abs(hash(vmDir)) & ".sock")
@@ -357,6 +400,66 @@ proc startQemuInBackground*(b: QemuWindowsArmBackend, vmDir: string,
                        workingDir = vmDir)
   result = p.processID
 
+proc childProcessExited(pid: int): bool =
+  when defined(posix):
+    var status: cint
+    let waited = posix.waitpid(Pid(pid), status, WNOHANG)
+    if waited == Pid(pid):
+      return true
+    if waited < Pid(0):
+      return posix.kill(Pid(pid), cint(0)) != 0
+    false
+  else:
+    false
+
+proc stopStartedProcess(pid: int) =
+  when defined(posix):
+    discard posix.kill(Pid(pid), SIGTERM)
+    let deadline = epochTime() + 2.0
+    while epochTime() < deadline:
+      if childProcessExited(pid):
+        return
+      sleep(25)
+    discard posix.kill(Pid(pid), SIGKILL)
+    let killDeadline = epochTime() + 2.0
+    while epochTime() < killDeadline:
+      if childProcessExited(pid):
+        return
+      sleep(25)
+  else:
+    discard runProcessCapture(@["/bin/kill", "-TERM", $pid], timeoutSec = 5)
+
+proc waitForTcpPortClaim(pid, port, timeoutMs: int): bool =
+  let deadline = epochTime() + timeoutMs.float / 1000.0
+  while epochTime() < deadline:
+    if childProcessExited(pid):
+      return false
+    if not tcpPortAvailable(port):
+      return true
+    sleep(25)
+  false
+
+proc startQemuWithAllocatedPort*(b: QemuWindowsArmBackend, vmDir: string,
+                                 cpus, memoryMB: int):
+                                 tuple[sshPort: int, pid: int] =
+  ## Keep the inter-process allocation lock until QEMU has claimed the chosen
+  ## port. This closes the race between probing a free port and QEMU binding
+  ## it when multiple ephemeral guests start at the same time.
+  var allocationLock = acquirePortAllocationLock(b.stateDir)
+  defer: releasePortAllocationLock(allocationLock)
+
+  for attempt in 0 ..< QemuPortAllocationAttempts:
+    let preferred = if attempt == 0: b.sshPort else: 0
+    let port = pickTcpPort(preferred)
+    let pid = b.startQemuInBackground(vmDir, port, cpus, memoryMB)
+    if waitForTcpPortClaim(pid, port, QemuPortClaimTimeoutMs):
+      return (sshPort: port, pid: pid)
+    stopStartedProcess(pid)
+
+  raise newVmHarnessError($b.id, lpStartup,
+    "QemuWindowsArmBackend: QEMU failed to claim an allocated SSH port after " &
+    $QemuPortAllocationAttempts & " attempts")
+
 method probeAvailability*(b: QemuWindowsArmBackend): bool =
   when defined(macosx):
     try:
@@ -407,14 +510,22 @@ method revertToBaseline*(b: QemuWindowsArmBackend, baselineName: string): VmHand
                            getCurrentProcessId())
   let vmDir = ephemeralDirFor(b.stateDir, name)
   createEphemeralCopy(baselineDir, vmDir)
-  let port = pickTcpPort(b.sshPort)
   let cpus = if baselineName in b.baselineCpus: b.baselineCpus[baselineName] else: 4
   let memoryMB =
     if baselineName in b.baselineMemoryMB: b.baselineMemoryMB[baselineName]
     else: 8192
   let swtpmPid = b.startSwtpmInBackground(vmDir)
   b.swtpmPids[name] = swtpmPid
-  let pid = b.startQemuInBackground(vmDir, port, cpus, memoryMB)
+  var started: tuple[sshPort: int, pid: int]
+  try:
+    started = b.startQemuWithAllocatedPort(vmDir, cpus, memoryMB)
+  except CatchableError:
+    let vm = VmHandle(backend: b, name: name, baseline: baselineName,
+                      extra: {"vmDir": vmDir, "swtpmPid": $swtpmPid}.toTable)
+    b.stopAndCleanup(vm, deleteVm = true)
+    raise
+  let port = started.sshPort
+  let pid = started.pid
   b.qemuPids[name] = pid
   if not b.waitForSshReady(port, b.sshReadyTimeoutSec):
     let vm = VmHandle(backend: b, name: name, baseline: baselineName,

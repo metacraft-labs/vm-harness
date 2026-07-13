@@ -4,9 +4,61 @@
 ## deterministic naming, command construction, SSH command quoting, and
 ## bounded probe behavior that the live cached-boot path depends on.
 
-import std/[os, sequtils, streams, strutils, tables, tempfiles, times, unittest,
-            xmlparser, xmltree]
+import std/[net, os, osproc, sequtils, streams, strutils, tables, tempfiles,
+            times, unittest, xmlparser, xmltree]
 import vm_harness
+
+const
+  PortAllocationWorkerArg = "--vmh-qemu-port-allocation-worker"
+  PortListenerHelperEnv = "VMH_QEMU_PORT_LISTENER_HELPER"
+  PortListenerBindDelayEnv = "VMH_QEMU_PORT_LISTENER_BIND_DELAY_MS"
+
+proc qemuForwardedPort(): int =
+  const marker = "hostfwd=tcp:127.0.0.1:"
+  for i in 1 .. paramCount():
+    let arg = paramStr(i)
+    let start = arg.find(marker)
+    if start < 0:
+      continue
+    let portStart = start + marker.len
+    let portEnd = arg.find("-:22", portStart)
+    if portEnd > portStart:
+      return parseInt(arg[portStart ..< portEnd])
+  raise newException(ValueError, "fake QEMU did not receive an SSH hostfwd")
+
+proc maybeRunPortListenerHelper() =
+  if getEnv(PortListenerHelperEnv) != "1":
+    return
+  let delayMs = parseInt(getEnv(PortListenerBindDelayEnv, "0"))
+  if delayMs > 0:
+    sleep(delayMs)
+  var listener = newSocket()
+  listener.bindAddr(Port(qemuForwardedPort()), "127.0.0.1")
+  listener.listen()
+  sleep(30_000)
+  quit(QuitSuccess)
+
+proc maybeRunPortAllocationWorker() =
+  if paramCount() < 5 or paramStr(1) != PortAllocationWorkerArg:
+    return
+  let stateDir = paramStr(2)
+  let vmDir = paramStr(3)
+  let resultFile = paramStr(4)
+  let preferredPort = parseInt(paramStr(5))
+  createDir(vmDir)
+  writeFile(vmDir / "windows.qcow2", "fake-qcow2")
+  putEnv(PortListenerHelperEnv, "1")
+  putEnv(PortListenerBindDelayEnv, "250")
+  let backend = newQemuWindowsArmBackend(
+    qemuCmd = getAppFilename(),
+    stateDir = stateDir,
+    sshPort = preferredPort)
+  let started = backend.startQemuWithAllocatedPort(vmDir, 1, 64)
+  writeFile(resultFile, $started.sshPort & " " & $started.pid)
+  quit(QuitSuccess)
+
+maybeRunPortListenerHelper()
+maybeRunPortAllocationWorker()
 
 proc writeExecutable(path, body: string) =
   writeFile(path, body)
@@ -312,6 +364,54 @@ suite "QemuWindowsArmBackend pure behavior":
     check ephemeralName("repro-vm-qemu-windows-arm", 1700000000123'i64, 42) ==
       "repro-vm-qemu-windows-arm-1700000000123-42"
     check ephemeralDirFor("/state", "vm-a") == "/state" / "instances" / "vm-a"
+
+  test "concurrent QEMU launches allocate distinct forwarded SSH ports":
+    when defined(posix):
+      let tmp = createTempDir("vmh-qemu-win-arm-port-allocation-", "")
+      defer: removeDir(tmp)
+      let stateDir = tmp / "state"
+      let resultA = tmp / "result-a"
+      let resultB = tmp / "result-b"
+      let preferredPort = pickTcpPort(0)
+      var workerA = startProcess(getAppFilename(), args = @[
+        PortAllocationWorkerArg, stateDir, tmp / "vm-a", resultA,
+        $preferredPort], options = {poParentStreams})
+      var workerB = startProcess(getAppFilename(), args = @[
+        PortAllocationWorkerArg, stateDir, tmp / "vm-b", resultB,
+        $preferredPort], options = {poParentStreams})
+      defer:
+        if workerA.running:
+          workerA.kill()
+        if workerB.running:
+          workerB.kill()
+        workerA.close()
+        workerB.close()
+
+      let exitA = workerA.waitForExit(10_000)
+      let exitB = workerB.waitForExit(10_000)
+      check exitA == 0
+      check exitB == 0
+      check fileExists(resultA)
+      check fileExists(resultB)
+
+      if exitA == 0 and exitB == 0 and
+         fileExists(resultA) and fileExists(resultB):
+        let fieldsA = readFile(resultA).splitWhitespace()
+        let fieldsB = readFile(resultB).splitWhitespace()
+        check fieldsA.len == 2
+        check fieldsB.len == 2
+        if fieldsA.len == 2 and fieldsB.len == 2:
+          let portA = parseInt(fieldsA[0])
+          let portB = parseInt(fieldsB[0])
+          let pidA = parseInt(fieldsA[1])
+          let pidB = parseInt(fieldsB[1])
+          defer:
+            discard execCmd("/bin/kill -TERM " & $pidA)
+            discard execCmd("/bin/kill -TERM " & $pidB)
+          check portA != portB
+          check preferredPort in [portA, portB]
+    else:
+      skip()
 
   test "QEMU argv uses aarch64 HVF, user networking, and a cloned disk path":
     let tmp = createTempDir("vmh-qemu-win-arm-argv-", "")
