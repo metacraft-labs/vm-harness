@@ -75,7 +75,7 @@ type
       ## How long ``tart ip --wait`` polls for the auto-assigned IP.
       ## Default 90.
     sshReadyTimeoutSec*: int
-      ## How long to retry the post-IP SSH-ready probe. Default 60.
+      ## How long to retry the post-IP SSH-ready probe. Default 180.
     ephemeralPids*: Table[string, int]
       ## VM name → pid of the ``tart run --no-graphics`` background process.
       ## Stored so ``stopAndCleanup`` can issue an extra ``kill`` if the
@@ -95,6 +95,15 @@ const
   DefaultCirrusLabsPassword* = "admin"
   DefaultEphemeralPrefixMacos* = "repro-vm-tart-macos"
   DefaultEphemeralPrefixLinuxArm* = "repro-vm-tart-linux"
+
+when defined(macosx):
+  const
+    DefaultTartSshCmd* = "/usr/bin/ssh"
+    DefaultTartScpCmd* = "/usr/bin/scp"
+else:
+  const
+    DefaultTartSshCmd* = "ssh"
+    DefaultTartScpCmd* = "scp"
 
 proc defaultSharedDirs(guestOs: GuestOs): seq[TartSharedDir] =
   let nixStore = getEnv("MCL_RUNNER_SHARED_NIX_STORE")
@@ -120,8 +129,8 @@ proc newTartBackend*(guestOs: GuestOs = goLinux,
                      goldenImage: string = "",
                      tartCmd: string = "tart",
                      sshpassCmd: string = "sshpass",
-                     sshCmd: string = "ssh",
-                     scpCmd: string = "scp",
+                     sshCmd: string = DefaultTartSshCmd,
+                     scpCmd: string = DefaultTartScpCmd,
                      sshUser: string = DefaultCirrusLabsUser,
                      sshPassword: string = DefaultCirrusLabsPassword,
                      sshPort: int = 22,
