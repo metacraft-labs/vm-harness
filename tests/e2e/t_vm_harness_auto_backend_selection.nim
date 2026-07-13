@@ -103,7 +103,22 @@ suite "e2e_vm_harness_auto_backend_selection":
                 of hpWindows: goLinux        # → wsl
                 of hpLinux:   goLinux        # → libvirt
                 of hpMacosArm: goLinux       # → tart-linux-arm
-    let (id, backend) = newBackendForGuest(host, guest, noopFallback = true)
+    let (id, selectedBackend) =
+      newBackendForGuest(host, guest, noopFallback = true)
+    var backend = selectedBackend
+    let selectedAvailable =
+      try:
+        selectedBackend.probeAvailability()
+      except CatchableError:
+        false
+    if not selectedAvailable:
+      # All backend factories are now registered, so noopFallback does not
+      # replace a registered-but-unavailable backend. Keep this dispatch test
+      # host-independent by substituting a tagged noop after the availability
+      # probe; real backend lifecycles belong to the host-level test catalog.
+      let noop = newNoopBackend()
+      noop.id = id
+      backend = noop
     # Skip the live-libvirt exercise on Linux hosts where the real
     # libvirt backend is auto-selected: provisioning a fresh baseline
     # would need a real Win11 ISO. The libvirt CLI dispatch path is
