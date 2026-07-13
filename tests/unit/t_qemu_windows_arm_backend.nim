@@ -413,6 +413,32 @@ suite "QemuWindowsArmBackend pure behavior":
     else:
       skip()
 
+  test "QEMU cleanup terminates the direct child and releases its port":
+    when defined(posix):
+      let tmp = createTempDir("vmh-qemu-win-arm-cleanup-", "")
+      defer: removeDir(tmp)
+      let vmDir = tmp / "vm"
+      createDir(vmDir)
+      writeFile(vmDir / "windows.qcow2", "fake-qcow2")
+      putEnv(PortListenerHelperEnv, "1")
+      defer: delEnv(PortListenerHelperEnv)
+      let preferredPort = pickTcpPort(0)
+      let backend = newQemuWindowsArmBackend(
+        qemuCmd = getAppFilename(), stateDir = tmp / "state",
+        sshPort = preferredPort)
+      let started = backend.startQemuWithAllocatedPort(vmDir, 1, 64)
+      let vm = VmHandle(
+        backend: backend,
+        name: "cleanup-test",
+        extra: {"vmDir": vmDir, "qemuPid": $started.pid}.toTable)
+
+      backend.stopAndCleanup(vm, deleteVm = true)
+
+      check pickTcpPort(preferredPort) == preferredPort
+      check not dirExists(vmDir)
+    else:
+      skip()
+
   test "QEMU argv uses aarch64 HVF, user networking, and a cloned disk path":
     let tmp = createTempDir("vmh-qemu-win-arm-argv-", "")
     defer: removeDir(tmp)
@@ -488,6 +514,11 @@ suite "QemuWindowsArmBackend pure behavior":
     check sshArgs[sshArgs.find("-p") + 1] == "2230"
     check sshArgs[^2] == "admin@127.0.0.1"
     check sshArgs[^1] == remote
+
+  test "Windows SSH retries only transport and authentication failures":
+    check transientSshFailure(ExecResult(exitCode: 255))
+    check not transientSshFailure(ExecResult(exitCode: 1))
+    check not transientSshFailure(ExecResult(exitCode: 0))
 
   test "probeAvailability is bounded when qemu command is silent":
     when defined(macosx):

@@ -42,6 +42,8 @@ const
   QemuPortAllocationLockName = ".qemu-port-allocation.lock"
   QemuPortClaimTimeoutMs = 5000
   QemuPortAllocationAttempts = 5
+  QemuSshAttempts = 5
+  QemuSshRetryDelayMs = 2000
 
 type
   PortAllocationLock* = object
@@ -313,6 +315,12 @@ proc buildSshpassSshArgs*(b: QemuWindowsArmBackend, pwdFile: string,
   @[b.sshpassCmd, "-f", pwdFile, b.sshCmd] &
     b.sshArgsBase(port) & @[remoteCommand]
 
+proc transientSshFailure*(execResult: ExecResult): bool =
+  ## OpenSSH uses 255 for transport and authentication failures. Remote
+  ## commands retain their own exit code, so retrying only 255 cannot replay a
+  ## completed command that returned an application error.
+  execResult.exitCode == 255
+
 proc writePasswordFile(password: string): string =
   let path = getTempDir() / "vm-harness-qemu-win-arm-pwd-" &
              $getCurrentProcessId() & "-" & $int(epochTime() * 1000)
@@ -378,7 +386,10 @@ proc startSwtpmInBackground*(b: QemuWindowsArmBackend, vmDir: string): int =
     "--ctrl", "type=unixio,path=" & sock
   ]
   var p = startProcess(b.swtpmCmd, args = args,
-                       options = {poUsePath, poDaemon},
+                       # Keep the direct child PID. On Darwin poDaemon may
+                       # detach through an intermediate process, leaving the
+                       # real swtpm orphaned and impossible to reap reliably.
+                       options = {poUsePath, poParentStreams},
                        workingDir = vmDir)
   result = p.processID
   let deadline = epochTime() + 3.0
@@ -396,7 +407,9 @@ proc startQemuInBackground*(b: QemuWindowsArmBackend, vmDir: string,
                             sshPort, cpus, memoryMB: int): int =
   let args = buildQemuWindowsArmArgs(vmDir, sshPort, cpus, memoryMB)
   var p = startProcess(b.qemuCmd, args = args,
-                       options = {poUsePath, poDaemon},
+                       # Keep QEMU as our direct child so the PID stored in the
+                       # VmHandle is the process stopAndCleanup must terminate.
+                       options = {poUsePath, poParentStreams},
                        workingDir = vmDir)
   result = p.processID
 
@@ -564,7 +577,17 @@ method execInGuest*(b: QemuWindowsArmBackend, vm: VmHandle,
   let remote = buildWindowsRemoteCommand(env, cmd)
   let sshCmd = b.buildSshpassSshArgs(pwdFile, vm.sshPort, remote)
   if stdin.len == 0:
-    return runProcessCapture(sshCmd, timeoutSec = timeoutSec)
+    var last = ExecResult(exitCode: -1)
+    for attempt in 1 .. QemuSshAttempts:
+      last = runProcessCapture(sshCmd, timeoutSec = timeoutSec)
+      if not transientSshFailure(last) or attempt == QemuSshAttempts:
+        return last
+      # Windows OpenSSH can accept the readiness probe and briefly reject the
+      # next authentication while the service finishes settling. Exit 255 is
+      # SSH's transport/authentication failure code; remote command failures
+      # retain their own exit code and are never replayed.
+      sleep(QemuSshRetryDelayMs)
+    return last
   let start = epochTime()
   var p = startProcess(sshCmd[0], args = sshCmd[1 .. ^1],
                        options = {poUsePath, poStdErrToStdOut})
@@ -615,12 +638,22 @@ proc scpCopy*(b: QemuWindowsArmBackend, port: int, src, dest: string,
   else:
     args.add(b.sshUser & "@127.0.0.1:" & src)
     args.add(dest)
-  let r = runProcessCapture(args, timeoutSec = timeoutSec)
-  if r.exitCode != 0:
-    raise newVmHarnessError($b.id, lpCopy,
-      "scp " & (if toGuest: "to" else: "from") &
-      " Windows ARM guest failed (exit " & $r.exitCode & "): " &
-      r.stdout & r.stderr)
+  let deadline = epochTime() + timeoutSec.float
+  var last = ExecResult(exitCode: -1)
+  var attempt = 0
+  while epochTime() < deadline:
+    inc attempt
+    let remaining = max(1, int(deadline - epochTime()))
+    last = runProcessCapture(args, timeoutSec = min(30, remaining))
+    if last.exitCode == 0:
+      return
+    if attempt >= QemuSshAttempts:
+      break
+    sleep(QemuSshRetryDelayMs)
+  raise newVmHarnessError($b.id, lpCopy,
+    "scp " & (if toGuest: "to" else: "from") &
+    " Windows ARM guest failed after " & $attempt & " attempts (exit " &
+    $last.exitCode & "): " & last.stdout & last.stderr)
 
 method copyToGuest*(b: QemuWindowsArmBackend, vm: VmHandle,
                    hostPath: string, guestPath: string) =
