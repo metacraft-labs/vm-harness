@@ -1,4 +1,4 @@
-import std/[os, strutils, tempfiles, unittest]
+import std/[options, os, strutils, tables, tempfiles, unittest]
 import vm_harness/backends/tart
 import vm_harness/types
 
@@ -78,4 +78,33 @@ suite "Tart backend commands":
       guestOs = goMacos, scpCmd = scp, sshpassCmd = sshpass)
     backend.scpCopy("192.0.2.1", src, "/tmp/payload",
       toGuest = true, recursive = false, timeoutSec = 10)
+    check readFile(attempts) == "2"
+
+  test "guest exec retries a transient authentication failure":
+    let tmp = createTempDir("vmh-tart-unit-", "")
+    defer: removeDir(tmp)
+    let attempts = tmp / "attempts"
+    let ssh = tmp / "ssh"
+    let sshpass = tmp / "sshpass"
+    writeExecutable(sshpass, "#!/bin/sh\nshift 2\nexec \"$@\"\n")
+    writeExecutable(ssh, "#!/bin/sh\n" &
+      "count=0\n" &
+      "[ ! -f '" & attempts & "' ] || count=$(cat '" & attempts & "')\n" &
+      "count=$((count + 1))\n" &
+      "printf '%s' \"$count\" > '" & attempts & "'\n" &
+      "if [ \"$count\" -lt 2 ]; then echo 'Permission denied' >&2; exit 255; fi\n" &
+      "echo ready\n")
+
+    let backend = newTartBackend(
+      guestOs = goMacos, sshCmd = ssh, sshpassCmd = sshpass)
+    let vm = VmHandle(
+      backend: backend,
+      name: "ephemeral",
+      baseline: "golden",
+      ipAddress: some("192.0.2.1"))
+    let result = backend.execInGuest(
+      vm, initTable[string, string](), @["echo", "ready"], timeoutSec = 10)
+
+    check result.exitCode == 0
+    check "ready" in result.stdout
     check readFile(attempts) == "2"
