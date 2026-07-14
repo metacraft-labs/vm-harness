@@ -1,0 +1,69 @@
+name: CI (reprobuild)
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  reprobuild:
+    name: Repro build/test (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - eph-linux-x64
+          - eph-linux-arm64
+          - eph-macos-arm64
+          - eph-win-x64
+          - eph-win-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mint installation token
+        id: ci-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - name: Setup reprobuild environment
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        with:
+          env-flavor: reprobuild
+          gh-token: ${{ steps.ci-token.outputs.token }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-cache: ${{ vars.ATTIC_CACHE }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          repro-build-pin: b29a5ababae99a81a96b84939128dc07771564ba
+
+      - name: Repro build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-logs
+          dev-exec repro build 2>&1 | tee test-logs/repro-build.log
+
+      - name: Repro test
+        shell: bash
+        run: |
+          set -euo pipefail
+          dev-exec repro test 2>&1 | tee test-logs/repro-test.log
+
+      - name: Upload logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: reprobuild-logs-${{ matrix.runner }}
+          path: test-logs/
+          retention-days: 30

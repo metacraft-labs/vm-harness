@@ -14,11 +14,16 @@ repository entrypoints below:
 - `just lint` checks the Nim entrypoint and Nix formatting.
 - `just format` formats Nim and Nix sources.
 - `just nix-build` builds the distributable Nix package.
+- `repro build --tool-provisioning=path --daemon=off` builds the CLI through
+  the pure reprobuild graph.
+- `repro test --tool-provisioning=path --daemon=off` builds and executes the
+  deterministic reprobuild test graph.
 
-`just test` is the deterministic three-class CI catalog. Backend tests that
-require a real hypervisor live behind `just test-host` and must keep an explicit
-platform and prerequisite guard. Do not turn a missing prerequisite into
-claimed coverage.
+`just test` is the deterministic three-class Nix CI catalog. `repro test` is
+the additive five-class catalog spanning Linux x64/ARM64, macOS ARM64, and
+Windows x64/ARM64. Backend tests that require a real hypervisor live behind
+`just test-host` and must keep an explicit platform and prerequisite guard. Do
+not turn a missing prerequisite into claimed coverage.
 The production host-level gates are maintained in `metacraft-labs/infra`:
 `checks/t_vmharness_tart_ephemeral_run.sh`, `checks/t_m3_arm_ephemeral.sh`, and
 `checks/t_windows_sysprep_golden.sh`.

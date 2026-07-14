@@ -81,7 +81,8 @@ Outstanding:
 ```
 vm-harness/
 ├── flake.nix                # dev shell + package output
-├── vm_harness.nimble        # Nimble package + test task
+├── repro.nim               # pure reprobuild build/test graph
+├── vm_harness.nimble        # Nimble package metadata
 ├── src/
 │   ├── vm_harness.nim       # top-level re-export module
 │   └── vm_harness/
@@ -119,20 +120,24 @@ vm-harness/
 
 ## Building and testing
 
-Inside the Nix dev shell:
+The Nix development path is:
 
 ```sh
-nix develop
-nimble buildCli          # produces build/bin/vm-harness
-nimble test              # M0 verification suite
+nix develop --command just build
+nix develop --command just test
 ```
 
-Without Nix (any host with Nim 2.0+ on PATH):
+The pure reprobuild path is an additive equivalent on Linux x64/ARM64,
+macOS ARM64, and Windows x64/ARM64:
 
 ```sh
-nim c -o:build/bin/vm-harness src/vm_harness/cli.nim
-nim r tests/e2e/t_vm_harness_smoke.nim
+repro build --tool-provisioning=path --daemon=off
+repro test --tool-provisioning=path --daemon=off
 ```
+
+The checked-in `repro.nim` builds the CLI and models every deterministic test
+as typed build and execute edges. Tests requiring a live host hypervisor remain
+in the explicit `just test-host` catalog.
 
 ## CLI reference
 
