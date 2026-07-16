@@ -36,3 +36,5 @@ run_nim r --hints:off tests/e2e/t_vm_harness_lima_revert_under_30s.nim
 run_nim r --hints:off tests/e2e/t_vmharness_libvirt_ephemeral_run.nim
 run_nim r --hints:off tests/e2e/t_windows_golden_jit_boot.nim
 run_nim r --hints:off tests/e2e/t_vmharness_incus_ephemeral_run.nim
+# §7.4 layered base images: snapshot -> publish -> export -> import -> launch.
+run_nim r --hints:off tests/e2e/t_incus_layered_base_image.nim
