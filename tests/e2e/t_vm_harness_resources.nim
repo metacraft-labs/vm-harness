@@ -87,12 +87,13 @@ suite "slice 3: vm-harness native resource providers":
 
   test "wrappers build a container -> exec -> snapshot graph in topo order":
     resetDesiredResources()
-    let base = vmh.container(containerName, baseImage = "vmh-base")
+    let base = vmh.container(containerName, baseImage = "vmh-base",
+                             profiles = @[])
     let touch = vmh.exec("touch", container = base.address,
                          run = @["sh", "-c", "touch " & markerPath],
                          dependsOn = @[base.address])
     discard vmh.snapshot(snapName, container = base.address,
-                         dependsOn = @[touch.address])
+                         publishAlias = "", dependsOn = @[touch.address])
     let desired = collectedResources()
     check desired.len == 3
 

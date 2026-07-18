@@ -1,20 +1,29 @@
 ## Native reprobuild resource providers authored IN vm-harness
-## (`Composable-Resource-Types.md` slice 3).
+## (`Composable-Resource-Types.md` slice 3, re-authored via the RP4
+## `resourceType` macro for RP5c1).
 ##
 ## This module proves that an EXTERNAL repo can define resource TYPES on
 ## reprobuild's generic external-provider lane (slice 2,
-## `repro_resources`) without any edit to reprobuild's own source: it
-## registers three native providers — `vm_harness.container`,
-## `vm_harness.exec`, `vm_harness.snapshot` — each carrying its own typed
-## attribute record, a `ResourceProviderDriver` whose `apply` drives
-## vm-harness's incus backend, and a thin typed wrapper proc a consumer
-## (infra, slice 4) calls to build a resource graph.
+## `repro_resources`) without any edit to reprobuild's own source. It
+## declares three native providers — `vm_harness.container`,
+## `vm_harness.exec`, `vm_harness.snapshot` — each via one `resourceType`
+## block that lowers to the provider registration + attribute marshaller +
+## typed wrapper + `InterfaceResource` contract + the
+## `<typeId>.observe/plan/apply` protocol entry points (RP4). Each type
+## carries its own typed attribute record and a `{.nimcall.}`
+## `ResourceProviderDriver` whose `apply` drives vm-harness's incus
+## backend.
+##
+## RP5c1: the SAME module, compiled into a provider binary with
+## `-d:reproProviderMode` (see `provider_main.nim`), serves the driver ops
+## over the runtime protocol (RP5b) — the engine reconciles a
+## `vm_harness.container` in a SEPARATE process that drives incus.
 ##
 ## Deliberately OUT of vm-harness's core build path: this module imports
 ## `repro_resources` (a reprobuild lib) and is NOT imported by
 ## `src/vm_harness/cli.nim` or anything `just build` compiles, so the core
 ## build stays reprobuild-free. It is compiled only with the reprobuild
-## `--path` set (see the slice-3 test / campaign notes).
+## `--path` set + full harness env (see the RP5c1 test / campaign notes).
 ##
 ## Determinism classes (per `Composable-Resource-Types.md` §Determinism +
 ## `Edge-Determinism-And-Soft-Rebuild.md` §7):
@@ -44,24 +53,26 @@ const
   TypeSnapshot*  = "vm_harness.snapshot"
 
 # ---------------------------------------------------------------------------
-# Typed attribute records.
+# Typed attribute records. The resource's ADDRESS (== its identity) is the
+# instance address, so it is NOT duplicated as an attribute field; the attrs
+# carry only the type-specific configuration.
 
 type
   ContainerAttrs* = object
-    ## Attributes of a `vm_harness.container` resource.
-    name*: string            ## container name == real-world identity
+    ## Attributes of a `vm_harness.container` resource. The container name is
+    ## the instance address.
     baseImage*: string       ## base image alias/fingerprint to launch from
     profiles*: seq[string]   ## optional incus profiles
 
   ExecAttrs* = object
-    ## Attributes of a `vm_harness.exec` resource.
-    name*: string            ## logical name of this exec step
+    ## Attributes of a `vm_harness.exec` resource. The exec's logical name is
+    ## the instance address.
     container*: string       ## target container's resource address (== name)
     run*: seq[string]        ## argv passed verbatim to `incus exec -- ...`
 
   SnapshotAttrs* = object
-    ## Attributes of a `vm_harness.snapshot` resource.
-    name*: string            ## snapshot name
+    ## Attributes of a `vm_harness.snapshot` resource. The snapshot name is
+    ## the instance address.
     container*: string       ## container to snapshot (its address == name)
     publishAlias*: string    ## when non-empty, publish the snapshot as this
                              ## local image alias
@@ -69,7 +80,7 @@ type
 # ---------------------------------------------------------------------------
 # Backend construction. Every driver builds a fresh backend so it honours
 # ``VMH_INCUS_CMD`` (via ``newIncusBackend`` -> ``resolveIncusCmd``) on
-# whatever process runs the reconcile.
+# whatever process runs the reconcile — including the provider process.
 
 proc backend(): IncusBackend =
   newIncusBackend()
@@ -93,12 +104,14 @@ proc snapshotAttrs(inst: ResourceInstance): SnapshotAttrs =
 
 # ===========================================================================
 # vm_harness.container — rdVolatile
+#
+# Driver ops are ``{.nimcall.}`` (the vtable + protocol-dispatch contract).
 # ===========================================================================
 
-proc containerIdentity(inst: ResourceInstance): string =
-  containerAttrs(inst).name
+proc containerIdentity(inst: ResourceInstance): string {.nimcall.} =
+  inst.address
 
-proc containerDigest(inst: ResourceInstance): Digest256 =
+proc containerDigest(inst: ResourceInstance): Digest256 {.nimcall.} =
   ## Digest of (baseImage, profiles). Determinism is rdVolatile, so a
   ## container is re-realized whenever a dependency changed regardless of
   ## this digest; the digest still gives a same-graph cache-hit no-op when
@@ -107,57 +120,64 @@ proc containerDigest(inst: ResourceInstance): Digest256 =
   digestString(inst.typeId & "\x00" & a.baseImage & "\x00" & a.profiles.join("\x00"))
 
 proc containerObserve(inst: ResourceInstance;
-                      recorded: Option[ResourceBinding]): ObservedState =
+                      recorded: Option[ResourceBinding]): ObservedState {.nimcall.} =
   let a = containerAttrs(inst)
   let b = backend()
-  if b.containerExists(a.name):
+  if b.containerExists(inst.address):
     result.present = true
     result.digest = containerDigest(inst)   # live == desired once it exists
   else:
     result.present = false
 
 proc containerApply(inst: ResourceInstance; action: ResourceActionKind;
-                    observed: ObservedState): ResourceBinding =
+                    observed: ObservedState): ResourceBinding {.nimcall.} =
   let a = containerAttrs(inst)
   let b = backend()
   case action
   of rakDestroy:
-    discard b.deleteContainer(a.name)
+    discard b.deleteContainer(inst.address)
     result = ResourceBinding(
       address: inst.address, typeId: inst.typeId,
-      resourceId: a.name, postWriteDigest: containerDigest(inst),
+      resourceId: inst.address, postWriteDigest: containerDigest(inst),
       present: false)
   else:
     # create / update / replace all converge to a fresh launched container.
     let vm = b.provisionEphemeralClone(EphemeralIncusSpec(
-      name: a.name, baseImage: a.baseImage, profiles: a.profiles))
+      name: inst.address, baseImage: a.baseImage, profiles: a.profiles))
     b.startAndAwaitReady(vm)
     result = ResourceBinding(
       address: inst.address, typeId: inst.typeId,
-      resourceId: a.name, postWriteDigest: containerDigest(inst),
+      resourceId: inst.address, postWriteDigest: containerDigest(inst),
       present: true)
 
-proc container*(name: string; baseImage: string;
-                profiles: seq[string] = @[]): ResourceRef =
-  ## Typed wrapper: a launched incus container. Its `.address` (== name)
-  ## seeds a dependent `exec`/`snapshot`'s `dependsOn`.
-  resource(TypeContainer, name,
-           ContainerAttrs(name: name, baseImage: baseImage, profiles: profiles))
+let containerDriver = ResourceProviderDriver(
+  identity: containerIdentity,
+  digest: containerDigest,
+  observe: containerObserve,
+  apply: containerApply)
+
+resourceType TypeContainer:
+  attrs: ContainerAttrs
+  wrapper: container
+  determinism: rdVolatile
+  driver: containerDriver
+  attr baseImage: string
+  attr profiles: seq[string]
 
 # ===========================================================================
 # vm_harness.exec — rdVolatile
 # ===========================================================================
 
-proc execIdentity(inst: ResourceInstance): string =
+proc execIdentity(inst: ResourceInstance): string {.nimcall.} =
   let a = execAttrs(inst)
-  a.container & "!" & a.name
+  a.container & "!" & inst.address
 
-proc execDigest(inst: ResourceInstance): Digest256 =
+proc execDigest(inst: ResourceInstance): Digest256 {.nimcall.} =
   let a = execAttrs(inst)
   digestString(inst.typeId & "\x00" & a.container & "\x00" & a.run.join("\x00"))
 
 proc execObserve(inst: ResourceInstance;
-                 recorded: Option[ResourceBinding]): ObservedState =
+                 recorded: Option[ResourceBinding]): ObservedState {.nimcall.} =
   ## An exec is a VOLATILE edge with no durable observable of its own — we
   ## do NOT record a completion marker in the guest. It therefore reports
   ## `present = false`, i.e. always-needs-apply: the reconciler creates it
@@ -168,7 +188,7 @@ proc execObserve(inst: ResourceInstance;
   result.present = false
 
 proc execApply(inst: ResourceInstance; action: ResourceActionKind;
-               observed: ObservedState): ResourceBinding =
+               observed: ObservedState): ResourceBinding {.nimcall.} =
   let a = execAttrs(inst)
   if action == rakDestroy:
     # Nothing to undo — an exec has no standalone lifecycle to tear down.
@@ -187,102 +207,71 @@ proc execApply(inst: ResourceInstance; action: ResourceActionKind;
     resourceId: execIdentity(inst), postWriteDigest: execDigest(inst),
     present: true)
 
-proc exec*(name: string; container: string; run: seq[string];
-           dependsOn: seq[string] = @[]): ResourceRef =
-  ## Typed wrapper: run `run` (argv) inside `container`. The container it
-  ## runs in is expressed as a `dependsOn` edge so the reconciler launches
-  ## the container first.
-  resource(TypeExec, name,
-           ExecAttrs(name: name, container: container, run: run), dependsOn)
+let execDriver = ResourceProviderDriver(
+  identity: execIdentity,
+  digest: execDigest,
+  observe: execObserve,
+  apply: execApply)
+
+resourceType TypeExec:
+  attrs: ExecAttrs
+  wrapper: exec
+  determinism: rdVolatile
+  driver: execDriver
+  attr container: string
+  attr run: seq[string]
 
 # ===========================================================================
 # vm_harness.snapshot — rdHostBound
 # ===========================================================================
 
-proc snapshotIdentity(inst: ResourceInstance): string =
+proc snapshotIdentity(inst: ResourceInstance): string {.nimcall.} =
   let a = snapshotAttrs(inst)
-  a.container & "/" & a.name
+  a.container & "/" & inst.address
 
-proc snapshotDigest(inst: ResourceInstance): Digest256 =
+proc snapshotDigest(inst: ResourceInstance): Digest256 {.nimcall.} =
   let a = snapshotAttrs(inst)
-  digestString(inst.typeId & "\x00" & a.container & "\x00" & a.name & "\x00" &
+  digestString(inst.typeId & "\x00" & a.container & "\x00" & inst.address & "\x00" &
     a.publishAlias)
 
 proc snapshotObserve(inst: ResourceInstance;
-                     recorded: Option[ResourceBinding]): ObservedState =
+                     recorded: Option[ResourceBinding]): ObservedState {.nimcall.} =
   let a = snapshotAttrs(inst)
   let b = backend()
-  if a.name in b.listSnapshots(a.container):
+  if inst.address in b.listSnapshots(a.container):
     result.present = true
     result.digest = snapshotDigest(inst)
   else:
     result.present = false
 
 proc snapshotApply(inst: ResourceInstance; action: ResourceActionKind;
-                   observed: ObservedState): ResourceBinding =
+                   observed: ObservedState): ResourceBinding {.nimcall.} =
   let a = snapshotAttrs(inst)
   let b = backend()
   if action == rakDestroy:
-    b.removeSnapshot(a.container, a.name)
+    b.removeSnapshot(a.container, inst.address)
     return ResourceBinding(
       address: inst.address, typeId: inst.typeId,
       resourceId: snapshotIdentity(inst), postWriteDigest: snapshotDigest(inst),
       present: false)
-  discard b.snapshot(a.container, a.name)
+  discard b.snapshot(a.container, inst.address)
   if a.publishAlias.len > 0:
-    discard b.publishAsImage(a.container & "/" & a.name, a.publishAlias)
+    discard b.publishAsImage(a.container & "/" & inst.address, a.publishAlias)
   result = ResourceBinding(
     address: inst.address, typeId: inst.typeId,
     resourceId: snapshotIdentity(inst), postWriteDigest: snapshotDigest(inst),
     present: true)
 
-proc snapshot*(name: string; container: string; publishAlias: string = "";
-               dependsOn: seq[string] = @[]): ResourceRef =
-  ## Typed wrapper: an incus snapshot of `container` (host-bound), optionally
-  ## published as a reusable local image alias.
-  resource(TypeSnapshot, name,
-           SnapshotAttrs(name: name, container: container,
-                         publishAlias: publishAlias), dependsOn)
+let snapshotDriver = ResourceProviderDriver(
+  identity: snapshotIdentity,
+  digest: snapshotDigest,
+  observe: snapshotObserve,
+  apply: snapshotApply)
 
-# ===========================================================================
-# Registration.
-# ===========================================================================
-
-proc registerVmHarnessResourceProviders*() =
-  ## Register all three providers + their attribute marshallers. Called at
-  ## module init below, so importing this module is enough to make the
-  ## types available to the reconciler (mirror of slice 2's pattern). Safe
-  ## to call again (e.g. from a test setup): registration is idempotent
-  ## replace-by-typeId, and `registerExtension` is required per-thread
-  ## because the extension registry is a threadvar.
-  registerResourceProvider(ResourceProviderDef(
-    typeId: TypeContainer,
-    determinism: rdVolatile,
-    driver: ResourceProviderDriver(
-      identity: containerIdentity,
-      digest: containerDigest,
-      observe: containerObserve,
-      apply: containerApply)))
-  registerExtension[ContainerAttrs](TypeContainer)
-
-  registerResourceProvider(ResourceProviderDef(
-    typeId: TypeExec,
-    determinism: rdVolatile,
-    driver: ResourceProviderDriver(
-      identity: execIdentity,
-      digest: execDigest,
-      observe: execObserve,
-      apply: execApply)))
-  registerExtension[ExecAttrs](TypeExec)
-
-  registerResourceProvider(ResourceProviderDef(
-    typeId: TypeSnapshot,
-    determinism: rdHostBound,
-    driver: ResourceProviderDriver(
-      identity: snapshotIdentity,
-      digest: snapshotDigest,
-      observe: snapshotObserve,
-      apply: snapshotApply)))
-  registerExtension[SnapshotAttrs](TypeSnapshot)
-
-registerVmHarnessResourceProviders()
+resourceType TypeSnapshot:
+  attrs: SnapshotAttrs
+  wrapper: snapshot
+  determinism: rdHostBound
+  driver: snapshotDriver
+  attr container: string
+  attr publishAlias: string
