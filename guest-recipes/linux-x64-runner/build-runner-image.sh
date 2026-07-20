@@ -27,9 +27,11 @@
 # curled in-guest. It is streamed, NOT `incus file push`ed, because on this
 # host `incus file push` corrupts large tarballs (blocker A).
 #
-# Reproducible + idempotent: safe to re-run. Uses ONLY the `im2-bld-runner`
-# throwaway container name + the `vmh-linux-runner` alias — never touches
-# unrelated host containers/images.
+# Reproducible + idempotent: safe to re-run. Uses ONLY an alias-scoped
+# `im2-bld-<alias>` throwaway container name + the requested runner image
+# alias — never touches unrelated host containers/images. Alias scoping lets
+# the plain and nested image builders run concurrently without deleting each
+# other's build container.
 #
 # Usage:
 #   ./build-runner-image.sh
@@ -50,6 +52,8 @@
 #   VMH_RUNNER_VERSION  actions runner version   (default: 2.335.1)
 #   VMH_RUNNER_TARBALL  pre-downloaded tarball    (default: download to /tmp)
 #   VMH_RUNNER_CACHE    in-image runner dir       (default: /home/<user>/actions-runner)
+#   VMH_RUNNER_BUILD_CONTAINER
+#                       throwaway container name   (default: im2-bld-<alias>)
 #   VMH_RUNNER_DOCKER   bake nested Docker (HR1)  (default: off; set =1)
 #   VMH_RUNNER_KVM      bake nested KVM (HR2)     (default: off; set =1)
 #   VMH_RUNNER_RECIPE_REVISION
@@ -96,7 +100,7 @@ RUNNER_USER="${VMH_RUNNER_USER:-runner}"
 # Default to the GARM-expected cached path /home/<user>/actions-runner so the
 # per-job bootstrap uses the baked runner instead of re-downloading it.
 RUNNER_CACHE="${VMH_RUNNER_CACHE:-/home/${RUNNER_USER}/actions-runner}"
-BLD="im2-bld-runner"
+BLD="${VMH_RUNNER_BUILD_CONTAINER:-im2-bld-${ALIAS}}"
 
 # HR1 (nested Docker): when VMH_RUNNER_DOCKER is set (=1), bake docker/moby +
 # fuse-overlayfs into the image so a per-job container launched with the
