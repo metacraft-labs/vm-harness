@@ -96,7 +96,7 @@ const
   DefaultEphemeralPrefixMacos* = "repro-vm-tart-macos"
   DefaultEphemeralPrefixLinuxArm* = "repro-vm-tart-linux"
 
-proc defaultSharedDirs(): seq[TartSharedDir] =
+proc defaultSharedDirs(guestOs: GuestOs): seq[TartSharedDir] =
   let nixStore = getEnv("MCL_RUNNER_SHARED_NIX_STORE")
   if nixStore.len > 0 and dirExists(nixStore):
     result.add(TartSharedDir(
@@ -105,7 +105,11 @@ proc defaultSharedDirs(): seq[TartSharedDir] =
       guestPath: "/nix/store",
       readOnly: true))
   let reproStore = getEnv("MCL_RUNNER_SHARED_REPRO_STORE")
-  if reproStore.len > 0 and dirExists(reproStore):
+  # A VirtioFS directory attachment prevents the Tahoe runner golden from
+  # reaching Remote Login when Tart starts it headlessly. Keep the shared
+  # repro store for Linux guests, where the attachment is known-good, and let
+  # macOS runners use their local ephemeral filesystem.
+  if guestOs != goMacos and reproStore.len > 0 and dirExists(reproStore):
     result.add(TartSharedDir(
       tag: "mcl-repro-store",
       hostPath: reproStore,
@@ -169,7 +173,7 @@ proc newTartBackend*(guestOs: GuestOs = goLinux,
     bootTimeoutSec: bootTimeoutSec,
     sshReadyTimeoutSec: sshReadyTimeoutSec,
     ephemeralPids: initTable[string, int](),
-    sharedDirs: defaultSharedDirs())
+    sharedDirs: defaultSharedDirs(guestOs))
 
 # ---------------------------------------------------------------------------
 # Process helper. Same shape as the helper used by hyperv.nim and wsl.nim
