@@ -33,6 +33,8 @@
 
 import std/[os, osproc, options, streams, strtabs,
             strutils, tables, times]
+when defined(posix):
+  import std/posix
 import ../types
 import ../auto
 
@@ -40,6 +42,11 @@ import ../auto
 # Backend type.
 
 type
+  TartStorageLock = object
+    held: bool
+    when defined(posix):
+      fd: cint
+
   TartSharedDir = object
     tag: string
     hostPath: string
@@ -275,6 +282,41 @@ proc runProcessCapture(cmd: seq[string], cwd: string = "",
 # ---------------------------------------------------------------------------
 # Tart CLI primitives.
 
+const TartStorageLockName = ".vm-harness-storage.lock"
+
+proc acquireTartStorageLock(): TartStorageLock =
+  ## Serialize pull/clone cache mutations across provider processes. Tart uses
+  ## its own storage lock, but starting a clone while another process is still
+  ## pulling can consume the clone command's entire timeout just waiting for
+  ## that lock. The advisory descriptor lock is released by the OS on crash.
+  when defined(posix):
+    let stateDir =
+      if getEnv("TART_HOME").len > 0: getEnv("TART_HOME")
+      else: getTempDir()
+    createDir(stateDir)
+    let lockPath = stateDir / TartStorageLockName
+    let fd = posix.open(lockPath.cstring, O_CREAT or O_RDWR, Mode(0o600))
+    if fd < 0:
+      raise newException(OSError,
+        "TartBackend: cannot open storage lock " & lockPath)
+    if posix.lockf(fd, F_LOCK, Off(0)) != 0:
+      discard posix.close(fd)
+      raise newException(OSError,
+        "TartBackend: cannot acquire storage lock " & lockPath)
+    result = TartStorageLock(held: true, fd: fd)
+  else:
+    raise newException(OSError,
+      "TartBackend: atomic storage operations require POSIX lockf")
+
+proc releaseTartStorageLock(storageLock: var TartStorageLock) =
+  when defined(posix):
+    if storageLock.held:
+      discard posix.lockf(storageLock.fd, F_ULOCK, Off(0))
+      discard posix.close(storageLock.fd)
+      storageLock.held = false
+  else:
+    storageLock.held = false
+
 proc listTartVms*(b: TartBackend): seq[string] =
   ## ``tart list`` and pull the ``Name`` column for ``local`` rows (the
   ## ``OCI`` rows are golden images, not VMs the backend should touch).
@@ -310,6 +352,8 @@ proc cloneTartVm*(b: TartBackend, srcRef: string, ephemeral: string) =
   ## one golden would therefore share a DHCP lease, causing ``tart ip`` to
   ## resolve both names to the same guest.  Every ephemeral needs a distinct
   ## MAC before it is started.
+  var storageLock = acquireTartStorageLock()
+  defer: releaseTartStorageLock(storageLock)
   let r = runProcessCapture(@[b.tartCmd, "clone", srcRef, ephemeral],
                             timeoutSec = 300)
   if r.exitCode != 0:
@@ -327,6 +371,8 @@ proc pullTartImage*(b: TartBackend, imageRef: string) =
   ## ``tart pull <ref>``. Idempotent — Tart's OCI cache means re-pulling a
   ## present image is fast. Raises on failure so ``provisionBaseline``
   ## surfaces network problems.
+  var storageLock = acquireTartStorageLock()
+  defer: releaseTartStorageLock(storageLock)
   let r = runProcessCapture(@[b.tartCmd, "pull", imageRef], timeoutSec = 0)
   if r.exitCode != 0:
     raise newVmHarnessError($b.id, lpProvisioning,
