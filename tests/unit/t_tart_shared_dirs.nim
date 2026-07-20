@@ -9,7 +9,7 @@ proc restoreEnv(name: string, existed: bool, value: string) =
     delEnv(name)
 
 suite "Tart shared directories":
-  test "macOS excludes the raw Nix store but keeps the reprobuild store":
+  test "macOS excludes host shares that block headless guest startup":
     let
       nixName = "MCL_RUNNER_SHARED_NIX_STORE"
       reproName = "MCL_RUNNER_SHARED_REPRO_STORE"
@@ -25,5 +25,5 @@ suite "Tart shared directories":
     putEnv(nixName, sharedPath)
     putEnv(reproName, sharedPath)
 
-    check newTartBackend(goMacos).sharedDirs.len == 1
+    check newTartBackend(goMacos).sharedDirs.len == 0
     check newTartBackend(goLinux).sharedDirs.len == 2
