@@ -10,6 +10,25 @@ proc writeExecutable(path, body: string) =
   setFilePermissions(path, {fpUserRead, fpUserWrite, fpUserExec})
 
 suite "Tart backend commands":
+  test "macOS excludes all host VirtioFS shares":
+    let
+      nixName = "MCL_RUNNER_SHARED_NIX_STORE"
+      reproName = "MCL_RUNNER_SHARED_REPRO_STORE"
+      hadNix = existsEnv(nixName)
+      hadRepro = existsEnv(reproName)
+      oldNix = getEnv(nixName)
+      oldRepro = getEnv(reproName)
+      sharedPath = getCurrentDir()
+    defer:
+      if hadNix: putEnv(nixName, oldNix) else: delEnv(nixName)
+      if hadRepro: putEnv(reproName, oldRepro) else: delEnv(reproName)
+
+    putEnv(nixName, sharedPath)
+    putEnv(reproName, sharedPath)
+
+    check newTartBackend(goMacos).sharedDirs.len == 0
+    check newTartBackend(goLinux).sharedDirs.len == 2
+
   when defined(macosx):
     test "defaults to the system OpenSSH transport on macOS":
       let backend = newTartBackend(guestOs = goMacos)

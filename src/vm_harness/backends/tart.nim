@@ -107,7 +107,10 @@ else:
 
 proc defaultSharedDirs(guestOs: GuestOs): seq[TartSharedDir] =
   let nixStore = getEnv("MCL_RUNNER_SHARED_NIX_STORE")
-  if nixStore.len > 0 and dirExists(nixStore):
+  # A raw read-only store cannot back a fresh macOS Nix installation: there is
+  # no host daemon for writes, and exposing it through synthetic.conf makes
+  # /nix a symlink that current Nix rejects during evaluation.
+  if guestOs != goMacos and nixStore.len > 0 and dirExists(nixStore):
     result.add(TartSharedDir(
       tag: "mcl-nix-store",
       hostPath: nixStore,
