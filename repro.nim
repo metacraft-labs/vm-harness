@@ -9,6 +9,19 @@
 import repro_project_dsl
 import ct_test_nim_unittest
 
+# TI2 producer-surface declaration: vm-harness's resource providers live in a
+# SEPARATE module (`src/vm_harness/repro/resources.nim`, re-authored via the RP4
+# `resourceType` macro for RP5c1), NOT inline in this `repro.nim`. This marker
+# NAMES that module + the extra `--path` its imports need, so a consumer that
+# `uses: "vm-harness"` is routed to the driver-free interface-artifact accessor
+# splice (TI2): detection reads it TEXTUALLY, the interface lift compiles the
+# module with the declared `--path`, and the accessor-cache freshness folds the
+# module's import closure in. It expands to NOTHING — this `repro.nim` imports
+# only `repro_project_dsl`, so the core `just build` never pulls in the resource
+# module's incus-backend driver closure (the RP5c1 reprobuild-free invariant).
+resourceModule "src/vm_harness/repro/resources.nim":
+  path "src"
+
 type
   VmHarnessTestSpec = object
     source: string
