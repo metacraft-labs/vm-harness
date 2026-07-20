@@ -10,6 +10,21 @@ proc writeExecutable(path, body: string) =
   setFilePermissions(path, {fpUserRead, fpUserWrite, fpUserExec})
 
 suite "Tart backend commands":
+  test "baseline name selects the Tart image without source-image":
+    let tmp = createTempDir("vmh-tart-unit-", "")
+    defer: removeDir(tmp)
+    let
+      log = tmp / "tart.log"
+      tart = tmp / "tart"
+      image = "ghcr.io/metacraft-labs/macos-tart-runner:tahoe-nix-v1"
+    writeExecutable(tart, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '" & log & "'\n")
+
+    let backend = newTartBackend(guestOs = goMacos, tartCmd = tart)
+    backend.provisionBaseline(BaselineSpec(name: image, guestOs: goMacos))
+
+    check backend.goldenImage == image
+    check "pull " & image in readFile(log)
+
   when defined(macosx):
     test "defaults to the system OpenSSH transport on macOS":
       let backend = newTartBackend(guestOs = goMacos)

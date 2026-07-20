@@ -564,6 +564,12 @@ method provisionBaseline*(b: TartBackend, spec: BaselineSpec) =
   ##    SIGKILL'd before the ``finally`` block could fire.
   if spec.sourceImage.len > 0:
     b.goldenImage = spec.sourceImage
+  elif spec.name.len > 0:
+    # `vm-harness run --baseline <image>` is the established provider
+    # invocation. Treat that logical baseline as the Tart image when no
+    # explicit --source-image override was supplied, so the configured golden
+    # is pulled and cloned instead of the backend's unrelated default image.
+    b.goldenImage = spec.name
   if "ephemeralPrefix" in spec.backendOptions:
     b.ephemeralPrefix = spec.backendOptions["ephemeralPrefix"]
   if b.goldenImage.len == 0:
