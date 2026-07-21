@@ -51,6 +51,8 @@ const
   TypeContainer* = "vm_harness.container"
   TypeExec*      = "vm_harness.exec"
   TypeSnapshot*  = "vm_harness.snapshot"
+  TypeNetwork*   = "vm_harness.network"
+  TypeNic*       = "vm_harness.nic"
 
 # ---------------------------------------------------------------------------
 # Typed attribute records. The resource's ADDRESS (== its identity) is the
@@ -60,9 +62,31 @@ const
 type
   ContainerAttrs* = object
     ## Attributes of a `vm_harness.container` resource. The container name is
-    ## the instance address.
+    ## the instance address. UNCHANGED by S2 — a container's launch/digest is
+    ## exactly as before; network attachment is expressed by a SEPARATE
+    ## `vm_harness.nic` resource (a first-class graph edge), so an existing
+    ## container declaration keeps compiling + behaving identically.
     baseImage*: string       ## base image alias/fingerprint to launch from
     profiles*: seq[string]   ## optional incus profiles
+
+  NetworkAttrs* = object
+    ## Attributes of a `vm_harness.network` resource. The incus network name is
+    ## the instance address (identity == name).
+    cidr*: string            ## ipv4 CIDR passed to `incus network create` as
+                             ## `ipv4.address` (with ipv4.nat + ipv6 none)
+    config*: seq[string]     ## extra `k=v` network settings, verbatim
+
+  NicAttrs* = object
+    ## Attributes of a `vm_harness.nic` resource — a NIC device attaching a
+    ## container to a managed network (S2's container-attachment model, kept as
+    ## a SIBLING resource so `vm_harness.container` stays byte-for-byte
+    ## unchanged). The NIC's logical name is the instance address; it
+    ## `dependsOn` both its container and its network.
+    container*: string       ## target container's address (== its name)
+    network*: string         ## managed network to attach (== its name)
+    device*: string          ## in-guest NIC device name (e.g. "eth1"). The
+                             ## device is added as `<device>` with interface
+                             ## name `<device>`.
 
   ExecAttrs* = object
     ## Attributes of a `vm_harness.exec` resource. The exec's logical name is
@@ -101,6 +125,12 @@ proc execAttrs(inst: ResourceInstance): ExecAttrs =
 
 proc snapshotAttrs(inst: ResourceInstance): SnapshotAttrs =
   TypedExtensionBox[SnapshotAttrs](inst.attrs).val
+
+proc networkAttrs(inst: ResourceInstance): NetworkAttrs =
+  TypedExtensionBox[NetworkAttrs](inst.attrs).val
+
+proc nicAttrs(inst: ResourceInstance): NicAttrs =
+  TypedExtensionBox[NicAttrs](inst.attrs).val
 
 # ===========================================================================
 # vm_harness.container — rdVolatile
@@ -275,3 +305,131 @@ resourceType TypeSnapshot:
   driver: snapshotDriver
   attr container: string
   attr publishAlias: string
+
+# ===========================================================================
+# vm_harness.network — rdHostBound
+#
+# A managed Incus network is REUSABLE on the realizing host (identity == its
+# name), so it is host-bound rather than volatile: a re-reconcile of the same
+# graph on the same host is a cache-hit no-op when the network already exists.
+# ===========================================================================
+
+proc networkIdentity(inst: ResourceInstance): string {.nimcall.} =
+  inst.address
+
+proc networkDigest(inst: ResourceInstance): Digest256 {.nimcall.} =
+  ## Digest of (name, cidr, config) — a CIDR or config change re-realizes.
+  let a = networkAttrs(inst)
+  digestString(inst.typeId & "\x00" & inst.address & "\x00" & a.cidr & "\x00" &
+    a.config.join("\x00"))
+
+proc networkObserve(inst: ResourceInstance;
+                    recorded: Option[ResourceBinding]): ObservedState {.nimcall.} =
+  let b = backend()
+  if b.networkExists(inst.address):
+    result.present = true
+    result.digest = networkDigest(inst)   # live == desired once it exists
+  else:
+    result.present = false
+
+proc networkApply(inst: ResourceInstance; action: ResourceActionKind;
+                  observed: ObservedState): ResourceBinding {.nimcall.} =
+  let a = networkAttrs(inst)
+  let b = backend()
+  if action == rakDestroy:
+    discard b.deleteNetwork(inst.address)
+    return ResourceBinding(
+      address: inst.address, typeId: inst.typeId,
+      resourceId: inst.address, postWriteDigest: networkDigest(inst),
+      present: false)
+  # create / update / replace all converge to a present managed network. Parse
+  # the extra `k=v` config entries into the table the backend op expects.
+  var cfg = initTable[string, string]()
+  for kv in a.config:
+    let eq = kv.find('=')
+    if eq > 0:
+      cfg[kv[0 ..< eq]] = kv[eq + 1 .. ^1]
+  discard b.createNetwork(inst.address, a.cidr, cfg)
+  result = ResourceBinding(
+    address: inst.address, typeId: inst.typeId,
+    resourceId: inst.address, postWriteDigest: networkDigest(inst),
+    present: true)
+
+let networkDriver = ResourceProviderDriver(
+  identity: networkIdentity,
+  digest: networkDigest,
+  observe: networkObserve,
+  apply: networkApply)
+
+resourceType TypeNetwork:
+  attrs: NetworkAttrs
+  wrapper: network
+  determinism: rdHostBound
+  driver: networkDriver
+  attr cidr: string
+  attr config: seq[string]
+
+# ===========================================================================
+# vm_harness.nic — rdVolatile
+#
+# A NIC device attaches a (volatile) container to a (host-bound) network. It is
+# a SIBLING of the container rather than a container attribute, so
+# `vm_harness.container` stays exactly as before — an existing container
+# declaration compiles + behaves identically (the S2 non-regression contract).
+# In a topology graph a nic `dependsOn` BOTH its container and its network, so
+# the reconciler attaches only after both exist. Determinism is rdVolatile: the
+# NIC lives and dies with its volatile container (deleting the container removes
+# its devices), so it is a state-transaction output, not a cacheable artifact.
+# ===========================================================================
+
+proc nicIdentity(inst: ResourceInstance): string {.nimcall.} =
+  let a = nicAttrs(inst)
+  a.container & "!" & a.device
+
+proc nicDigest(inst: ResourceInstance): Digest256 {.nimcall.} =
+  let a = nicAttrs(inst)
+  digestString(inst.typeId & "\x00" & a.container & "\x00" & a.network & "\x00" &
+    a.device)
+
+proc nicObserve(inst: ResourceInstance;
+                recorded: Option[ResourceBinding]): ObservedState {.nimcall.} =
+  ## Present iff the device is already attached to the container. Lets a
+  ## re-reconcile of the same graph be a no-op once the NIC exists.
+  let a = nicAttrs(inst)
+  let b = backend()
+  if b.containerExists(a.container) and a.device in b.listDevices(a.container):
+    result.present = true
+    result.digest = nicDigest(inst)
+  else:
+    result.present = false
+
+proc nicApply(inst: ResourceInstance; action: ResourceActionKind;
+              observed: ObservedState): ResourceBinding {.nimcall.} =
+  let a = nicAttrs(inst)
+  let b = backend()
+  if action == rakDestroy:
+    discard b.removeDevice(a.container, a.device)
+    return ResourceBinding(
+      address: inst.address, typeId: inst.typeId,
+      resourceId: nicIdentity(inst), postWriteDigest: nicDigest(inst),
+      present: false)
+  discard b.addDeviceToContainer(a.container, a.device, a.network)
+  result = ResourceBinding(
+    address: inst.address, typeId: inst.typeId,
+    resourceId: nicIdentity(inst), postWriteDigest: nicDigest(inst),
+    present: true)
+
+let nicDriver = ResourceProviderDriver(
+  identity: nicIdentity,
+  digest: nicDigest,
+  observe: nicObserve,
+  apply: nicApply)
+
+resourceType TypeNic:
+  attrs: NicAttrs
+  wrapper: nic
+  determinism: rdVolatile
+  driver: nicDriver
+  attr container: string
+  attr network: string
+  attr device: string

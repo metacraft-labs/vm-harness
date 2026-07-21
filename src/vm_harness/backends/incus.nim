@@ -255,6 +255,110 @@ proc deleteContainer*(b: IncusBackend, name: string): ExecResult =
   b.runIncus(@["delete", "--force", name], timeoutSec = 60)
 
 # ---------------------------------------------------------------------------
+# Network + NIC-device primitives — the S2 (network-primitive) surface. These
+# map Incus managed networks and per-container NIC attachment onto the CLI in
+# the same style the deployment rehearsal wires the topology (managed bridge
+# with ``ipv4.nat`` + ``ipv6.address=none``; extra segments attached as
+# ``eth1``/``eth2`` NIC devices). Each is a thin ``runIncus`` wrapper following
+# the existing error-raising convention; ``networkExists`` / ``listNetworks`` /
+# ``listDevices`` let the resource driver's ``observe`` check existence first so
+# apply stays idempotent-friendly.
+
+proc networkExists*(b: IncusBackend, name: string): bool =
+  ## ``incus network info <name>`` exits 0 iff the managed network is defined.
+  let r = b.runIncus(@["network", "info", name], timeoutSec = 30)
+  r.exitCode == 0
+
+proc createNetwork*(b: IncusBackend, name, cidr: string;
+                    config: Table[string, string] =
+                      initTable[string, string]()): ExecResult =
+  ## ``incus network create <name> ipv4.address=<cidr> ipv4.nat=true
+  ##   ipv6.address=none [<k>=<v> ...]`` — a managed bridge with the topology's
+  ## network config style (the deployment rehearsal uses ipv4.nat + ipv6 none).
+  ## ``cidr`` is passed verbatim as ``ipv4.address`` (Incus reads a CIDR-form
+  ## address as the gateway + subnet). Extra ``config`` keys are appended as
+  ## additional ``k=v`` settings (they override the defaults if they repeat a
+  ## key, since Incus takes the last value). Raises on non-zero exit.
+  if name.len == 0:
+    raise newException(ValueError, "createNetwork: empty name")
+  if cidr.len == 0:
+    raise newException(ValueError, "createNetwork: empty cidr")
+  var sub = @["network", "create", name,
+              "ipv4.address=" & cidr,
+              "ipv4.nat=true",
+              "ipv6.address=none"]
+  for k, v in config:
+    sub.add(k & "=" & v)
+  result = b.runIncus(sub, timeoutSec = 60)
+  if result.exitCode != 0:
+    raise newVmHarnessError($b.id, lpProvisioning,
+      "incus network create " & name & " failed (exit " &
+      $result.exitCode & "): " & result.stdout)
+
+proc deleteNetwork*(b: IncusBackend, name: string): ExecResult =
+  ## ``incus network delete <name>``. Idempotent-ish: Incus returns non-zero
+  ## for a missing network, which the caller treats as already-clean.
+  b.runIncus(@["network", "delete", name], timeoutSec = 60)
+
+proc listNetworks*(b: IncusBackend): seq[string] =
+  ## ``incus network list --format csv -c n`` — every network the daemon knows
+  ## about (managed + the physical/unmanaged ones it can see). Returns an empty
+  ## seq on error. NOTE: this lists ALL networks on the host — callers assert
+  ## only on their OWN throwaway names, never on live bridges (incusbr0/lxdbr0).
+  let r = b.runIncus(@["network", "list", "--format", "csv", "-c", "n"],
+                     timeoutSec = 30)
+  if r.exitCode != 0:
+    return @[]
+  for line in r.stdout.splitLines():
+    let s = line.strip()
+    if s.len > 0:
+      result.add(s)
+
+proc networkConfigGet*(b: IncusBackend, name, key: string): string =
+  ## ``incus network get <name> <key>`` — a single managed-network config
+  ## value (e.g. ``ipv4.address``), stripped. Empty on error / unset. Lets a
+  ## caller assert the CIDR actually took effect.
+  let r = b.runIncus(@["network", "get", name, key], timeoutSec = 30)
+  if r.exitCode != 0:
+    return ""
+  result = r.stdout.strip()
+
+proc addDeviceToContainer*(b: IncusBackend, container, nic,
+                           network: string): ExecResult =
+  ## ``incus config device add <container> <nic> nic network=<network>
+  ##   name=<nic>`` — attach a managed-network NIC to a container as device
+  ## ``<nic>`` with the in-guest interface name ``<nic>`` (matching the
+  ## rehearsal's ``eth1``/``eth2`` additional-segment wiring). Raises on
+  ## non-zero exit.
+  if container.len == 0 or nic.len == 0 or network.len == 0:
+    raise newException(ValueError,
+      "addDeviceToContainer: container/nic/network must be non-empty")
+  let r = b.runIncus(@["config", "device", "add", container, nic, "nic",
+                       "network=" & network, "name=" & nic], timeoutSec = 60)
+  if r.exitCode != 0:
+    raise newVmHarnessError($b.id, lpProvisioning,
+      "incus config device add " & container & " " & nic & " failed (exit " &
+      $r.exitCode & "): " & r.stdout)
+  result = r
+
+proc removeDevice*(b: IncusBackend, container, nic: string): ExecResult =
+  ## ``incus config device remove <container> <nic>``. Idempotent-ish:
+  ## removing a missing device returns non-zero, treated as already-clean.
+  b.runIncus(@["config", "device", "remove", container, nic], timeoutSec = 60)
+
+proc listDevices*(b: IncusBackend, container: string): seq[string] =
+  ## ``incus config device list <container>`` — the NIC/disk/... device names
+  ## explicitly attached to the container (one per line). Returns an empty seq
+  ## on error. Used to assert a declared NIC actually attached.
+  let r = b.runIncus(@["config", "device", "list", container], timeoutSec = 30)
+  if r.exitCode != 0:
+    return @[]
+  for line in r.stdout.splitLines():
+    let s = line.strip()
+    if s.len > 0:
+      result.add(s)
+
+# ---------------------------------------------------------------------------
 # provisionEphemeralClone + teardown (the per-job core).
 
 proc applyConfig(b: IncusBackend, name: string, spec: EphemeralIncusSpec) =
