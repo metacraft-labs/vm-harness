@@ -53,6 +53,7 @@ const
   TypeSnapshot*  = "vm_harness.snapshot"
   TypeNetwork*   = "vm_harness.network"
   TypeNic*       = "vm_harness.nic"
+  TypeCheck*     = "vm_harness.check"
 
 # ---------------------------------------------------------------------------
 # Typed attribute records. The resource's ADDRESS (== its identity) is the
@@ -94,6 +95,26 @@ type
     container*: string       ## target container's resource address (== name)
     run*: seq[string]        ## argv passed verbatim to `incus exec -- ...`
 
+  CheckAttrs* = object
+    ## Attributes of a `vm_harness.check` resource — a SMOKE-CHECK probe: it
+    ## runs an argv in a container (via `execInGuest`, like `vm_harness.exec`)
+    ## and ASSERTS the result against an expectation. It is `rdVolatile`: a
+    ## probe is a state-transaction (it re-runs every reconcile, never a
+    ## cacheable artifact), and on a mismatch its `apply` RAISES so the
+    ## reconcile FAILS — surfacing the smoke-test failure as a hard error.
+    ##
+    ## The expectation is two independent conditions, BOTH enforced:
+    ##   * `expectExit` — the probe must exit with exactly this code
+    ##     (default 0).
+    ##   * `expectStdout` — when non-empty, the probe's stdout must CONTAIN
+    ##     this string as a substring. Empty ⇒ no stdout constraint (exit-only
+    ##     check). Substring (not exact) is chosen so a probe like `curl` whose
+    ##     body may carry a trailing newline still matches the declared body.
+    container*: string       ## container to run the probe in (== its name)
+    run*: seq[string]        ## the probe argv, passed verbatim to `incus exec`
+    expectStdout*: string    ## required stdout SUBSTRING; empty ⇒ unchecked
+    expectExit*: int         ## required exit code (default 0)
+
   SnapshotAttrs* = object
     ## Attributes of a `vm_harness.snapshot` resource. The snapshot name is
     ## the instance address.
@@ -125,6 +146,9 @@ proc execAttrs(inst: ResourceInstance): ExecAttrs =
 
 proc snapshotAttrs(inst: ResourceInstance): SnapshotAttrs =
   TypedExtensionBox[SnapshotAttrs](inst.attrs).val
+
+proc checkAttrs(inst: ResourceInstance): CheckAttrs =
+  TypedExtensionBox[CheckAttrs](inst.attrs).val
 
 proc networkAttrs(inst: ResourceInstance): NetworkAttrs =
   TypedExtensionBox[NetworkAttrs](inst.attrs).val
@@ -433,3 +457,73 @@ resourceType TypeNic:
   attr container: string
   attr network: string
   attr device: string
+
+# ===========================================================================
+# vm_harness.check — rdVolatile
+#
+# A SMOKE-CHECK probe: run an argv in a container and ASSERT the result. Like
+# `vm_harness.exec` it is a volatile state-transaction (re-runs every reconcile,
+# no durable observable of its own → `observe` reports present=false, i.e.
+# always-needs-apply), but unlike `exec` it carries an EXPECTATION: on a
+# mismatch `apply` RAISES so the reconcile FAILS, surfacing the smoke-test
+# failure as a hard error. In a topology graph a check `dependsOn` the nodes it
+# probes (and the NICs wiring them), so it runs only once the topology is up.
+# ===========================================================================
+
+proc checkIdentity(inst: ResourceInstance): string {.nimcall.} =
+  let a = checkAttrs(inst)
+  a.container & "?" & inst.address
+
+proc checkDigest(inst: ResourceInstance): Digest256 {.nimcall.} =
+  let a = checkAttrs(inst)
+  digestString(inst.typeId & "\x00" & a.container & "\x00" & a.run.join("\x00") &
+    "\x00" & a.expectStdout & "\x00" & $a.expectExit)
+
+proc checkObserve(inst: ResourceInstance;
+                  recorded: Option[ResourceBinding]): ObservedState {.nimcall.} =
+  ## A check is a VOLATILE probe with no durable observable — always re-checks.
+  result.present = false
+
+proc checkApply(inst: ResourceInstance; action: ResourceActionKind;
+                observed: ObservedState): ResourceBinding {.nimcall.} =
+  let a = checkAttrs(inst)
+  if action == rakDestroy:
+    # A probe has no standalone lifecycle to tear down.
+    return ResourceBinding(
+      address: inst.address, typeId: inst.typeId,
+      resourceId: checkIdentity(inst), postWriteDigest: checkDigest(inst),
+      present: false)
+  let b = backend()
+  let r = b.execInGuest(handleFor(a.container), initTable[string, string](), a.run)
+  # ASSERT the expectation. Any mismatch RAISES so reconcile FAILS (the whole
+  # point of a smoke-check: a wrong result must surface, not pass silently).
+  if r.exitCode != a.expectExit:
+    raise newException(CatchableError,
+      "vm_harness.check '" & inst.address & "' in container '" & a.container &
+      "': expected exit " & $a.expectExit & " but got " & $r.exitCode &
+      " (stdout: " & r.stdout & ")")
+  if a.expectStdout.len > 0 and a.expectStdout notin r.stdout:
+    raise newException(CatchableError,
+      "vm_harness.check '" & inst.address & "' in container '" & a.container &
+      "': stdout did not contain expected '" & a.expectStdout & "' (got: '" &
+      r.stdout & "')")
+  result = ResourceBinding(
+    address: inst.address, typeId: inst.typeId,
+    resourceId: checkIdentity(inst), postWriteDigest: checkDigest(inst),
+    present: true)
+
+let checkDriver = ResourceProviderDriver(
+  identity: checkIdentity,
+  digest: checkDigest,
+  observe: checkObserve,
+  apply: checkApply)
+
+resourceType TypeCheck:
+  attrs: CheckAttrs
+  wrapper: check
+  determinism: rdVolatile
+  driver: checkDriver
+  attr container: string
+  attr run: seq[string]
+  attr expectStdout: string
+  attr expectExit: int
