@@ -33,6 +33,7 @@ import ./backends/lima
 import ./backends/libvirt
 import ./backends/incus
 {.pop.}
+import ./prune
 
 type
   LogFormat* = enum
@@ -133,6 +134,13 @@ type
                                  ## the guest's FirstLogonCommands can install
                                  ## it in ``authorized_keys`` before the
                                  ## controller first reaches out over SSH.
+    stateDir*: string            ## ``--state-dir <dir>`` — ``prune`` scope for
+                                 ## the qemu-windows-arm state directory.
+    olderThanSec*: int           ## ``--older-than <sec>`` — ``prune`` age guard.
+    olderThanSet*: bool          ## whether ``--older-than`` was supplied.
+    dryRun*: bool                ## ``--dry-run`` — ``prune`` reports only.
+    sweepTmp*: bool              ## ``--sweep-tmp`` — also age-sweep transient
+                                 ## ``/tmp`` scratch files during ``prune``.
 
 const HelpText = """
 vm-harness <subcommand> [flags]
@@ -164,6 +172,16 @@ Subcommands:
   baseline import <src-dir>
                           Import a previously-exported baseline bundle.
                           Prints the snapshot names now available.
+  prune --ephemeral-prefix <p> [--backend all|tart|qemu-windows-arm]
+        [--state-dir <dir>] [--older-than <sec>] [--sweep-tmp] [--dry-run]
+                          Reclaim ephemeral instances/clones leaked by
+                          hard-killed launchers, scoped to --ephemeral-prefix.
+                          A running instance (advisory lock held, or creator
+                          PID alive) is never removed. --older-than guards the
+                          PID-fallback path (default 3600s; 0 disables).
+                          --sweep-tmp also age-removes transient /tmp scratch
+                          files (SSH password files, mount-share scripts).
+                          --dry-run reports what would be reclaimed.
 
 Common flags:
   --backend <auto|noop|hyperv|wsl|tart-macos|tart-linux-arm|
@@ -411,6 +429,17 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i
     of "--running":
       result.running = true
+      inc i
+    of "--state-dir":
+      inc i; result.stateDir = args[i]; inc i
+    of "--older-than":
+      inc i; result.olderThanSec = parseInt(args[i]); result.olderThanSet = true
+      inc i
+    of "--dry-run":
+      result.dryRun = true
+      inc i
+    of "--sweep-tmp":
+      result.sweepTmp = true
       inc i
     of "-h", "--help":
       result.subcommand = "help"
@@ -940,6 +969,55 @@ proc cmdBaseline(opts: CliOpts): int =
     stderr.writeLine("  actions: export, import")
     2
 
+proc cmdPrune(opts: CliOpts): int =
+  ## Reclaim ephemeral resources leaked by hard-killed launchers, scoped to a
+  ## project's ``--ephemeral-prefix``. Never touches anything outside that
+  ## scope and never removes an instance whose owner is still alive.
+  if opts.ephemeralPrefix.len == 0:
+    stderr.writeLine(
+      "vm-harness prune: --ephemeral-prefix is required (project scope)")
+    return 2
+  var backend = opts.backend
+  if backend.len == 0 or backend == "auto":
+    backend = "all"
+  if backend notin ["all", "tart", "qemu-windows-arm"]:
+    stderr.writeLine(
+      "vm-harness prune: --backend must be all|tart|qemu-windows-arm")
+    return 2
+  let scope = PruneScope(
+    ephemeralPrefix: opts.ephemeralPrefix,
+    stateDir: opts.stateDir,
+    olderThanSec: (if opts.olderThanSet: opts.olderThanSec else: DefaultPruneAgeSec),
+    dryRun: opts.dryRun,
+    backend: backend,
+    sweepTmp: opts.sweepTmp)
+  let rep = runPrune(scope)
+  let mib = rep.bytesReclaimed.float / (1024.0 * 1024.0)
+  if opts.logFormat == lfJson:
+    echo $(%*{
+      "event": "prune",
+      "dryRun": opts.dryRun,
+      "ephemeralPrefix": opts.ephemeralPrefix,
+      "backend": backend,
+      "olderThanSec": scope.olderThanSec,
+      "removedInstanceDirs": rep.removedInstanceDirs,
+      "liveInstanceDirs": rep.liveInstanceDirs,
+      "freshInstanceDirs": rep.freshInstanceDirs,
+      "removedTartClones": rep.removedTartClones,
+      "liveTartClones": rep.liveTartClones,
+      "removedTmpFiles": rep.removedTmpFiles,
+      "bytesReclaimed": rep.bytesReclaimed})
+  else:
+    let verb = if opts.dryRun: "would reclaim" else: "reclaimed"
+    echo &"vm-harness prune ({backend}, prefix '{opts.ephemeralPrefix}'): " &
+         &"{verb} {rep.removedInstanceDirs.len} instance dir(s), " &
+         &"{rep.removedTartClones.len} tart clone(s), " &
+         &"{rep.removedTmpFiles.len} tmp file(s) " &
+         &"(~{mib:.1f} MiB); kept {rep.liveInstanceDirs.len} live + " &
+         &"{rep.freshInstanceDirs.len} fresh instance dir(s), " &
+         &"{rep.liveTartClones.len} live tart clone(s)."
+  0
+
 proc runCli*(args: seq[string]): int =
   var opts: CliOpts
   try:
@@ -961,6 +1039,7 @@ proc runCli*(args: seq[string]): int =
   of "shell":     return cmdShell(opts)
   of "snapshot":  return cmdSnapshot(opts)
   of "baseline":  return cmdBaseline(opts)
+  of "prune":     return cmdPrune(opts)
   else:
     stderr.writeLine("vm-harness: unknown subcommand '" & opts.subcommand & "'")
     stderr.writeLine(HelpText)

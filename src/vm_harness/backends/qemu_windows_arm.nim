@@ -17,6 +17,7 @@ import ../auto
 type
   QemuWindowsArmBackend* = ref object of VmBackend
     qemuCmd*: string
+    qemuImgCmd*: string
     swtpmCmd*: string
     sshpassCmd*: string
     sshCmd*: string
@@ -34,6 +35,9 @@ type
     baselineMemoryMB*: Table[string, int]
     qemuPids*: Table[string, int]
     swtpmPids*: Table[string, int]
+    instanceLockFds*: Table[string, cint]  ## per-instance lock fds, held for
+                                            ## the instance lifetime; OS releases
+                                            ## them if this launcher crashes.
 
 const
   DefaultQemuWindowsArmPrefix* = "repro-vm-qemu-windows-arm"
@@ -44,6 +48,17 @@ const
   QemuPortAllocationAttempts = 5
   QemuSshAttempts = 5
   QemuSshRetryDelayMs = 2000
+  # Ephemeral disk layout. The baseline directory holds an immutable golden
+  # ``windows.qcow2``; each ephemeral instance boots from a thin
+  # ``overlay.qcow2`` whose qcow2 backing file is that golden. The golden is
+  # shared read-only across every concurrent instance, so a leaked instance
+  # costs only its write-delta instead of a full disk copy.
+  QwaBaseDiskName* = "windows.qcow2"
+  QwaOverlayDiskName* = "overlay.qcow2"
+  QwaInstanceLockName* = ".instance.lock"
+  # Disk provisioning modes for ``VMH_QEMU_WINDOWS_ARM_DISK_MODE``.
+  QwaDiskModeOverlay* = "overlay"   ## qcow2 backing overlay (default)
+  QwaDiskModeClone* = "clone"       ## whole-file clone (clonefile/copy)
 
 type
   PortAllocationLock* = object
@@ -69,12 +84,14 @@ proc newQemuWindowsArmBackend*(qemuCmd: string = "qemu-system-aarch64",
                                sshPort: int = 2223,
                                bootTimeoutSec: int = 300,
                                sshReadyTimeoutSec: int = 300,
-                               probeTimeoutSec: int = 10): QemuWindowsArmBackend =
+                               probeTimeoutSec: int = 10,
+                               qemuImgCmd: string = "qemu-img"): QemuWindowsArmBackend =
   result = QemuWindowsArmBackend(
     id: biQemuWindowsArm,
     hostPlatform: hpMacosArm,
     supportedGuests: {goWindows},
     qemuCmd: qemuCmd,
+    qemuImgCmd: qemuImgCmd,
     swtpmCmd: swtpmCmd,
     sshpassCmd: sshpassCmd,
     sshCmd: sshCmd,
@@ -91,7 +108,8 @@ proc newQemuWindowsArmBackend*(qemuCmd: string = "qemu-system-aarch64",
     baselineCpus: initTable[string, int](),
     baselineMemoryMB: initTable[string, int](),
     qemuPids: initTable[string, int](),
-    swtpmPids: initTable[string, int]())
+    swtpmPids: initTable[string, int](),
+    instanceLockFds: initTable[string, cint]())
 
 proc runProcessCapture(cmd: seq[string], cwd: string = "",
                       timeoutSec: int = 0,
@@ -145,6 +163,81 @@ proc ephemeralName*(prefix: string, epochMs: int64, pid: int): string =
 
 proc ephemeralDirFor*(stateDir, name: string): string =
   stateDir / "instances" / name
+
+proc ephemeralPidFromName*(name: string): int =
+  ## The creating process id is the last ``-``-separated field of
+  ## ``<prefix>-<epochMs>-<pid>``. Returns 0 when it cannot be parsed.
+  let idx = name.rfind('-')
+  if idx < 0 or idx == name.high:
+    return 0
+  try: parseInt(name[idx + 1 .. ^1])
+  except ValueError: 0
+
+when defined(posix):
+  # BSD advisory locks (``flock``). Unlike ``lockf``/fcntl locks — which are
+  # owned by the process and so are invisible to a same-process probe — a
+  # ``flock`` is owned by the open file description. A separate ``open`` of
+  # the same lock file therefore conflicts even within one process, which
+  # makes the liveness check behave identically whether ``prune`` runs in the
+  # launcher's process or (as in production) a different one. The OS drops the
+  # lock automatically when the owning fd is closed, including on crash.
+  proc c_flock(fd: cint, op: cint): cint
+    {.importc: "flock", header: "<sys/file.h>".}
+  const
+    LockExclusive = cint(2)   ## LOCK_EX
+    LockNonBlock = cint(4)    ## LOCK_NB
+    LockUnlock = cint(8)      ## LOCK_UN
+
+proc qwaInstanceLockPath*(vmDir: string): string =
+  vmDir / QwaInstanceLockName
+
+proc qwaDiskImagePath*(vmDir: string): string =
+  ## The disk QEMU boots from: the thin ``overlay.qcow2`` when present
+  ## (overlay mode), otherwise the whole-file ``windows.qcow2`` (clone mode
+  ## and legacy instances).
+  let overlay = vmDir / QwaOverlayDiskName
+  if fileExists(overlay): overlay else: vmDir / QwaBaseDiskName
+
+proc pidAlive*(pid: int): bool =
+  ## Best-effort liveness check. ``kill(pid, 0)`` succeeds while the process
+  ## exists (or fails with EPERM, which still means it is alive).
+  if pid <= 0:
+    return false
+  when defined(posix):
+    let rc = posix.kill(Pid(pid), cint(0))
+    if rc == 0:
+      return true
+    return errno == EPERM
+  else:
+    return false
+
+proc instanceDirOwnerAlive*(vmDir: string): bool =
+  ## True when the launcher that owns ``vmDir`` is still running. Preference
+  ## order:
+  ##   1. The per-instance advisory lock (``.instance.lock``). If it is held
+  ##      by another process the owner is alive; if we can take it the owner
+  ##      is gone. This is race-free and immune to PID recycling.
+  ##   2. Legacy instances predate the lock file: fall back to the creator
+  ##      PID embedded in the directory name. Prune callers pair this with an
+  ##      age guard so a recycled PID cannot mask a genuine orphan.
+  when defined(posix):
+    let lockPath = qwaInstanceLockPath(vmDir)
+    if fileExists(lockPath):
+      let fd = posix.open(lockPath.cstring, O_RDWR, Mode(0o600))
+      if fd < 0:
+        # Cannot open the lock; assume alive rather than risk deleting a
+        # running instance.
+        return true
+      defer: discard posix.close(fd)
+      # Non-blocking test lock. Success => nobody holds it => owner is dead.
+      if c_flock(fd, LockExclusive or LockNonBlock) == 0:
+        discard c_flock(fd, LockUnlock)
+        return false
+      return true
+    else:
+      return pidAlive(ephemeralPidFromName(extractFilename(vmDir)))
+  else:
+    return pidAlive(ephemeralPidFromName(extractFilename(vmDir)))
 
 proc tcpPortAvailable(port: int): bool =
   try:
@@ -240,7 +333,7 @@ proc qemuFirmwareArgs(vmDir: string): seq[string] =
 
 proc buildQemuWindowsArmArgs*(vmDir: string, sshPort: int,
                               cpus: int = 4, memoryMB: int = 8192): seq[string] =
-  let disk = vmDir / "windows.qcow2"
+  let disk = qwaDiskImagePath(vmDir)
   let tpmSock = shortSocketPath("vmh-qwa-tpm", vmDir)
   let serialLog = vmDir / "serial.log"
   let monitorSock = shortSocketPath("vmh-qwa-mon", vmDir)
@@ -339,17 +432,16 @@ proc cloneOneFile(src, dst: string) =
       return
   copyFile(src, dst)
 
-proc createEphemeralCopy*(baselineDir, destDir: string) =
-  let base = validateWindowsArmVmDir(baselineDir)
-  if dirExists(destDir):
-    removeDir(destDir)
-  createDir(destDir)
+proc copyFirmwareAndTpm(base, destDir: string) =
+  ## Clone the small per-instance firmware bits (UEFI vars ``.fd``, option
+  ## ROMs) and seed a writable TPM state directory. These are raw/pflash
+  ## files that cannot use a qcow2 backing chain, but they are only a few MB
+  ## so a clonefile/copy is cheap.
   for kind, path in walkDir(base):
     if kind != pcFile:
       continue
     let name = extractFilename(path)
-    if name == "windows.qcow2" or name.endsWith(".fd") or
-       name.endsWith(".rom") or name.endsWith(".bin"):
+    if name.endsWith(".fd") or name.endsWith(".rom") or name.endsWith(".bin"):
       cloneOneFile(path, destDir / name)
   if dirExists(base / "tpm"):
     copyDir(base / "tpm", destDir / "tpm")
@@ -357,6 +449,80 @@ proc createEphemeralCopy*(baselineDir, destDir: string) =
     except CatchableError: discard
   else:
     createDir(destDir / "tpm")
+
+proc createEphemeralCopy*(baselineDir, destDir: string) =
+  ## Clone mode: a full independent ``windows.qcow2`` per instance
+  ## (APFS clonefile on macOS, byte copy elsewhere). Retained as a fallback
+  ## for ``VMH_QEMU_WINDOWS_ARM_DISK_MODE=clone``.
+  let base = validateWindowsArmVmDir(baselineDir)
+  if dirExists(destDir):
+    removeDir(destDir)
+  createDir(destDir)
+  cloneOneFile(base / QwaBaseDiskName, destDir / QwaBaseDiskName)
+  copyFirmwareAndTpm(base, destDir)
+
+proc createEphemeralOverlay*(baselineDir, destDir, qemuImgCmd: string) =
+  ## Overlay mode (default): create a thin ``overlay.qcow2`` whose qcow2
+  ## backing file is the immutable golden ``windows.qcow2``. The golden is
+  ## never copied and is shared read-only across every concurrent instance;
+  ## the overlay records only the guest's writes. ``qemu-img create`` fails
+  ## fast if the backing image is missing or unreadable.
+  let base = validateWindowsArmVmDir(baselineDir)
+  if dirExists(destDir):
+    removeDir(destDir)
+  createDir(destDir)
+  let backing = base / QwaBaseDiskName   # ``base`` is already absolutePath'd
+  let overlay = destDir / QwaOverlayDiskName
+  let createArgs = @[qemuImgCmd, "create",
+    "-f", "qcow2",
+    "-b", backing,
+    "-F", "qcow2",
+    overlay]
+  let r = runProcessCapture(createArgs, timeoutSec = 120)
+  if r.exitCode != 0:
+    raise newVmHarnessError($biQemuWindowsArm, lpProvisioning,
+      "qemu-img create (CoW overlay over " & backing & ") failed (exit " &
+      $r.exitCode & "): " & r.stdout & r.stderr)
+  copyFirmwareAndTpm(base, destDir)
+
+proc qwaDiskMode*(): string =
+  ## ``overlay`` (default) or ``clone``, from
+  ## ``VMH_QEMU_WINDOWS_ARM_DISK_MODE``.
+  let m = getEnv("VMH_QEMU_WINDOWS_ARM_DISK_MODE").strip().toLowerAscii()
+  if m == QwaDiskModeClone: QwaDiskModeClone else: QwaDiskModeOverlay
+
+proc createEphemeralInstance*(b: QemuWindowsArmBackend,
+                              baselineDir, destDir: string) =
+  ## Provision an ephemeral instance disk using the configured disk mode,
+  ## then take the per-instance advisory lock so ``prune`` can tell a live
+  ## instance from an orphaned one.
+  if qwaDiskMode() == QwaDiskModeClone:
+    createEphemeralCopy(baselineDir, destDir)
+  else:
+    createEphemeralOverlay(baselineDir, destDir, b.qemuImgCmd)
+
+proc acquireInstanceLock*(b: QemuWindowsArmBackend, name, vmDir: string) =
+  ## Create + hold ``<vmDir>/.instance.lock`` for the instance's lifetime.
+  ## The fd is kept open in ``instanceLockFds``; if this launcher exits or
+  ## crashes the OS drops the lock, which is exactly the liveness signal
+  ## ``prune`` relies on.
+  when defined(posix):
+    let lockPath = qwaInstanceLockPath(vmDir)
+    let fd = posix.open(lockPath.cstring, O_CREAT or O_RDWR, Mode(0o600))
+    if fd < 0:
+      return
+    if c_flock(fd, LockExclusive or LockNonBlock) != 0:
+      discard posix.close(fd)
+      return
+    b.instanceLockFds[name] = fd
+
+proc releaseInstanceLock*(b: QemuWindowsArmBackend, name: string) =
+  when defined(posix):
+    if name in b.instanceLockFds:
+      let fd = b.instanceLockFds[name]
+      discard c_flock(fd, LockUnlock)
+      discard posix.close(fd)
+      b.instanceLockFds.del(name)
 
 proc waitForSshReady*(b: QemuWindowsArmBackend, port: int,
                     timeoutSec: int): bool =
@@ -522,7 +688,8 @@ method revertToBaseline*(b: QemuWindowsArmBackend, baselineName: string): VmHand
   let name = ephemeralName(b.ephemeralPrefix, int64(epochTime() * 1000),
                            getCurrentProcessId())
   let vmDir = ephemeralDirFor(b.stateDir, name)
-  createEphemeralCopy(baselineDir, vmDir)
+  b.createEphemeralInstance(baselineDir, vmDir)
+  b.acquireInstanceLock(name, vmDir)
   let cpus = if baselineName in b.baselineCpus: b.baselineCpus[baselineName] else: 4
   let memoryMB =
     if baselineName in b.baselineMemoryMB: b.baselineMemoryMB[baselineName]
@@ -690,6 +857,9 @@ method stopAndCleanup*(b: QemuWindowsArmBackend, vm: VmHandle,
       discard runProcessCapture(@["/bin/kill", "-KILL", swtpmPidText], timeoutSec = 5)
     if vm.name in b.swtpmPids:
       b.swtpmPids.del(vm.name)
+    # Release the per-instance lock before removing the directory so the fd
+    # and its lock file go away together.
+    b.releaseInstanceLock(vm.name)
     if deleteVm:
       let vmDir = vm.extra.getOrDefault("vmDir", "")
       if vmDir.len > 0 and dirExists(vmDir):
@@ -701,6 +871,7 @@ registerBackend(biQemuWindowsArm,
   proc(): VmBackend =
     newQemuWindowsArmBackend(
       qemuCmd = getEnv("VMH_QEMU_WINDOWS_ARM_QEMU_CMD", "qemu-system-aarch64"),
+      qemuImgCmd = getEnv("VMH_QEMU_WINDOWS_ARM_QEMU_IMG_CMD", "qemu-img"),
       swtpmCmd = getEnv("VMH_QEMU_WINDOWS_ARM_SWTPM_CMD", "swtpm"),
       sshpassCmd = getEnv("VMH_QEMU_WINDOWS_ARM_SSHPASS_CMD", "sshpass"),
       sshCmd = getEnv("VMH_QEMU_WINDOWS_ARM_SSH_CMD", "ssh"),
