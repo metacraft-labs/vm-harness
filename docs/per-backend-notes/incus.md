@@ -130,8 +130,9 @@ The Linux/container analog of the Windows M3 golden. Deliverables:
   `/opt/actions-runner`, an unprivileged `runner` user (passwordless sudo;
   the runner refuses to run as root), and the .NET runtime deps
   (`libicu72/libssl3/zlib1g/libkrb5-3` — already in the cloud base, so no
-  apt is needed). Build (idempotent; `im2-bld-runner` throwaway + the
-  `vmh-linux-runner` alias only):
+  apt is needed). Build (idempotent; a per-alias `vmh-bld-<alias>` throwaway
+  container + the `vmh-linux-runner` alias only — override the build container
+  with `VMH_BUILD_CONTAINER`):
 
   ```sh
   export VMH_INCUS_CMD="sudo -n incus"
