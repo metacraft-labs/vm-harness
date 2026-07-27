@@ -27,9 +27,11 @@
 # curled in-guest. It is streamed, NOT `incus file push`ed, because on this
 # host `incus file push` corrupts large tarballs (blocker A).
 #
-# Reproducible + idempotent: safe to re-run. Uses ONLY the `im2-bld-runner`
-# throwaway container name + the `vmh-linux-runner` alias — never touches
-# unrelated host containers/images.
+# Reproducible + idempotent: safe to re-run. Uses ONLY a throwaway build
+# container derived from the target alias (`vmh-bld-<alias>`, see
+# VMH_BUILD_CONTAINER below) + that output alias — never touches unrelated host
+# containers/images, and never collides with a concurrent build of a different
+# alias.
 #
 # Usage:
 #   ./build-runner-image.sh
@@ -44,6 +46,9 @@
 # Env:
 #   VMH_INCUS_CMD       incus invocation        (default: incus)
 #   VMH_RUNNER_ALIAS    output image alias       (default: vmh-linux-runner)
+#   VMH_BUILD_CONTAINER throwaway build container (default: vmh-bld-<alias w/o
+#                       name; MUST be unique per   the leading `vmh-`>, so a
+#                       concurrent alias           per-alias build never clashes)
 #   VMH_CLOUD_BASE      local cloud base alias   (default: im2-debian-cloud)
 #   VMH_CLOUD_REMOTE    remote to copy if base
 #                       absent                   (default: images:debian/12/cloud)
@@ -96,7 +101,15 @@ RUNNER_USER="${VMH_RUNNER_USER:-runner}"
 # Default to the GARM-expected cached path /home/<user>/actions-runner so the
 # per-job bootstrap uses the baked runner instead of re-downloading it.
 RUNNER_CACHE="${VMH_RUNNER_CACHE:-/home/${RUNNER_USER}/actions-runner}"
-BLD="im2-bld-runner"
+# Throwaway build container. DERIVED FROM THE TARGET ALIAS so that two
+# invocations of this same recipe for DIFFERENT aliases (e.g. the plain
+# `vmh-linux-runner` and the nested `vmh-linux-runner-nested`) never share one
+# build container. They previously both hard-coded `im2-bld-runner`, so when
+# both ran at once each recipe's opening `incus delete --force "$BLD"` destroyed
+# the other's in-flight container and both builds failed (SIGKILL/137 on the
+# next `incus exec`) and crash-looped, producing no image. Overridable for
+# callers that need an explicit name.
+BLD="${VMH_BUILD_CONTAINER:-vmh-bld-${ALIAS#vmh-}}"
 
 # HR1 (nested Docker): when VMH_RUNNER_DOCKER is set (=1), bake docker/moby +
 # fuse-overlayfs into the image so a per-job container launched with the
