@@ -10,6 +10,16 @@ Rust port lives at `agent-harbor/main/crates/ah-vm/` (M17 of the
 
 [campaign]: https://github.com/metacraft-labs/reprobuild-specs/blob/main/Multi-OS-VM-Automation-Campaign.milestones.org
 
+> **Need to boot / provision / drive / record a guest OS (Linux, macOS, or
+> Windows incl. Windows-on-ARM)? Use this — don't hand-roll
+> `qemu`/`swtpm`/`tart`/`limactl`/`autounattend.xml`.** The backends below cover
+> the lifecycle; the one-time "how to build a golden guest" scripts live in
+> **`guest-recipes/`** (e.g. `guest-recipes/windows-arm-base/` is the maintained
+> Win11-on-ARM golden — official ISO + autounattend + OpenSSH + VirtIO, built via
+> **UTM** because raw `qemu` can't cleanly hand the Win11-ARM installer off to
+> WinPE). Consumers add only their task-specific logic on top (see "Three-tier
+> ownership").
+
 ## Status
 
 Shipped milestones:
