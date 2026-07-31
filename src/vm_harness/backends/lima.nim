@@ -63,6 +63,16 @@ type
       ## ``BaselineSpec.sourceImage`` (which is treated as a path or
       ## ``template://...`` reference depending on whether it begins
       ## with ``template:`` / ``file://`` / ``http``).
+    baselineSourceImage*: string
+      ## Effective ``--source-image`` / template override, persisted so
+      ## it reaches BOTH the session (``provisionBaseline``) AND every
+      ## per-gate (``revertToBaseline``) ``limactl create``. Without
+      ## this, a pinned image (e.g. ``template:ubuntu-24.04``) applied
+      ## at provision time was silently dropped on revert, so every
+      ## ephemeral fell back to the embedded default template. Set from
+      ## ``newLimaBackend(sourceImage=...)`` or refreshed from
+      ## ``BaselineSpec.sourceImage`` on each ``provisionBaseline``.
+      ## Empty ⇒ embedded :const:`DefaultLimaTemplate`.
     bootTimeoutSec*: int
       ## How long ``limactl start --timeout`` waits for the instance
       ## to be running. Default 180 (Lima boots cloud-init from cold
@@ -115,10 +125,16 @@ proc newLimaBackend*(limactlCmd: string = "limactl",
                      bootTimeoutSec: int = DefaultLimaBootTimeoutSec,
                      cpus: int = 0,
                      memoryGiB: int = 0,
-                     diskGiB: int = 0): LimaBackend =
+                     diskGiB: int = 0,
+                     sourceImage: string = ""): LimaBackend =
   ## Construct a LimaBackend. ``templateText`` defaults to the
   ## embedded :const:`DefaultLimaTemplate`; pass a non-empty string
   ## to override (or set ``BaselineSpec.sourceImage`` per call).
+  ##
+  ## ``sourceImage`` pins the ``--source-image`` / template override
+  ## for the lifetime of the backend so it governs BOTH
+  ## ``provisionBaseline`` and every per-gate ``revertToBaseline``.
+  ## Empty ⇒ embedded :const:`DefaultLimaTemplate`.
   result = LimaBackend(
     id: biLima,
     hostPlatform: hpMacosArm,
@@ -127,6 +143,7 @@ proc newLimaBackend*(limactlCmd: string = "limactl",
     ephemeralPrefix: ephemeralPrefix,
     templateText: if templateText.len > 0: templateText
                   else: DefaultLimaTemplate,
+    baselineSourceImage: sourceImage,
     bootTimeoutSec: bootTimeoutSec,
     cpus: cpus,
     memoryGiB: memoryGiB,
@@ -455,10 +472,17 @@ method provisionBaseline*(b: LimaBackend, spec: BaselineSpec) =
   ##    create`` doesn't bear the download cost (best-effort, never
   ##    raises).
   ##
-  ## ``BaselineSpec.sourceImage``, when non-empty, overrides the
-  ## backend's default template for subsequent ``createLimaInstance``
-  ## calls. We don't pre-fetch when ``sourceImage`` is set — the user
-  ## may have supplied a one-off template that isn't worth caching.
+  ## ``BaselineSpec.sourceImage``, when non-empty, is persisted into
+  ## ``b.baselineSourceImage`` so it overrides the backend's default
+  ## template for EVERY subsequent ``createLimaInstance`` — both the
+  ## session pre-fetch here AND each per-gate ``revertToBaseline``.
+  ## (The ``run`` CLI path relies on this: it provisions once and then
+  ## reverts on the same backend instance, so pinning the image here is
+  ## what makes it reach revert.) We don't pre-fetch when
+  ## ``sourceImage`` is set — the user may have supplied a one-off
+  ## template that isn't worth caching.
+  if spec.sourceImage.len > 0:
+    b.baselineSourceImage = spec.sourceImage
   if spec.cpus > 0 and b.cpus == 0:
     b.cpus = spec.cpus
   if spec.memoryMB > 0 and b.memoryGiB == 0:
@@ -493,7 +517,10 @@ method revertToBaseline*(b: LimaBackend, baselineName: string): VmHandle =
   if ephemeral in existing:
     b.stopLimaInstance(ephemeral)
     b.deleteLimaInstance(ephemeral)
-  b.createLimaInstance(ephemeral)
+  # Thread the pinned source-image/template through so per-gate
+  # ephemerals honor it too. Empty ⇒ embedded DefaultLimaTemplate
+  # (unchanged default behavior).
+  b.createLimaInstance(ephemeral, b.baselineSourceImage)
   try:
     b.startLimaInstance(ephemeral)
   except CatchableError:
@@ -517,7 +544,8 @@ method revertToBaseline*(b: LimaBackend, baselineName: string): VmHandle =
     sshUser: "",  # filled by Lima from the user's config
     sshAuth: SshAuth(kind: saKeyFile,
                      keyPath: getHomeDir() / ".lima" / "_config" / "user"),
-    extra: {"limaTemplate": "embedded",
+    extra: {"limaTemplate": (if b.baselineSourceImage.len > 0:
+                               b.baselineSourceImage else: "embedded"),
             "instanceName": ephemeral}.toTable)
 
 method execInGuest*(b: LimaBackend, vm: VmHandle,
@@ -584,8 +612,38 @@ method copyToGuest*(b: LimaBackend, vm: VmHandle,
   if parent.len > 0 and parent != "/" and parent != ".":
     discard b.execInGuest(vm, initTable[string, string](),
                           @["mkdir", "-p", parent], timeoutSec = 30)
-  b.limactlCopy(hostPath, vm.name & ":" & guestPath,
-                recursive = dirExists(hostPath))
+  if dirExists(hostPath):
+    # DIRECTORY: tar-stream instead of ``limactl copy --recursive``
+    # (scp -r), which mishandles directory trees containing spaces or
+    # other odd filenames. We archive on the host with ``-C <parent>
+    # <basename>`` (no shell globbing) and pipe the archive into an
+    # in-guest ``tar -xf -`` rooted at the destination's parent, so
+    # the tree lands at ``<parentOf(guestPath)>/<basename(hostPath)>``.
+    let hostParent = parentDir(hostPath)
+    let base = extractFilename(hostPath.strip(
+      leading = false, chars = {DirSep}))
+    let guestParent = parentDir(guestPath)
+    # Produce the archive on the host. ``runLimactl`` runs an arbitrary
+    # ``/bin/sh -c`` argv with temp-file capture; host ``tar`` is silent
+    # on success so its merged (2>&1) stderr stays empty — we bail on
+    # any non-zero exit rather than shipping a corrupt archive.
+    let tarball = runLimactl(@["tar", "-cf", "-", "-C", hostParent, base],
+                             timeoutSec = 600)
+    if tarball.exitCode != 0:
+      raise newVmHarnessError($b.id, lpCopy,
+        "host tar of '" & hostPath & "' failed (exit " &
+        $tarball.exitCode & "): " & tarball.stdout)
+    let r = b.execInGuest(vm, initTable[string, string](),
+                          @["tar", "-xf", "-", "-C", guestParent],
+                          stdin = tarball.stdout, timeoutSec = 600)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpCopy,
+        "in-guest tar extract to '" & guestParent & "' failed (exit " &
+        $r.exitCode & "): " & r.stdout)
+  else:
+    # Single FILE: ``limactl copy`` is fine (no scp -r hazard).
+    b.limactlCopy(hostPath, vm.name & ":" & guestPath,
+                  recursive = false)
 
 method copyFromGuest*(b: LimaBackend, vm: VmHandle,
                      guestPath: string, hostPath: string) =
@@ -594,6 +652,15 @@ method copyFromGuest*(b: LimaBackend, vm: VmHandle,
   # file (scp -r tolerates non-directory sources); the rsync backend
   # would error out here, which is why ``limactlCopy`` pins
   # ``--backend=scp``.
+  #
+  # NOTE: unlike ``copyToGuest``, this path is NOT tar-streamed. The
+  # reverse direction would have to capture the guest ``tar`` archive
+  # over ``limactl shell`` stdout, but ``runLimactl`` merges stderr
+  # into stdout (``2>&1``) so any Lima log line would corrupt a binary
+  # archive. In practice ``copyFrom`` is used for result-file
+  # extraction (single files), where scp -r is degenerate-safe; a
+  # directory-tree extraction would need a clean-stdout capture seam
+  # before it could be tar-streamed.
   b.limactlCopy(vm.name & ":" & guestPath, hostPath,
                 recursive = true)
 

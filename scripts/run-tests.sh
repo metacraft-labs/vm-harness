@@ -19,6 +19,7 @@ run_nim r --hints:off tests/unit/t_tart_shared_dirs.nim
 run_nim r --hints:off tests/unit/t_qemu_windows_arm_backend.nim
 run_nim r --hints:off tests/unit/t_qemu_windows_arm_overlay.nim
 run_nim r --hints:off tests/unit/t_tart_backend.nim
+run_nim r --hints:off tests/unit/t_lima_backend.nim
 run_nim r --hints:off tests/unit/t_prune.nim
 
 # Backend-independent lifecycle and CLI coverage.
