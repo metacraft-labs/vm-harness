@@ -83,6 +83,11 @@ type
                                  ## When both are passed the values must match.
     networkBridge*: string       ## ``--network-bridge <name>`` — libvirt-only
                                  ## override for the guest's primary NIC.
+    imagePoolDir*: string        ## ``--image-pool-dir <dir>`` — libvirt-only
+                                 ## override for the directory the domain's
+                                 ## qcow2 disk is written to (disk lands at
+                                 ## ``<dir>/<name>.qcow2``). Empty ⇒ backend
+                                 ## default (``/var/lib/libvirt/images``).
     firstBootScript*: string     ## ``--first-boot-script <path>`` — file the
                                  ## recipe's build-autounattend-iso.sh wraps
                                  ## into the per-VM autounattend ISO.
@@ -203,6 +208,12 @@ Common flags:
   --network-bridge <name>         libvirt-only: host bridge for the guest NIC
                                   (default: backend's configured value, e.g.
                                   virbr0). Ignored by other backends.
+  --image-pool-dir <dir>          libvirt-only: directory the domain's qcow2
+                                  disk is written to; the disk lands at
+                                  <dir>/<name>.qcow2. Use it when your storage
+                                  lives outside the default
+                                  /var/lib/libvirt/images (e.g. a ZFS pool at
+                                  /storage). Ignored by other backends.
   --first-boot-script <path>      libvirt-only: host path to a script the
                                   recipe wraps into the per-VM autounattend
                                   ISO. Requires --recipe.
@@ -361,6 +372,8 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.diskGB = parseInt(args[i]); inc i
     of "--network-bridge":
       inc i; result.networkBridge = args[i]; inc i
+    of "--image-pool-dir":
+      inc i; result.imagePoolDir = args[i]; inc i
     of "--first-boot-script":
       inc i; result.firstBootScript = args[i]; inc i
     of "--controller-pubkey":
@@ -541,6 +554,7 @@ proc applyDefaults(spec: var BaselineSpec, opts: CliOpts) =
   spec.firstBootScript = opts.firstBootScript
   spec.controllerPubKey = opts.controllerPubKey
   spec.networkBridge = opts.networkBridge
+  spec.imagePoolDir = opts.imagePoolDir
   spec.backendOptions = initTable[string, string]()
   if opts.ephemeralPrefix.len > 0:
     spec.backendOptions["ephemeralPrefix"] = opts.ephemeralPrefix

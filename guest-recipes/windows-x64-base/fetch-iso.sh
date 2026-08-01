@@ -22,11 +22,14 @@
 # Override the Windows ISO path with:
 #   VMH_WIN11_X64_ISO=/path/to/Win11_24H2_EnglishInternational_x64.iso
 #
-# Required tools: curl, sha256sum.
+# Required tools: curl, sha256sum. Uses xorriso (via the vm-harness dev
+# shell) to validate the Windows ISO has a UEFI El Torito boot record.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+# shellcheck source=../lib/validate-uefi-iso.sh
+. "${SCRIPT_DIR}/../lib/validate-uefi-iso.sh"
 BUILD_DIR="${SCRIPT_DIR}/build"
 VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
 VIRTIO_OUT="${BUILD_DIR}/virtio-win.iso"
@@ -78,7 +81,13 @@ EOF
   exit 1
 fi
 
-# 3. Create a symlink under build/ so downstream recipes have a
+# 3. Validate the Windows ISO is UEFI-bootable BEFORE we commit to it.
+# The libvirt Win11 domain is UEFI-only (q35 + OVMF); a BIOS-only ISO
+# boots to nothing and virt-install stalls ~90 min on --wait. Fail fast
+# with a clear cause instead.
+validate_uefi_iso "${WIN11_ISO_PATH}" "the Windows 11 x64 ISO (${WIN11_ISO_PATH})"
+
+# 4. Create a symlink under build/ so downstream recipes have a
 # stable path regardless of where the operator stashed the ISO.
 ln -sf "${WIN11_ISO_PATH}" "${WIN11_SYMLINK}"
 echo "fetch-iso: Win11 ISO available at ${WIN11_SYMLINK} -> ${WIN11_ISO_PATH}"

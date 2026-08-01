@@ -43,6 +43,40 @@ suite "LibvirtBackend smoke (no live virsh)":
     let b = newLibvirtBackend(virshCmd = "/nonexistent/virsh-no-such")
     check not b.probeAvailability()
 
+  test "domainDiskPath uses the configured image pool (default + override)":
+    # Default backend: disk lands under /var/lib/libvirt/images.
+    let bDefault = newLibvirtBackend()
+    check bDefault.imagePoolDir == DefaultLibvirtImagePool
+    check bDefault.domainDiskPath("windows-runner-001") ==
+      DefaultLibvirtImagePool / "windows-runner-001.qcow2"
+    # Operator override: storage lives on a big ZFS pool at /storage.
+    let bOverride = newLibvirtBackend(imagePoolDir = "/storage/libvirt")
+    check bOverride.imagePoolDir == "/storage/libvirt"
+    check bOverride.domainDiskPath("windows-runner-001") ==
+      "/storage/libvirt/windows-runner-001.qcow2"
+
+  test "buildVirtInstallArgs writes the disk at the overridden pool dir":
+    # The disk path virt-install receives is computed by domainDiskPath,
+    # so an --image-pool-dir override must surface in the --disk argv.
+    let b = newLibvirtBackend(imagePoolDir = "/storage/libvirt")
+    let diskPath = b.domainDiskPath("windows-runner-001")
+    let argv = buildVirtInstallArgs(b,
+      name = "windows-runner-001",
+      diskPath = diskPath,
+      diskGB = 80, memoryMB = 8192, vcpus = 4,
+      isoPath = "/storage/iso/Win11.iso",
+      unattendIsoPath = "/tmp/autounattend.iso",
+      virtioWinIsoPath = "/tmp/virtio-win.iso",
+      osVariant = "win11")
+    var diskArg = ""
+    for a in argv:
+      if a.startsWith("path=/storage/libvirt/windows-runner-001.qcow2"):
+        diskArg = a
+    check diskArg.len > 0
+    check diskArg.contains("format=qcow2")
+    # And the default pool path must NOT appear anywhere in the argv.
+    check not argv.anyIt(it.contains(DefaultLibvirtImagePool))
+
   test "buildVirtInstallArgs renders an argv with the expected key flags":
     let b = newLibvirtBackend(networkBridge = "br0",
                               libvirtUri = "qemu:///system")

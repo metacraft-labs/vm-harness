@@ -385,11 +385,18 @@ proc undefineDomain*(b: LibvirtBackend, name: string,
   if not b.domainExists(name): return
   discard b.runVirsh(@["undefine", "--nvram", name], timeoutSec = 60)
 
+proc domainDiskPath*(b: LibvirtBackend, name: string): string =
+  ## The per-domain qcow2 disk path: ``<imagePoolDir>/<name>.qcow2``.
+  ## Single source of truth so ``provisionBaseline`` (both the ISO and
+  ## the qcow2-import branches) and ``deleteDomainDisk`` agree — and so
+  ## the operator's ``--image-pool-dir`` override lands in one place.
+  b.imagePoolDir / (name & ".qcow2")
+
 proc deleteDomainDisk*(b: LibvirtBackend, name: string) =
   ## Delete only the per-VM qcow2 disk that ``bootFromMedia`` wrote
   ## out, never any other libvirt-tracked storage attached to the
   ## domain. See ``undefineDomain`` for the rationale.
-  let qcow2 = b.imagePoolDir / (name & ".qcow2")
+  let qcow2 = b.domainDiskPath(name)
   if fileExists(qcow2):
     try: removeFile(qcow2)
     except CatchableError: discard
@@ -1028,6 +1035,15 @@ method provisionBaseline*(b: LibvirtBackend, spec: BaselineSpec) =
         "treat the call as a no-op) or pass --source-image with " &
         "the Windows install ISO path")
 
+    # Operator override: place the domain disk in a pool directory of
+    # their choosing (e.g. a large ZFS pool at ``/storage``) instead of
+    # the default ``/var/lib/libvirt/images``. Applied once here so both
+    # the qcow2-import fast path and the ISO+autounattend path (and the
+    # ``domainDiskPath`` helper they share) honour it. Empty ⇒ the
+    # backend's configured pool is used unchanged.
+    if spec.imagePoolDir.len > 0:
+      b.imagePoolDir = spec.imagePoolDir
+
     # qcow2 fast path: pre-built baseline. The operator points
     # ``--source-image`` at a known-good Win11 qcow2 (e.g. a snapshot
     # created from a successful prior install). We clone it as the
@@ -1050,7 +1066,7 @@ method provisionBaseline*(b: LibvirtBackend, spec: BaselineSpec) =
       let mem = if spec.memoryMB > 0: spec.memoryMB else: 4096
       if spec.networkBridge.len > 0:
         b.networkBridge = spec.networkBridge
-      let diskPath = b.imagePoolDir / (spec.name & ".qcow2")
+      let diskPath = b.domainDiskPath(spec.name)
       # Clone-on-write: the per-VM qcow2 is a thin overlay over the
       # operator-supplied baseline. Writes are local to the overlay so
       # the baseline stays clean and can back any number of runners.
@@ -1199,7 +1215,7 @@ method provisionBaseline*(b: LibvirtBackend, spec: BaselineSpec) =
         virtioWinCandidate & " — run guest-recipes/windows-x64-base/" &
         "fetch-iso.sh first")
 
-    let diskPath = b.imagePoolDir / (spec.name & ".qcow2")
+    let diskPath = b.domainDiskPath(spec.name)
     let argv = buildVirtInstallArgs(b, spec.name, diskPath, disk, mem,
                                     cpus, spec.sourceImage,
                                     unattendCandidate, virtioWinCandidate,

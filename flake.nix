@@ -127,6 +127,9 @@
               pkgs.openssh
               pkgs.pre-commit
               pkgs.sshpass
+              # guest-recipes/*/fetch-iso.sh use xorriso to validate that a
+              # Windows ISO carries a UEFI El Torito boot record.
+              pkgs.xorriso
             ]
             ++ backendTools;
 

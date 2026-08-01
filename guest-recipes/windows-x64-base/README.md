@@ -16,7 +16,10 @@ prototype on `high-mem-server` can be brought up by a single
 
 A `qemu:///system` libvirt domain configured for:
 
-- 4 vCPU, 8 GB RAM, 80 GB qcow2 in `/var/lib/libvirt/images/`.
+- 4 vCPU, 8 GB RAM, 80 GB qcow2 in `/var/lib/libvirt/images/`
+  (override the directory with `--image-pool-dir <dir>` when your
+  storage lives elsewhere, e.g. a ZFS pool at `/storage`; the disk
+  then lands at `<dir>/<name>.qcow2`).
 - q35 board with UEFI + SMM (Win11 requires both).
 - virtio-blk system disk, virtio-net adapter on `virbr0` (default
   NAT bridge; overridable via `--network-bridge`).
@@ -210,7 +213,11 @@ domain as long-lived and skips per-gate revert.
   FirstLogonCommands (OpenSSH install, firewall rule, virtio-win
   guest tools install, first-boot.ps1 run, install-done sentinel).
 - `fetch-iso.sh` — downloads virtio-win.iso, verifies the
-  operator-supplied Win11 ISO.
+  operator-supplied Win11 ISO exists AND validates it carries a UEFI
+  (EFI) El Torito boot record (via `xorriso`, provided by the dev
+  shell). A BIOS-only ISO is rejected up front: it boots to nothing on
+  the UEFI q35 domain (OVMF drops to the UEFI shell and virt-install
+  stalls ~90 min). Supply a stock Microsoft ISO, which is UEFI-bootable.
 - `build-autounattend-iso.sh` — wraps autounattend.xml + an optional
   first-boot.ps1 as a CD-ROM ISO9660+Joliet image.
 - `finalize-golden.sh` — verifies the domain is in the expected

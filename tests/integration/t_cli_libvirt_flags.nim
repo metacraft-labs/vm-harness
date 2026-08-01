@@ -42,6 +42,7 @@ proc applyDefaultsForTest(opts: CliOpts): BaselineSpec =
   result.firstBootScript = opts.firstBootScript
   result.controllerPubKey = opts.controllerPubKey
   result.networkBridge = opts.networkBridge
+  result.imagePoolDir = opts.imagePoolDir
   result.backendOptions = initTable[string, string]()
 
 suite "CLI libvirt M4 canonical-command flag plumbing":
@@ -144,6 +145,28 @@ suite "CLI libvirt M4 canonical-command flag plumbing":
     check spec.networkBridge == "virbr0"
     check spec.firstBootScript == firstBoot
     check spec.recipeDir.endsWith("windows-x64-base")
+
+  test "--image-pool-dir lands in CliOpts and threads through BaselineSpec":
+    let opts = parseCliOpts(@[
+      "provision",
+      "--backend", "libvirt",
+      "--name", "windows-runner-001",
+      "--image-pool-dir", "/storage/libvirt"
+    ])
+    check opts.imagePoolDir == "/storage/libvirt"
+    let spec = applyDefaultsForTest(opts)
+    check spec.imagePoolDir == "/storage/libvirt"
+
+  test "--image-pool-dir absent ⇒ empty (backend default preserved)":
+    let opts = parseCliOpts(@[
+      "provision", "--backend", "libvirt", "--name", "windows-runner-001"
+    ])
+    check opts.imagePoolDir == ""
+    let spec = applyDefaultsForTest(opts)
+    check spec.imagePoolDir == ""
+    # An empty override must NOT disturb the backend's configured default.
+    let b = newLibvirtBackend()
+    check b.imagePoolDir == DefaultLibvirtImagePool
 
   test "--cpus and --vcpu are interchangeable":
     let a = parseCliOpts(@["provision", "--cpus", "2"])

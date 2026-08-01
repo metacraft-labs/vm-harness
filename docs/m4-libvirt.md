@@ -78,6 +78,15 @@ vm-harness provision \
 
 Wall-clock: 25-50 minutes on first run (mostly Win11 Setup).
 
+When the host's storage lives outside the default libvirt image pool
+(`/var/lib/libvirt/images`) — e.g. a large ZFS pool mounted at
+`/storage` — add `--image-pool-dir /storage/libvirt`; the domain's
+qcow2 then lands at `/storage/libvirt/<name>.qcow2` instead. Omit it to
+keep the default byte-for-byte. This threads through
+`BaselineSpec.imagePoolDir` into `LibvirtBackend.imagePoolDir` and is
+honoured by both the ISO-install and the `.qcow2`-import provision
+paths.
+
 The flags `--recipe`, `--name`, `--vcpu`, `--memory-gb`,
 `--network-bridge`, and `--first-boot-script` are the canonical
 libvirt-slice surface — `parseCliOpts` resolves them at parse time
