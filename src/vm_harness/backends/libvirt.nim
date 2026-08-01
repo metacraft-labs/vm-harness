@@ -71,10 +71,8 @@
 ## helpers can run anywhere. Backend *registration* is unconditional,
 ## but ``probeAvailability`` returns false on non-Linux hosts.
 
-import std/[os, osproc, streams, strtabs,
+import std/[options, os, osproc, streams, strtabs,
             strutils, tables, times]
-when defined(linux):
-  import std/options
 import ../types
 import ../auto
 
@@ -970,6 +968,117 @@ proc buildVirtInstallArgs*(b: LibvirtBackend, name: string,
     "--wait", $max(1, b.bootTimeoutSec div 60)]
 
 # ---------------------------------------------------------------------------
+# UEFI El Torito ISO validation.
+#
+# The libvirt Win11 domain is UEFI-only (q35 + OVMF). A BIOS-only install
+# ISO — one whose only El Torito boot image has platform BIOS — boots to
+# nothing: OVMF finds no UEFI boot option and silently drops to the UEFI
+# shell, and ``virt-install --wait`` then sits for ~90 minutes before
+# timing out with no actionable cause. ``provisionBaseline`` validates the
+# ISO up front so the ONE-COMMAND CLI flow (``vm-harness provision
+# --backend libvirt --recipe windows-x64-base ...``) fails fast even when
+# the operator skipped the optional ``guest-recipes/.../fetch-iso.sh`` prep
+# (which performs the identical check via
+# ``guest-recipes/lib/validate-uefi-iso.sh``).
+#
+# The decision logic here is a faithful port of that shell helper's
+# ``uefi_report_indicates_uefi`` so both entry points agree exactly.
+
+proc isoHasUefiElTorito*(report: string): bool =
+  ## Pure decision over an ``xorriso -report_el_torito`` dump (``plain`` or
+  ## ``as_mkisofs`` form) — or an isoinfo/iso-info dump. Returns true when
+  ## the report indicates a UEFI (EFI) El Torito boot image, false
+  ## otherwise. No I/O; this is the unit-tested core.
+  # Strategy 1 — `-report_el_torito plain`: each boot image is a line like
+  #   El Torito boot img :   2  UEFI  y   none  0x0000  0x00  5760   34
+  # whose platform column is BIOS or UEFI. A BIOS-only ISO only shows BIOS.
+  for rawLine in report.splitLines():
+    let low = rawLine.toLowerAscii()
+    if "torito" in low and "boot img" in low:
+      for tok in rawLine.splitWhitespace():
+        if tok.toLowerAscii() == "uefi":
+          return true
+  # Strategy 2 — `-report_el_torito as_mkisofs`: an EFI image is emitted as
+  # a `-eltorito-alt-boot` section carrying an EFI boot image (`-e <img>` /
+  # `--efi-boot <img>`) or an explicit EFI platform selector. None of these
+  # tokens appear for a BIOS-only ISO.
+  block asMkisofs:
+    var hasAltBoot = false
+    var hasEfiImage = false
+    let toks = report.splitWhitespace()
+    for i, tok in toks:
+      let low = tok.toLowerAscii()
+      if low == "-eltorito-alt-boot":
+        hasAltBoot = true
+      elif low == "-e" or low == "--efi-boot":
+        hasEfiImage = true
+      elif low == "-eltorito-platform" and i + 1 < toks.len:
+        let nxt = toks[i + 1].toLowerAscii()
+        if nxt == "0xef" or nxt == "efi" or nxt == "uefi":
+          hasEfiImage = true
+      elif "efi" in low and (low.endsWith(".bin") or low.endsWith(".img") or
+                             low.endsWith(".efi")):
+        hasEfiImage = true
+    if hasAltBoot and hasEfiImage:
+      return true
+  # Strategy 3 — generic textual fallback (isoinfo/iso-info, or an xorriso
+  # form that spells out the platform). Accept only an El Torito record
+  # that explicitly names a UEFI/EFI platform, so a stray "efi" token in an
+  # unrelated field can't produce a false accept.
+  for rawLine in report.splitLines():
+    let low = rawLine.toLowerAscii()
+    if "torito" in low and "platform" in low and
+       ("uefi" in low or "efi" in low):
+      return true
+    if "platform id" in low and "0xef" in low:
+      return true
+    if "platform id" in low and ("(uefi)" in low or "(efi)" in low):
+      return true
+  return false
+
+proc queryIsoElToritoReport*(isoPath: string,
+                             xorrisoCmd: string = "xorriso"): Option[string] =
+  ## Run ``xorriso -indev <iso> -report_el_torito`` (``plain``, falling back
+  ## to ``as_mkisofs``) and return its report text. Returns ``none`` when
+  ## no ``xorriso`` binary is available (so the caller can WARN rather than
+  ## fail, mirroring the shell helper's missing-tooling semantics).
+  if findExe(xorrisoCmd).len == 0:
+    return none(string)
+  var r = runProcessCapture(@[xorrisoCmd, "-indev", isoPath,
+                              "-report_el_torito", "plain"], timeoutSec = 60)
+  if r.exitCode != 0 or r.stdout.strip().len == 0:
+    r = runProcessCapture(@[xorrisoCmd, "-indev", isoPath,
+                            "-report_el_torito", "as_mkisofs"], timeoutSec = 60)
+  return some(r.stdout)
+
+proc validateWindowsIsoBootable*(b: LibvirtBackend, isoPath: string,
+                                 xorrisoCmd: string = "xorriso") =
+  ## Fail fast when ``isoPath`` is a BIOS-only Windows install ISO that
+  ## would silently stall the UEFI q35 install. When ``xorriso`` is present
+  ## and finds NO UEFI El Torito record, raise a ``VmHarnessError``
+  ## (``lpProvisioning``) whose message matches
+  ## ``guest-recipes/lib/validate-uefi-iso.sh``. When ``xorriso`` is absent,
+  ## WARN and skip (missing tooling is never a hard failure).
+  let report = queryIsoElToritoReport(isoPath, xorrisoCmd)
+  if report.isNone:
+    stderr.writeLine("vm-harness libvirt: WARNING — no xorriso on PATH; " &
+      "skipping the UEFI El Torito validation of " & isoPath &
+      ". Install xorriso (provided by the vm-harness dev shell) to enable " &
+      "this check.")
+    return
+  if isoHasUefiElTorito(report.get):
+    return
+  raise newVmHarnessError($b.id, lpProvisioning,
+    "The Windows install ISO " & isoPath & " has no UEFI (EFI) El Torito " &
+    "boot record — this ISO is BIOS-boot only and will NOT boot the UEFI " &
+    "q35/virt Win11 domain (OVMF drops to the UEFI shell, and virt-install " &
+    "then stalls on --wait for ~90 minutes with no clear cause). Supply a " &
+    "UEFI-bootable Windows 11 ISO instead — a stock Microsoft ISO from " &
+    "microsoft.com carries both BIOS and UEFI El Torito boot records and " &
+    "works out of the box (pass its path via --source-image, or drop it at " &
+    "the recipe's expected location / set VMH_WIN11_X64_ISO).")
+
+# ---------------------------------------------------------------------------
 # VmBackend method overrides.
 
 method probeAvailability*(b: LibvirtBackend): bool =
@@ -1125,6 +1234,16 @@ method provisionBaseline*(b: LibvirtBackend, spec: BaselineSpec) =
       raise newException(IOError,
         "LibvirtBackend.provisionBaseline: sourceImage does not " &
         "exist: " & spec.sourceImage)
+
+    # Fail fast on a BIOS-only Windows ISO BEFORE launching virt-install —
+    # a UEFI q35 domain can't boot it (OVMF drops to the UEFI shell and
+    # --wait stalls ~90 min). This protects the one-command CLI flow even
+    # when the operator skipped the recipe's fetch-iso.sh prep. Only the
+    # Windows install ISO carries the UEFI-El-Torito requirement here; a
+    # Linux guest install ISO is left unchecked (it isn't the trap this
+    # guards, and Linux media is commonly hybrid/UEFI already).
+    if spec.guestOs == goWindows:
+      b.validateWindowsIsoBootable(spec.sourceImage)
 
     let cpus = if spec.cpus > 0: spec.cpus else: 2
     let mem = if spec.memoryMB > 0: spec.memoryMB else: 4096
