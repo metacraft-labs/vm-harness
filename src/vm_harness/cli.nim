@@ -3,6 +3,7 @@
 ## Subcommands per design doc §6:
 ##
 ## - ``provision``: ensure a baseline image exists.
+## - ``boot``: boot a transient VM directly from ISO, QCOW2, or VHDX media.
 ## - ``run``: revert, exec, harvest, cleanup — the one-shot gate runner.
 ## - ``probe``: print available backends (capability detection).
 ## - ``shell``: interactive shell against a baseline (debug aid).
@@ -46,6 +47,8 @@ type
     guestSet*: bool
     baseline*: string
     sourceImage*: string
+    mediaKind*: string
+    expectPattern*: string
     cpus*: int
     memoryMB*: int
     diskGB*: int
@@ -139,6 +142,9 @@ vm-harness <subcommand> [flags]
 
 Subcommands:
   provision               Ensure a baseline image exists (idempotent).
+  boot                    Boot ISO/QCOW2/VHDX media in a transient VM.
+                          Use --keep to leave it running, or --expect REGEX
+                          to assert a serial boot marker and clean it up.
   run                     One-shot revert + exec + harvest + cleanup.
   ephemeral-destroy       libvirt-only: reclaim an ephemeral clone left
                           running by `run --ephemeral --keep` (destroy +
@@ -177,6 +183,9 @@ Common flags:
                                   build-autounattend-iso.sh, ...). Required by
                                   backends that consume recipe-shaped inputs.
   --source-image <ref>
+  --kind <auto|iso|qcow2|vhdx|rootfs-tar>
+                                  Media kind for `boot` (default: extension).
+  --expect <regex>                `boot`: wait for a serial-console match.
   --cpus <int>                    Backend default applies when omitted.
   --vcpu <int>                    Alias for --cpus (canonical libvirt M4 shape).
   --memory-mb <int>
@@ -199,12 +208,8 @@ Common flags:
                                   residue). The M2 per-job reset the GARM
                                   provider drives. A positional arg after --
                                   is treated as an expected serial boot marker.
-  --keep                          libvirt-only: with --ephemeral, clone +
-                                  attach the config-drive + boot (UEFI) and
-                                  LEAVE THE DOMAIN RUNNING (no probe/teardown).
-                                  Reclaim it with `ephemeral-destroy`. Used to
-                                  drive an in-guest probe (e.g. the Windows JIT
-                                  bootstrap over SSH) for a long-lived golden.
+  --keep                          Leave a `boot` VM running, or keep a libvirt
+                                  ephemeral clone after startup.
   --golden-image <path>           libvirt-only: golden qcow2 the ephemeral
                                   overlay is CoW-cloned from. Requires
                                   --ephemeral.
@@ -326,6 +331,10 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.recipeBuildDir = args[i]; inc i
     of "--source-image":
       inc i; result.sourceImage = args[i]; inc i
+    of "--kind":
+      inc i; result.mediaKind = args[i]; inc i
+    of "--expect":
+      inc i; result.expectPattern = args[i]; inc i
     of "--cpus", "--vcpu":
       # ``--vcpu`` is the canonical libvirt M4 spelling; ``--cpus`` is
       # the historical vm-harness spelling. Both produce the same
@@ -490,6 +499,74 @@ proc resolveBackend(opts: CliOpts): tuple[id: BackendId, backend: VmBackend] =
     let b = newBackend(id, noopFallback = opts.allowNoopFallback)
     (id: id, backend: b)
 
+proc resolveBootMediaPath*(sourceImage: string): string =
+  ## Accept either one media file or a recipe output directory. Directory
+  ## selection is useful for content-addressed outputs whose filename embeds
+  ## the image digest.
+  if sourceImage.len == 0:
+    raise newException(ValueError, "boot: --source-image is required")
+  if fileExists(sourceImage):
+    return absolutePath(sourceImage)
+  if not dirExists(sourceImage):
+    raise newException(ValueError,
+      "boot: source image does not exist: " & sourceImage)
+
+  var newestPath = ""
+  var newestTime = fromUnix(0)
+  for kind, path in walkDir(sourceImage):
+    if kind != pcFile:
+      continue
+    let ext = splitFile(path).ext.toLowerAscii()
+    if ext notin [".iso", ".qcow2", ".vhdx"]:
+      continue
+    let modified = getLastModificationTime(path)
+    if newestPath.len == 0 or modified > newestTime or
+        (modified == newestTime and path < newestPath):
+      newestPath = path
+      newestTime = modified
+  if newestPath.len == 0:
+    raise newException(ValueError,
+      "boot: no .iso, .qcow2, or .vhdx media found in " & sourceImage)
+  absolutePath(newestPath)
+
+proc parseBootMediaKind*(value, mediaPath: string): BootMediaKind =
+  let normalized = value.toLowerAscii()
+  case normalized
+  of "", "auto":
+    case splitFile(mediaPath).ext.toLowerAscii()
+    of ".iso": bmkIso
+    of ".qcow2": bmkQcow2
+    of ".vhdx": bmkVhdx
+    else:
+      raise newException(ValueError,
+        "boot: cannot infer media kind from: " & mediaPath &
+        "; pass --kind iso|qcow2|vhdx|rootfs-tar")
+  of "iso": bmkIso
+  of "qcow2": bmkQcow2
+  of "vhdx": bmkVhdx
+  of "rootfs-tar": bmkRootfsTar
+  else:
+    raise newException(ValueError,
+      "boot: --kind expects auto|iso|qcow2|vhdx|rootfs-tar, got '" &
+      value & "'")
+
+proc resolveBootBackendId*(opts: CliOpts; mediaKind: BootMediaKind;
+                           host: HostPlatform): BackendId =
+  if opts.backend.len > 0 and opts.backend != "auto":
+    return parseBackendId(opts.backend)
+  case host
+  of hpWindows:
+    if mediaKind == bmkRootfsTar: biWsl else: biHyperv
+  of hpLinux:
+    if mediaKind == bmkRootfsTar:
+      raise newException(ValueError,
+        "boot: rootfs tar media is supported by the Windows WSL backend only")
+    biLibvirt
+  of hpMacosArm:
+    raise newException(ValueError,
+      "boot: no macOS backend currently implements bootFromMedia; " &
+      "pass an explicit backend after adding that capability")
+
 proc probeBackendIds*(opts: CliOpts): seq[BackendId] =
   if opts.backend == "" or opts.backend == "auto":
     registeredBackends()
@@ -515,6 +592,78 @@ proc applyDefaults(spec: var BaselineSpec, opts: CliOpts) =
   spec.backendOptions = initTable[string, string]()
   if opts.ephemeralPrefix.len > 0:
     spec.backendOptions["ephemeralPrefix"] = opts.ephemeralPrefix
+
+proc cmdBoot(opts: CliOpts): int =
+  if not opts.keepEphemeral and opts.expectPattern.len == 0:
+    raise newException(ValueError,
+      "boot: pass --keep to leave the VM running or --expect <regex> " &
+      "for a self-cleaning boot assertion")
+
+  let mediaPath = resolveBootMediaPath(opts.sourceImage)
+  let mediaKind = parseBootMediaKind(opts.mediaKind, mediaPath)
+  let id = resolveBootBackendId(opts, mediaKind, detectHostPlatform())
+  let backend = newBackend(id, noopFallback = opts.allowNoopFallback)
+  if not backend.probeAvailability():
+    raise newException(BackendUnavailableError,
+      "boot: backend is not available: " & $id)
+
+  let outputDir = if opts.outputDir.len > 0:
+                    absolutePath(opts.outputDir)
+                  else:
+                    getTempDir() / "vm-harness-boot"
+  createDir(outputDir)
+  var extra = initTable[string, string]()
+  let spec = BootMediaSpec(
+    name: "",
+    kind: mediaKind,
+    mediaPath: mediaPath,
+    secondaryIsoPath: "",
+    cpus: (if opts.cpus > 0: opts.cpus else: 2),
+    memoryMB: (if opts.memoryMB > 0: opts.memoryMB else: 4096),
+    generation: 2,
+    secureBootEnabled: false,
+    serialPipeName: "",
+    serialLogPath: outputDir / "boot.serial.log",
+    extra: extra)
+
+  logEvent(opts.logFormat, "info", "booting media",
+           {"backend": $id, "media": mediaPath, "kind": $mediaKind})
+  var vm: VmHandle
+  var serial: SerialStream
+  try:
+    vm = backend.bootFromMedia(spec)
+
+    # Hyper-V creates the VM in the Off state; captureSerial starts it while
+    # wiring COM1. Libvirt starts the domain during bootFromMedia.
+    if id == biHyperv or opts.expectPattern.len > 0:
+      serial = backend.captureSerial(vm)
+
+    if opts.expectPattern.len > 0:
+      let timeout = if opts.timeoutSec > 0: opts.timeoutSec else: 180
+      let match = backend.expectLine(serial, opts.expectPattern, timeout)
+      if not match.matched:
+        logEvent(opts.logFormat, "error", "boot marker not observed",
+                 {"vm": vm.name, "pattern": opts.expectPattern,
+                  "serialLog": serial.logPath})
+        return 1
+      logEvent(opts.logFormat, "info", "boot marker observed",
+               {"vm": vm.name, "match": match.matchedText.strip(),
+                "serialLog": serial.logPath})
+    elif id == biHyperv:
+      # Let Start-VM leave the PowerShell launcher before closing its serial
+      # reader. Closing the reader does not stop the VM.
+      sleep(1000)
+
+    if opts.keepEphemeral:
+      logEvent(opts.logFormat, "info", "VM left running",
+               {"backend": $id, "vm": vm.name})
+      echo vm.name
+    0
+  finally:
+    if serial != nil:
+      backend.closeSerial(serial)
+    if vm != nil and not opts.keepEphemeral:
+      backend.stopAndCleanup(vm, deleteVm = true)
 
 proc cmdProvision(opts: CliOpts): int =
   let (id, backend) = resolveBackend(opts)
@@ -954,6 +1103,7 @@ proc runCli*(args: seq[string]): int =
     echo(HelpText)
     return 0
   of "provision": return cmdProvision(opts)
+  of "boot":      return cmdBoot(opts)
   of "run":       return cmdRun(opts)
   of "ephemeral-destroy": return cmdEphemeralDestroy(opts)
   of "probe":     return cmdProbe(opts)

@@ -156,6 +156,11 @@ vm-harness provision --backend <id|auto> --guest <linux|windows|macos> \
                      --baseline <name> [--source-image <ref>] \
                      [--cpus N] [--memory-mb N] [--disk-gb N]
 
+vm-harness boot      --backend <id|auto> --source-image <file-or-dir> \
+                     [--kind <auto|iso|qcow2|vhdx>] \
+                     [--cpus N] [--memory-mb N] \
+                     (--keep | --expect <serial-regex>)
+
 vm-harness run       --backend <id|auto> --guest <linux|windows|macos> \
                      --baseline <name> --output-dir <path> \
                      [--env KEY=VAL ...] [--copy-to host:guest ...] \
@@ -167,6 +172,12 @@ vm-harness probe     # JSON report of available backends.
 vm-harness backends  # Tabular listing.
 vm-harness shell     --backend <id|auto> --baseline <name>   # placeholder in M0
 ```
+
+`boot` uses Hyper-V on Windows and libvirt/QEMU on Linux. Hyper-V cannot
+attach QCOW2 directly, so the backend converts it to a transient dynamic VHDX
+with `qemu-img` and removes that conversion when a self-cleaning boot finishes.
+Passing an output directory selects its newest `.iso`, `.qcow2`, or `.vhdx`,
+which supports content-addressed recipe outputs without scripting a filename.
 
 `--backend auto` picks per the dispatch table (design doc §6):
 

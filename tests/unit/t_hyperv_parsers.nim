@@ -5,7 +5,7 @@
 ## VM, so they run on any host including macOS (where this M1 was
 ## authored).
 
-import std/[os, sequtils, tempfiles, unittest]
+import std/[os, sequtils, strutils, tempfiles, unittest]
 import vm_harness
 
 suite "parseScriptVerdict":
@@ -241,6 +241,25 @@ suite "newHyperVBackend":
     check b.id == biHyperv
     check b of HyperVBackend
 
-  test "probeAvailability returns false off-Windows":
+  when not defined(windows):
+    test "probeAvailability returns false off-Windows":
+      let b = newHyperVBackend()
+      check not b.probeAvailability()
+
+suite "Hyper-V boot media command":
+  test "QCOW2 media is converted to a transient VHDX":
     let b = newHyperVBackend()
-    check not b.probeAvailability()
+    let spec = BootMediaSpec(
+      kind: bmkQcow2,
+      mediaPath: "D:\\images\\reproos.qcow2",
+      cpus: 2,
+      memoryMB: 4096)
+    let script = b.buildNewBootVmCommand(
+      spec,
+      "repro-test-boot-unit",
+      "repro-test-boot-unit-com1",
+      "D:\\scratch\\reproos.vhdx")
+    check "$kind    = 'qcow2'" in script
+    check "Get-Command qemu-img" in script
+    check "convert -f qcow2 -O vhdx -o subformat=dynamic" in script
+    check "D:\\scratch\\reproos.vhdx" in script

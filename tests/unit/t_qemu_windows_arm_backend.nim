@@ -458,7 +458,8 @@ suite "QemuWindowsArmBackend pure behavior":
     check "nvme,drive=disk0,serial=winarm0,bootindex=1" in args
     check "virtio-net-pci,netdev=net0,id=net0,mac=52:54:00:c9:18:27" in args
     let tpmArg = args[args.find("-chardev") + 1]
-    check tpmArg.startsWith("socket,id=chrtpm,path=/tmp/vmh-qwa-tpm-")
+    check tpmArg.startsWith("socket,id=chrtpm,path=")
+    check "vmh-qwa-tpm-" in tpmArg
     check tpmArg.endsWith(".sock")
     check "emulator,id=tpm0,chardev=chrtpm" in args
     check "tpm-tis-device,tpmdev=tpm0" in args
@@ -468,7 +469,8 @@ suite "QemuWindowsArmBackend pure behavior":
                         "virtio-blk-device" in it).len == 0
     check "file:" & tmp / "serial.log" in args
     let monArg = args[args.find("-monitor") + 1]
-    check monArg.startsWith("unix:/tmp/vmh-qwa-mon-")
+    check monArg.startsWith("unix:")
+    check "vmh-qwa-mon-" in monArg
     check monArg.endsWith(".sock,server=on,wait=off")
     check "-rtc" in args
     check args[args.find("-rtc") + 1] == "base=utc"

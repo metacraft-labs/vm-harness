@@ -628,8 +628,8 @@ proc newBootVmName(prefix: string = BootVmNamePrefix): string =
   ## don't collide.
   result = prefix & toHex(int64(epochTime() * 1000.0) and 0xFFFFFF'i64, 6).toLowerAscii()
 
-proc buildNewBootVmCommand(b: HyperVBackend, spec: BootMediaSpec,
-                           vmName, pipeName, scratchVhdxPath: string): string =
+proc buildNewBootVmCommand*(b: HyperVBackend, spec: BootMediaSpec,
+                            vmName, pipeName, scratchVhdxPath: string): string =
   ## Render the PowerShell that creates the transient Gen-2 UEFI VM,
   ## wires COM1 to the named pipe, attaches the boot media + optional
   ## seed ISO, and (for non-DryRun) leaves the VM Off ready for
@@ -639,10 +639,7 @@ proc buildNewBootVmCommand(b: HyperVBackend, spec: BootMediaSpec,
     case spec.kind
     of bmkVhdx: "vhdx"
     of bmkIso:  "iso"
-    of bmkQcow2: "vhdx" # qcow2 isn't directly bootable on Hyper-V; the consumer
-                      # must convert to VHDX first and pass mediaPath as the VHDX.
-                      # We accept it here so the caller's mistake produces a
-                      # clear "file not found" error rather than a type panic.
+    of bmkQcow2: "qcow2"
     of bmkRootfsTar:
       raise newException(BackendUnavailableError,
         "HyperVBackend.bootFromMedia: bmkRootfsTar is WSL-specific; " &
@@ -673,18 +670,31 @@ if (Get-VM -Name $vmName -ErrorAction SilentlyContinue) {{
   throw "boot VM $vmName already exists; refusing to clobber"
 }}
 
-# Resolve boot disk: for VHDX kind the mediaPath IS the boot disk; for ISO
-# kind we create a transient blank dynamic VHDX as the boot disk and
-# attach the ISO as the first boot device.
+# Resolve boot disk: VHDX is attached directly, QCOW2 is converted into a
+# transient dynamic VHDX, and ISO gets a transient blank installation disk.
 $bootVhdx = if ($kind -eq 'vhdx') {{ $mediaPath }} else {{ $scratchVhdx }}
 
-if ($kind -ne 'vhdx') {{
+if ($kind -eq 'iso') {{
   if (-not (Test-Path -LiteralPath $mediaPath)) {{
     throw "bmkIso requires mediaPath to exist: $mediaPath"
   }}
   $dir = Split-Path -Parent $scratchVhdx
   if (-not (Test-Path $dir)) {{ New-Item -ItemType Directory -Force -Path $dir | Out-Null }}
   New-VHD -Path $scratchVhdx -SizeBytes 8GB -Dynamic | Out-Null
+}} elseif ($kind -eq 'qcow2') {{
+  if (-not (Test-Path -LiteralPath $mediaPath)) {{
+    throw "bmkQcow2 requires mediaPath to exist: $mediaPath"
+  }}
+  $qemuImg = Get-Command qemu-img -ErrorAction SilentlyContinue
+  if (-not $qemuImg) {{
+    throw "bmkQcow2 on Hyper-V requires qemu-img on PATH"
+  }}
+  $dir = Split-Path -Parent $scratchVhdx
+  if (-not (Test-Path $dir)) {{ New-Item -ItemType Directory -Force -Path $dir | Out-Null }}
+  & $qemuImg.Source convert -f qcow2 -O vhdx -o subformat=dynamic $mediaPath $scratchVhdx
+  if ($LASTEXITCODE -ne 0) {{
+    throw "qemu-img failed to convert QCOW2 to VHDX (exit $LASTEXITCODE)"
+  }}
 }} else {{
   if (-not (Test-Path -LiteralPath $bootVhdx)) {{
     throw "bmkVhdx requires mediaPath (used as boot disk) to exist: $bootVhdx"
@@ -1085,4 +1095,3 @@ proc runViaReproScript*(b: HyperVBackend, gate: string,
 # own ``newHyperVBackend(...)`` instance.
 
 registerBackend(biHyperv, proc(): VmBackend = newHyperVBackend())
-

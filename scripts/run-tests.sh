@@ -12,6 +12,7 @@ run_nim r --hints:off tests/unit/t_output_envelope.nim
 run_nim r --hints:off tests/unit/t_auto_selection.nim
 run_nim r --hints:off tests/unit/t_guest_scripts.nim
 run_nim r --hints:off tests/unit/t_cli_probe.nim
+run_nim r --hints:off tests/unit/t_cli_boot.nim
 run_nim r --hints:off tests/unit/t_hyperv_parsers.nim
 run_nim r --hints:off tests/unit/t_wsl_parsers.nim
 run_nim r --hints:off tests/unit/t_utm_parsers.nim

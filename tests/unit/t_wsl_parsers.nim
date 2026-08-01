@@ -147,6 +147,7 @@ suite "newWslBackend":
     check b.id == biWsl
     check b of WslBackend
 
-  test "probeAvailability returns false off-Windows":
-    let b = newWslBackend()
-    check not b.probeAvailability()
+  when not defined(windows):
+    test "probeAvailability returns false off-Windows":
+      let b = newWslBackend()
+      check not b.probeAvailability()
