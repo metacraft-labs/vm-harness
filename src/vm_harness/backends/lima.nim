@@ -86,6 +86,22 @@ type
     diskGiB*: int
       ## Override disk passed to ``limactl create --disk``. ``0`` =
       ## template default.
+    provisionScripts*: seq[string]
+      ## Optional first-boot provisioning scripts baked into the
+      ## generated Lima template's ``provision:`` section (each emitted
+      ## as ``mode: system`` so apt/package installs run as root on
+      ## first boot). Because ``revertToBaseline`` spins up a FRESH
+      ## ephemeral from the embedded template every gate, embedding the
+      ## provisioning here means every ephemeral comes up already
+      ## provisioned — the consumer no longer has to ``execInGuest`` a
+      ## setup script on every single run. Set via
+      ## ``newLimaBackend(provisionScripts=...)`` or refreshed from
+      ## ``BaselineSpec.provisionScripts`` on each ``provisionBaseline``.
+      ## Empty ⇒ no ``provision:`` block emitted (template
+      ## byte-identical to the default). NOTE: only applies when the
+      ## generated template is materialized from ``templateText`` (the
+      ## default path); a ``sourceImage`` / ``template:`` pass-through
+      ## override bypasses template generation and thus this block.
 
 const
   DefaultLimaEphemeralPrefix* = "repro-vm-lima"
@@ -126,7 +142,8 @@ proc newLimaBackend*(limactlCmd: string = "limactl",
                      cpus: int = 0,
                      memoryGiB: int = 0,
                      diskGiB: int = 0,
-                     sourceImage: string = ""): LimaBackend =
+                     sourceImage: string = "",
+                     provisionScripts: seq[string] = @[]): LimaBackend =
   ## Construct a LimaBackend. ``templateText`` defaults to the
   ## embedded :const:`DefaultLimaTemplate`; pass a non-empty string
   ## to override (or set ``BaselineSpec.sourceImage`` per call).
@@ -147,7 +164,8 @@ proc newLimaBackend*(limactlCmd: string = "limactl",
     bootTimeoutSec: bootTimeoutSec,
     cpus: cpus,
     memoryGiB: memoryGiB,
-    diskGiB: diskGiB)
+    diskGiB: diskGiB,
+    provisionScripts: provisionScripts)
 
 # ---------------------------------------------------------------------------
 # Process helper.
@@ -313,6 +331,31 @@ proc deleteLimaInstance*(b: LimaBackend, name: string) =
     @[b.limactlCmd, "delete", "--force", name],
     timeoutSec = 60)
 
+proc renderProvisionBlock(scripts: seq[string]): string =
+  ## Emit a Lima ``provision:`` section — one entry per script, each
+  ## ``mode: system`` (runs as root on first boot, the right mode for
+  ## apt/package installs) with the body as a YAML literal block scalar.
+  ##
+  ## Empty ``scripts`` ⇒ empty string, so callers can append this
+  ## unconditionally and the default template stays byte-identical.
+  if scripts.len == 0:
+    return ""
+  # A leading blank line separates the block from the template body.
+  result = "\nprovision:\n"
+  for s in scripts:
+    result.add("- mode: system\n")
+    result.add("  script: |\n")
+    for line in s.splitLines():
+      # Block-scalar content must be indented deeper than the ``script:``
+      # key (2 spaces); 4 spaces is safe. Empty lines stay empty — YAML
+      # tolerates blank lines inside a literal block scalar.
+      if line.len == 0:
+        result.add("\n")
+      else:
+        result.add("    ")
+        result.add(line)
+        result.add("\n")
+
 proc writeTemplateFile(b: LimaBackend, sourceImage: string): string =
   ## Materialize the YAML template to a temp file. Returns the
   ## absolute path; caller is responsible for ``removeFile``.
@@ -334,7 +377,7 @@ proc writeTemplateFile(b: LimaBackend, sourceImage: string): string =
   let path = getTempDir() / "vm-harness-lima-tmpl-" &
              $int(epochTime() * 1000) & "-" &
              $getCurrentProcessId() & ".yaml"
-  writeFile(path, b.templateText)
+  writeFile(path, b.templateText & renderProvisionBlock(b.provisionScripts))
   result = path
 
 proc createLimaInstance*(b: LimaBackend, name: string,
@@ -483,6 +526,12 @@ method provisionBaseline*(b: LimaBackend, spec: BaselineSpec) =
   ## template that isn't worth caching.
   if spec.sourceImage.len > 0:
     b.baselineSourceImage = spec.sourceImage
+  # Persist any provisioning scripts onto the backend so BOTH the
+  # session pre-fetch here AND every per-gate ``revertToBaseline``
+  # ephemeral bake them into their generated template's ``provision:``
+  # block. Empty ⇒ leave the backend's default (no block) untouched.
+  if spec.provisionScripts.len > 0:
+    b.provisionScripts = spec.provisionScripts
   if spec.cpus > 0 and b.cpus == 0:
     b.cpus = spec.cpus
   if spec.memoryMB > 0 and b.memoryGiB == 0:
@@ -648,21 +697,64 @@ method copyToGuest*(b: LimaBackend, vm: VmHandle,
 method copyFromGuest*(b: LimaBackend, vm: VmHandle,
                      guestPath: string, hostPath: string) =
   createDir(parentDir(hostPath))
-  # ``--recursive`` with the scp backend is safe even for a single
-  # file (scp -r tolerates non-directory sources); the rsync backend
-  # would error out here, which is why ``limactlCopy`` pins
-  # ``--backend=scp``.
-  #
-  # NOTE: unlike ``copyToGuest``, this path is NOT tar-streamed. The
-  # reverse direction would have to capture the guest ``tar`` archive
-  # over ``limactl shell`` stdout, but ``runLimactl`` merges stderr
-  # into stdout (``2>&1``) so any Lima log line would corrupt a binary
-  # archive. In practice ``copyFrom`` is used for result-file
-  # extraction (single files), where scp -r is degenerate-safe; a
-  # directory-tree extraction would need a clean-stdout capture seam
-  # before it could be tar-streamed.
-  b.limactlCopy(vm.name & ":" & guestPath, hostPath,
-                recursive = true)
+  # Determine dir-vs-file with an in-guest ``test -d``. A single FILE
+  # keeps the plain ``limactl copy`` path (byte-identical to the prior
+  # behavior). A DIRECTORY is tar-streamed, mirroring ``copyToGuest``:
+  # ``limactl copy --recursive`` uses scp -r, which mishandles trees
+  # with spaces or other odd filenames (e.g. npm @-scoped dirs).
+  let probe = b.execInGuest(vm, initTable[string, string](),
+                            @["test", "-d", guestPath], timeoutSec = 30)
+  if probe.exitCode != 0:
+    # Single FILE (or a non-existent source — let ``limactl copy``
+    # surface that error). ``--recursive`` with the scp backend is safe
+    # even for a single file (scp -r tolerates non-directory sources);
+    # the rsync backend would error out here, which is why
+    # ``limactlCopy`` pins ``--backend=scp``.
+    b.limactlCopy(vm.name & ":" & guestPath, hostPath,
+                  recursive = true)
+    return
+  # DIRECTORY. We deliberately DO NOT stream the guest ``tar`` over
+  # ``limactl shell`` stdout: ``runLimactl`` merges stderr into stdout
+  # (``2>&1``), so any Lima log line would corrupt a binary archive.
+  # Instead we tar the tree INTO a guest-side temp FILE, ``limactl
+  # copy`` that single file out (single-file copy is scp-safe and does
+  # not stream binary over stdout), extract on the host, then remove
+  # both temp files. The tree lands at
+  # ``<parentOf(hostPath)>/<basename(guestPath)>`` — the exact reverse
+  # of ``copyToGuest``'s mapping.
+  let guestParent = parentDir(guestPath)
+  let base = extractFilename(guestPath.strip(
+    leading = false, chars = {DirSep}))
+  let stamp = $int(epochTime() * 1000000) & "-" & $getCurrentProcessId()
+  let guestTar = "/tmp/vm-harness-pull-" & stamp & ".tar"
+  # Archive inside the guest. ``tar`` is silent on success; on any
+  # non-zero exit we bail rather than copy out a partial archive.
+  let tarRes = b.execInGuest(vm, initTable[string, string](),
+                             @["tar", "-cf", guestTar, "-C", guestParent, base],
+                             timeoutSec = 600)
+  if tarRes.exitCode != 0:
+    raise newVmHarnessError($b.id, lpCopy,
+      "in-guest tar of '" & guestPath & "' failed (exit " &
+      $tarRes.exitCode & "): " & tarRes.stdout)
+  let hostTar = getTempDir() / "vm-harness-pull-" & stamp & ".tar"
+  defer:
+    try: removeFile(hostTar)
+    except CatchableError: discard
+    # Best-effort cleanup of the guest-side temp archive.
+    discard b.execInGuest(vm, initTable[string, string](),
+                          @["rm", "-f", guestTar], timeoutSec = 30)
+  # Copy the single archive FILE out (scp-safe; no stdout streaming).
+  b.limactlCopy(vm.name & ":" & guestTar, hostTar, recursive = false)
+  # Extract on the host into the destination's parent so the tree lands
+  # at ``<hostParent>/<base>``.
+  let hostParent = parentDir(hostPath)
+  let extractDir = if hostParent.len > 0: hostParent else: "."
+  let untar = runLimactl(@["tar", "-xf", hostTar, "-C", extractDir],
+                         timeoutSec = 600)
+  if untar.exitCode != 0:
+    raise newVmHarnessError($b.id, lpCopy,
+      "host tar extract of '" & guestPath & "' to '" & extractDir &
+      "' failed (exit " & $untar.exitCode & "): " & untar.stdout)
 
 method installArgvTraceShim*(b: LimaBackend, vm: VmHandle,
                             shim: ArgvTraceShim) =

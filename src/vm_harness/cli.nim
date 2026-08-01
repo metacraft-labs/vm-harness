@@ -91,6 +91,12 @@ type
     firstBootScript*: string     ## ``--first-boot-script <path>`` — file the
                                  ## recipe's build-autounattend-iso.sh wraps
                                  ## into the per-VM autounattend ISO.
+    provisionScripts*: seq[string] ## ``--provision-script <path>`` (repeatable)
+                                 ## — lima-only: each file's CONTENTS is read at
+                                 ## parse time and baked into the generated Lima
+                                 ## template's ``provision:`` block so every
+                                 ## per-gate ephemeral boots already provisioned.
+                                 ## Empty ⇒ no ``provision:`` block.
     ephemeral*: bool             ## ``--ephemeral`` — libvirt-only: run one
                                  ## per-job CoW-clone VM (fresh overlay from
                                  ## ``--golden-image``, boot, then destroy +
@@ -217,6 +223,10 @@ Common flags:
   --first-boot-script <path>      libvirt-only: host path to a script the
                                   recipe wraps into the per-VM autounattend
                                   ISO. Requires --recipe.
+  --provision-script <path>       lima-only (repeatable): host path to a shell
+                                  script baked into the generated Lima
+                                  template's provision: block so every per-gate
+                                  ephemeral boots already provisioned.
   --controller-pubkey <path>      libvirt-only: SSH public key the recipe
                                   bakes into the autounattend ISO so the
                                   guest's FirstLogonCommands installs it in
@@ -376,6 +386,14 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.imagePoolDir = args[i]; inc i
     of "--first-boot-script":
       inc i; result.firstBootScript = args[i]; inc i
+    of "--provision-script":
+      inc i
+      let p = args[i]
+      if not fileExists(p):
+        raise newException(ValueError,
+          &"--provision-script '{p}': file not found")
+      result.provisionScripts.add(readFile(p))
+      inc i
     of "--controller-pubkey":
       inc i; result.controllerPubKey = args[i]; inc i
     of "--ephemeral":
@@ -552,6 +570,7 @@ proc applyDefaults(spec: var BaselineSpec, opts: CliOpts) =
   spec.recipeDir = opts.recipeDir
   spec.recipeBuildDir = opts.recipeBuildDir
   spec.firstBootScript = opts.firstBootScript
+  spec.provisionScripts = opts.provisionScripts
   spec.controllerPubKey = opts.controllerPubKey
   spec.networkBridge = opts.networkBridge
   spec.imagePoolDir = opts.imagePoolDir
