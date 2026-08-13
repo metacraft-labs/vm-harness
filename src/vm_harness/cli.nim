@@ -34,6 +34,7 @@ import ./backends/lima
 import ./backends/libvirt
 import ./backends/incus
 {.pop.}
+import ./prune
 
 type
   LogFormat* = enum
@@ -85,9 +86,20 @@ type
                                  ## When both are passed the values must match.
     networkBridge*: string       ## ``--network-bridge <name>`` — libvirt-only
                                  ## override for the guest's primary NIC.
+    imagePoolDir*: string        ## ``--image-pool-dir <dir>`` — libvirt-only
+                                 ## override for the directory the domain's
+                                 ## qcow2 disk is written to (disk lands at
+                                 ## ``<dir>/<name>.qcow2``). Empty ⇒ backend
+                                 ## default (``/var/lib/libvirt/images``).
     firstBootScript*: string     ## ``--first-boot-script <path>`` — file the
                                  ## recipe's build-autounattend-iso.sh wraps
                                  ## into the per-VM autounattend ISO.
+    provisionScripts*: seq[string] ## ``--provision-script <path>`` (repeatable)
+                                 ## — lima-only: each file's CONTENTS is read at
+                                 ## parse time and baked into the generated Lima
+                                 ## template's ``provision:`` block so every
+                                 ## per-gate ephemeral boots already provisioned.
+                                 ## Empty ⇒ no ``provision:`` block.
     ephemeral*: bool             ## ``--ephemeral`` — libvirt-only: run one
                                  ## per-job CoW-clone VM (fresh overlay from
                                  ## ``--golden-image``, boot, then destroy +
@@ -136,6 +148,13 @@ type
                                  ## the guest's FirstLogonCommands can install
                                  ## it in ``authorized_keys`` before the
                                  ## controller first reaches out over SSH.
+    stateDir*: string            ## ``--state-dir <dir>`` — ``prune`` scope for
+                                 ## the qemu-windows-arm state directory.
+    olderThanSec*: int           ## ``--older-than <sec>`` — ``prune`` age guard.
+    olderThanSet*: bool          ## whether ``--older-than`` was supplied.
+    dryRun*: bool                ## ``--dry-run`` — ``prune`` reports only.
+    sweepTmp*: bool              ## ``--sweep-tmp`` — also age-sweep transient
+                                 ## ``/tmp`` scratch files during ``prune``.
 
 const HelpText = """
 vm-harness <subcommand> [flags]
@@ -170,6 +189,16 @@ Subcommands:
   baseline import <src-dir>
                           Import a previously-exported baseline bundle.
                           Prints the snapshot names now available.
+  prune --ephemeral-prefix <p> [--backend all|tart|qemu-windows-arm]
+        [--state-dir <dir>] [--older-than <sec>] [--sweep-tmp] [--dry-run]
+                          Reclaim ephemeral instances/clones leaked by
+                          hard-killed launchers, scoped to --ephemeral-prefix.
+                          A running instance (advisory lock held, or creator
+                          PID alive) is never removed. --older-than guards the
+                          PID-fallback path (default 3600s; 0 disables).
+                          --sweep-tmp also age-removes transient /tmp scratch
+                          files (SSH password files, mount-share scripts).
+                          --dry-run reports what would be reclaimed.
 
 Common flags:
   --backend <auto|noop|hyperv|wsl|tart-macos|tart-linux-arm|
@@ -194,9 +223,19 @@ Common flags:
   --network-bridge <name>         libvirt-only: host bridge for the guest NIC
                                   (default: backend's configured value, e.g.
                                   virbr0). Ignored by other backends.
+  --image-pool-dir <dir>          libvirt-only: directory the domain's qcow2
+                                  disk is written to; the disk lands at
+                                  <dir>/<name>.qcow2. Use it when your storage
+                                  lives outside the default
+                                  /var/lib/libvirt/images (e.g. a ZFS pool at
+                                  /storage). Ignored by other backends.
   --first-boot-script <path>      libvirt-only: host path to a script the
                                   recipe wraps into the per-VM autounattend
                                   ISO. Requires --recipe.
+  --provision-script <path>       lima-only (repeatable): host path to a shell
+                                  script baked into the generated Lima
+                                  template's provision: block so every per-gate
+                                  ephemeral boots already provisioned.
   --controller-pubkey <path>      libvirt-only: SSH public key the recipe
                                   bakes into the autounattend ISO so the
                                   guest's FirstLogonCommands installs it in
@@ -352,8 +391,18 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.diskGB = parseInt(args[i]); inc i
     of "--network-bridge":
       inc i; result.networkBridge = args[i]; inc i
+    of "--image-pool-dir":
+      inc i; result.imagePoolDir = args[i]; inc i
     of "--first-boot-script":
       inc i; result.firstBootScript = args[i]; inc i
+    of "--provision-script":
+      inc i
+      let p = args[i]
+      if not fileExists(p):
+        raise newException(ValueError,
+          &"--provision-script '{p}': file not found")
+      result.provisionScripts.add(readFile(p))
+      inc i
     of "--controller-pubkey":
       inc i; result.controllerPubKey = args[i]; inc i
     of "--ephemeral":
@@ -420,6 +469,17 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i
     of "--running":
       result.running = true
+      inc i
+    of "--state-dir":
+      inc i; result.stateDir = args[i]; inc i
+    of "--older-than":
+      inc i; result.olderThanSec = parseInt(args[i]); result.olderThanSet = true
+      inc i
+    of "--dry-run":
+      result.dryRun = true
+      inc i
+    of "--sweep-tmp":
+      result.sweepTmp = true
       inc i
     of "-h", "--help":
       result.subcommand = "help"
@@ -587,8 +647,10 @@ proc applyDefaults(spec: var BaselineSpec, opts: CliOpts) =
   spec.recipeDir = opts.recipeDir
   spec.recipeBuildDir = opts.recipeBuildDir
   spec.firstBootScript = opts.firstBootScript
+  spec.provisionScripts = opts.provisionScripts
   spec.controllerPubKey = opts.controllerPubKey
   spec.networkBridge = opts.networkBridge
+  spec.imagePoolDir = opts.imagePoolDir
   spec.backendOptions = initTable[string, string]()
   if opts.ephemeralPrefix.len > 0:
     spec.backendOptions["ephemeralPrefix"] = opts.ephemeralPrefix
@@ -1089,6 +1151,55 @@ proc cmdBaseline(opts: CliOpts): int =
     stderr.writeLine("  actions: export, import")
     2
 
+proc cmdPrune(opts: CliOpts): int =
+  ## Reclaim ephemeral resources leaked by hard-killed launchers, scoped to a
+  ## project's ``--ephemeral-prefix``. Never touches anything outside that
+  ## scope and never removes an instance whose owner is still alive.
+  if opts.ephemeralPrefix.len == 0:
+    stderr.writeLine(
+      "vm-harness prune: --ephemeral-prefix is required (project scope)")
+    return 2
+  var backend = opts.backend
+  if backend.len == 0 or backend == "auto":
+    backend = "all"
+  if backend notin ["all", "tart", "qemu-windows-arm"]:
+    stderr.writeLine(
+      "vm-harness prune: --backend must be all|tart|qemu-windows-arm")
+    return 2
+  let scope = PruneScope(
+    ephemeralPrefix: opts.ephemeralPrefix,
+    stateDir: opts.stateDir,
+    olderThanSec: (if opts.olderThanSet: opts.olderThanSec else: DefaultPruneAgeSec),
+    dryRun: opts.dryRun,
+    backend: backend,
+    sweepTmp: opts.sweepTmp)
+  let rep = runPrune(scope)
+  let mib = rep.bytesReclaimed.float / (1024.0 * 1024.0)
+  if opts.logFormat == lfJson:
+    echo $(%*{
+      "event": "prune",
+      "dryRun": opts.dryRun,
+      "ephemeralPrefix": opts.ephemeralPrefix,
+      "backend": backend,
+      "olderThanSec": scope.olderThanSec,
+      "removedInstanceDirs": rep.removedInstanceDirs,
+      "liveInstanceDirs": rep.liveInstanceDirs,
+      "freshInstanceDirs": rep.freshInstanceDirs,
+      "removedTartClones": rep.removedTartClones,
+      "liveTartClones": rep.liveTartClones,
+      "removedTmpFiles": rep.removedTmpFiles,
+      "bytesReclaimed": rep.bytesReclaimed})
+  else:
+    let verb = if opts.dryRun: "would reclaim" else: "reclaimed"
+    echo &"vm-harness prune ({backend}, prefix '{opts.ephemeralPrefix}'): " &
+         &"{verb} {rep.removedInstanceDirs.len} instance dir(s), " &
+         &"{rep.removedTartClones.len} tart clone(s), " &
+         &"{rep.removedTmpFiles.len} tmp file(s) " &
+         &"(~{mib:.1f} MiB); kept {rep.liveInstanceDirs.len} live + " &
+         &"{rep.freshInstanceDirs.len} fresh instance dir(s), " &
+         &"{rep.liveTartClones.len} live tart clone(s)."
+  0
+
 proc runCli*(args: seq[string]): int =
   var opts: CliOpts
   try:
@@ -1111,6 +1222,7 @@ proc runCli*(args: seq[string]): int =
   of "shell":     return cmdShell(opts)
   of "snapshot":  return cmdSnapshot(opts)
   of "baseline":  return cmdBaseline(opts)
+  of "prune":     return cmdPrune(opts)
   else:
     stderr.writeLine("vm-harness: unknown subcommand '" & opts.subcommand & "'")
     stderr.writeLine(HelpText)

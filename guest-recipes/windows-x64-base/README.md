@@ -16,7 +16,10 @@ prototype on `high-mem-server` can be brought up by a single
 
 A `qemu:///system` libvirt domain configured for:
 
-- 4 vCPU, 8 GB RAM, 80 GB qcow2 in `/var/lib/libvirt/images/`.
+- 4 vCPU, 8 GB RAM, 80 GB qcow2 in `/var/lib/libvirt/images/`
+  (override the directory with `--image-pool-dir <dir>` when your
+  storage lives elsewhere, e.g. a ZFS pool at `/storage`; the disk
+  then lands at `<dir>/<name>.qcow2`).
 - q35 board with UEFI + SMM (Win11 requires both).
 - virtio-blk system disk, virtio-net adapter on `virbr0` (default
   NAT bridge; overridable via `--network-bridge`).
@@ -64,6 +67,18 @@ vm-harness provision \
 This is what the windows-runner-001 README on the infra repo
 documents as the canonical operator command. If `vm-harness` isn't
 on PATH yet, fall back to the manual sequence below.
+
+> **Fail-fast on a BIOS-only ISO.** Before launching `virt-install`,
+> `vm-harness provision` validates that the Windows ISO carries a UEFI
+> (EFI) El Torito boot record (via `xorriso`). A BIOS-only ISO can't
+> boot the UEFI q35 domain — OVMF drops to the UEFI shell and
+> `virt-install --wait` would otherwise stall ~90 minutes with no clear
+> cause. The CLI rejects it up front with a message telling you to
+> supply a UEFI-bootable Win11 ISO (a stock Microsoft ISO works) via
+> `--source-image` / `VMH_WIN11_X64_ISO`. The optional `fetch-iso.sh`
+> prep performs the identical check, so both paths are protected. When
+> `xorriso` is absent the check is skipped with a warning (never a hard
+> failure on missing tooling).
 
 ### 1. Prerequisites
 
@@ -210,7 +225,11 @@ domain as long-lived and skips per-gate revert.
   FirstLogonCommands (OpenSSH install, firewall rule, virtio-win
   guest tools install, first-boot.ps1 run, install-done sentinel).
 - `fetch-iso.sh` — downloads virtio-win.iso, verifies the
-  operator-supplied Win11 ISO.
+  operator-supplied Win11 ISO exists AND validates it carries a UEFI
+  (EFI) El Torito boot record (via `xorriso`, provided by the dev
+  shell). A BIOS-only ISO is rejected up front: it boots to nothing on
+  the UEFI q35 domain (OVMF drops to the UEFI shell and virt-install
+  stalls ~90 min). Supply a stock Microsoft ISO, which is UEFI-bootable.
 - `build-autounattend-iso.sh` — wraps autounattend.xml + an optional
   first-boot.ps1 as a CD-ROM ISO9660+Joliet image.
 - `finalize-golden.sh` — verifies the domain is in the expected

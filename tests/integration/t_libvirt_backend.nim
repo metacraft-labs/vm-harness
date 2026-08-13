@@ -43,6 +43,40 @@ suite "LibvirtBackend smoke (no live virsh)":
     let b = newLibvirtBackend(virshCmd = "/nonexistent/virsh-no-such")
     check not b.probeAvailability()
 
+  test "domainDiskPath uses the configured image pool (default + override)":
+    # Default backend: disk lands under /var/lib/libvirt/images.
+    let bDefault = newLibvirtBackend()
+    check bDefault.imagePoolDir == DefaultLibvirtImagePool
+    check bDefault.domainDiskPath("windows-runner-001") ==
+      DefaultLibvirtImagePool / "windows-runner-001.qcow2"
+    # Operator override: storage lives on a big ZFS pool at /storage.
+    let bOverride = newLibvirtBackend(imagePoolDir = "/storage/libvirt")
+    check bOverride.imagePoolDir == "/storage/libvirt"
+    check bOverride.domainDiskPath("windows-runner-001") ==
+      "/storage/libvirt/windows-runner-001.qcow2"
+
+  test "buildVirtInstallArgs writes the disk at the overridden pool dir":
+    # The disk path virt-install receives is computed by domainDiskPath,
+    # so an --image-pool-dir override must surface in the --disk argv.
+    let b = newLibvirtBackend(imagePoolDir = "/storage/libvirt")
+    let diskPath = b.domainDiskPath("windows-runner-001")
+    let argv = buildVirtInstallArgs(b,
+      name = "windows-runner-001",
+      diskPath = diskPath,
+      diskGB = 80, memoryMB = 8192, vcpus = 4,
+      isoPath = "/storage/iso/Win11.iso",
+      unattendIsoPath = "/tmp/autounattend.iso",
+      virtioWinIsoPath = "/tmp/virtio-win.iso",
+      osVariant = "win11")
+    var diskArg = ""
+    for a in argv:
+      if a.startsWith("path=/storage/libvirt/windows-runner-001.qcow2"):
+        diskArg = a
+    check diskArg.len > 0
+    check diskArg.contains("format=qcow2")
+    # And the default pool path must NOT appear anywhere in the argv.
+    check not argv.anyIt(it.contains(DefaultLibvirtImagePool))
+
   test "buildVirtInstallArgs renders an argv with the expected key flags":
     let b = newLibvirtBackend(networkBridge = "br0",
                               libvirtUri = "qemu:///system")
@@ -260,3 +294,123 @@ suite "LibvirtBackend smoke (no live virsh)":
       check "HELLO-M3" in raw
       check "user_data" in raw
       removeFile(iso)
+
+# ---------------------------------------------------------------------------
+# UEFI El Torito ISO validation (Gap 1, backend side).
+#
+# MOCK JUSTIFICATION (per design.md §9.1): no backend or process mocks.
+# The pure decision `isoHasUefiElTorito` is fed representative
+# `xorriso -report_el_torito` output (the same BIOS-only vs BIOS+UEFI
+# samples the shell unit test uses; we cannot ship real multi-GB ISOs).
+# `validateWindowsIsoBootable` is driven against a REAL `xorriso` shell
+# shim on PATH (a genuine osproc spawn, per §9.1's "shell shim that
+# records/emits and exits" allowance) — never a mocked process.
+
+const Win11PlainBiosPlusUefi = """
+El Torito catalog  : 20  2
+El Torito images   :   N  Pltf  B   Emul  Ld_seg  Hdpt  Ldsiz         LBA
+El Torito boot img :   1  BIOS  y   none  0x0000  0x00  8             27
+El Torito boot img :   2  UEFI  y   none  0x0000  0x00  5760          35
+"""
+
+const BiosOnlyPlain = """
+El Torito catalog  : 20  1
+El Torito images   :   N  Pltf  B   Emul  Ld_seg  Hdpt  Ldsiz         LBA
+El Torito boot img :   1  BIOS  y   none  0x0000  0x00  4             27
+"""
+
+const Win11AsMkisofs = """
+-V 'CCCOMA_X64FRE_EN-US_DV9'
+-boot-load-size 8 -no-emul-boot -boot-info-table
+-eltorito-boot boot/etfsboot.com
+-eltorito-alt-boot -e efi/microsoft/boot/efisys.bin -no-emul-boot
+"""
+
+const BiosOnlyAsMkisofs = """
+-V 'SOME_BIOS_ONLY_ISO'
+-boot-load-size 4 -no-emul-boot -boot-info-table
+-eltorito-boot isolinux/isolinux.bin
+"""
+
+const IsoinfoUefiPlatform = """
+El Torito VD version 1 found, boot catalog is in sector 20
+Platform Id 0xEF (UEFI)
+Bootoff 23 0x17
+"""
+
+proc writeXorrisoStub(dir, report: string): string =
+  ## Write an executable `xorriso` shim into `dir` that ignores its args
+  ## and prints `report` on stdout, exit 0. Returns `dir` (to prepend to
+  ## PATH). This is a real binary spawned by osproc — not a mock.
+  createDir(dir)
+  let stub = dir / "xorriso"
+  # Single-quote the heredoc-free body; embed the report via a Nim string.
+  writeFile(stub, "#!/usr/bin/env bash\ncat <<'__RPT__'\n" & report &
+    "\n__RPT__\n")
+  setFilePermissions(stub, {fpUserRead, fpUserWrite, fpUserExec,
+    fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
+  dir
+
+template withPath(newPath: string, body: untyped) =
+  let savedPath = getEnv("PATH")
+  putEnv("PATH", newPath)
+  try:
+    body
+  finally:
+    putEnv("PATH", savedPath)
+
+suite "LibvirtBackend UEFI El Torito ISO validation":
+  test "isoHasUefiElTorito ACCEPTS a plain report with a UEFI boot image":
+    check isoHasUefiElTorito(Win11PlainBiosPlusUefi)
+
+  test "isoHasUefiElTorito REJECTS a BIOS-only plain report":
+    check not isoHasUefiElTorito(BiosOnlyPlain)
+
+  test "isoHasUefiElTorito ACCEPTS an as_mkisofs report with alt-boot + EFI":
+    check isoHasUefiElTorito(Win11AsMkisofs)
+
+  test "isoHasUefiElTorito REJECTS a BIOS-only as_mkisofs report":
+    check not isoHasUefiElTorito(BiosOnlyAsMkisofs)
+
+  test "isoHasUefiElTorito ACCEPTS an isoinfo dump naming the EFI platform":
+    check isoHasUefiElTorito(IsoinfoUefiPlatform)
+
+  test "isoHasUefiElTorito REJECTS an empty report":
+    check not isoHasUefiElTorito("")
+
+  test "validateWindowsIsoBootable RAISES on a BIOS-only ISO (xorriso present)":
+    let b = newLibvirtBackend()
+    let dir = writeXorrisoStub(
+      getTempDir() / "vmh-xorriso-bios-" & $getCurrentProcessId(),
+      BiosOnlyPlain)
+    defer: removeDir(dir)
+    withPath(dir & ":" & getEnv("PATH")):
+      var raised = false
+      try:
+        b.validateWindowsIsoBootable("/tmp/fake-bios-only.iso")
+      except VmHarnessError as e:
+        raised = true
+        check e.phase == lpProvisioning
+        check "BIOS-boot only" in e.msg
+        check "UEFI shell" in e.msg
+        check "/tmp/fake-bios-only.iso" in e.msg
+      check raised
+
+  test "validateWindowsIsoBootable PASSES on a UEFI ISO (xorriso present)":
+    let b = newLibvirtBackend()
+    let dir = writeXorrisoStub(
+      getTempDir() / "vmh-xorriso-uefi-" & $getCurrentProcessId(),
+      Win11PlainBiosPlusUefi)
+    defer: removeDir(dir)
+    withPath(dir & ":" & getEnv("PATH")):
+      # Must not raise.
+      b.validateWindowsIsoBootable("/tmp/fake-uefi.iso")
+
+  test "validateWindowsIsoBootable WARNS + SKIPS when xorriso is absent":
+    let b = newLibvirtBackend()
+    let emptyDir = getTempDir() / "vmh-noxorriso-" & $getCurrentProcessId()
+    createDir(emptyDir)
+    defer: removeDir(emptyDir)
+    # PATH with no xorriso ⇒ findExe returns "" ⇒ warn + return (no raise).
+    withPath(emptyDir):
+      b.validateWindowsIsoBootable("/tmp/whatever.iso", xorrisoCmd = "xorriso")

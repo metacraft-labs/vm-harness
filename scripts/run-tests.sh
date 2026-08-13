@@ -18,7 +18,11 @@ run_nim r --hints:off tests/unit/t_wsl_parsers.nim
 run_nim r --hints:off tests/unit/t_utm_parsers.nim
 run_nim r --hints:off tests/unit/t_tart_shared_dirs.nim
 run_nim r --hints:off tests/unit/t_qemu_windows_arm_backend.nim
+run_nim r --hints:off tests/unit/t_qemu_windows_arm_overlay.nim
 run_nim r --hints:off tests/unit/t_tart_backend.nim
+run_nim r --hints:off tests/unit/t_lima_backend.nim
+run_nim r --hints:off tests/unit/t_prune.nim
+run_nim r --hints:off tests/unit/t_uefi_iso_validator.nim
 
 # Backend-independent lifecycle and CLI coverage.
 run_nim r --hints:off tests/integration/t_noop_lifecycle.nim

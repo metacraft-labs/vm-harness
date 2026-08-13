@@ -66,4 +66,16 @@ jobs:
         with:
           name: reprobuild-logs-${{ matrix.runner }}
           path: test-logs/
-          retention-days: 30
+          retention-days: 1
+      - name: Mirror logs to S3 (non-blocking)
+        if: always()
+        continue-on-error: true
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@main
+        with:
+          path: test-logs/
+          prefix: reprobuild-logs-${{ matrix.runner }}/${{ github.run_id }}
+          endpoint: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
+          bucket: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
+          region: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
+          access-key-id: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}

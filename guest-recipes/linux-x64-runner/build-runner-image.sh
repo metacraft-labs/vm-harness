@@ -16,7 +16,12 @@
 #   * an unprivileged `runner` user with passwordless sudo (the runner
 #     refuses to run as root),
 #   * the runner's .NET runtime deps (libicu/libssl/libkrb5/zlib) — the
-#     `debian/12/cloud` base already ships them, so no apt is needed.
+#     `debian/12/cloud` base already ships them, so no apt is needed,
+#   * `fuse3`, which ships the SETUID `/usr/bin/fusermount3` an unprivileged
+#     process needs before libfuse can mount anything (see step 3b), PLUS a
+#     boot-time `/run/wrappers/bin/fusermount3` symlink to it (step 3c) so
+#     libfuse's absolute-path probe resolves and a Nix dev shell's own
+#     non-setuid `fusermount3` cannot shadow it on PATH.
 #
 # Base image: a Debian *cloud* variant (has cloud-init). The default base
 # alias is `im2-debian-cloud` (pulled during IM0/IM2 prep); if it is absent
@@ -27,9 +32,11 @@
 # curled in-guest. It is streamed, NOT `incus file push`ed, because on this
 # host `incus file push` corrupts large tarballs (blocker A).
 #
-# Reproducible + idempotent: safe to re-run. Uses ONLY the `im2-bld-runner`
-# throwaway container name + the `vmh-linux-runner` alias — never touches
-# unrelated host containers/images.
+# Reproducible + idempotent: safe to re-run. Uses ONLY a throwaway build
+# container derived from the target alias (`vmh-bld-<alias>`, see
+# VMH_BUILD_CONTAINER below) + that output alias — never touches unrelated host
+# containers/images, and never collides with a concurrent build of a different
+# alias.
 #
 # Usage:
 #   ./build-runner-image.sh
@@ -44,6 +51,9 @@
 # Env:
 #   VMH_INCUS_CMD       incus invocation        (default: incus)
 #   VMH_RUNNER_ALIAS    output image alias       (default: vmh-linux-runner)
+#   VMH_BUILD_CONTAINER throwaway build container (default: vmh-bld-<alias w/o
+#                       name; MUST be unique per   the leading `vmh-`>, so a
+#                       concurrent alias           per-alias build never clashes)
 #   VMH_CLOUD_BASE      local cloud base alias   (default: im2-debian-cloud)
 #   VMH_CLOUD_REMOTE    remote to copy if base
 #                       absent                   (default: images:debian/12/cloud)
@@ -53,7 +63,31 @@
 #   VMH_RUNNER_DOCKER   bake nested Docker (HR1)  (default: off; set =1)
 #   VMH_RUNNER_KVM      bake nested KVM (HR2)     (default: off; set =1)
 #   VMH_RUNNER_RECIPE_REVISION
-#                       image recipe revision property (default: linux-x64-runner-v1)
+#                       image recipe revision property (default: linux-x64-runner-v2)
+#   VMH_RUNNER_REPRO    bake the `repro` CLI      (default: ON; set =0 to skip)
+#   VMH_REPRO_PIN       reprobuild rev to build   (default: resolved from
+#                       repro-portable from       nixos-modules/flake.lock —
+#                                                 the single source of truth)
+#   VMH_REPRO_BUNDLE    pre-built repro-portable  (default: nix-built on host
+#                       self-extractor on host    from the pin)
+#   VMH_NIXOS_MODULES_LOCK  path to the pinning   (default: ../../../nixos-modules
+#                       nixos-modules flake.lock  /flake.lock relative to script)
+#
+# REPRO BAKE (HR-REPRO): the ephemeral Linux runner ships the pinned `repro`
+# CLI pre-installed on PATH so CI jobs get it for free and reprobuild's
+# idempotent `setup-reprobuild` action no-ops. `repro` is distributed to
+# NON-nix hosts (this Debian image has no /nix/store) as `repro-portable` — a
+# ~234 MB self-extracting `toArx` bundle that, on FIRST run, extracts its whole
+# nix closure (~364 MB) under $HOME/.cache and re-exposes it at /nix/store via
+# nix-user-chroot (needs unprivileged user namespaces). A cold first run costs
+# ~50 s of extraction; a warm run (extracted `dat` already present) is ~4 s and
+# does NOT re-extract. Because these runners are EPHEMERAL (fresh image clone
+# per job) we must NEVER pay that ~50 s per job, so this script PRE-WARMS the
+# extraction AT BAKE TIME as the runner user: the extracted closure lands in
+# /home/<user>/.cache/tmpx-<hash> and is baked into the published image, so
+# every per-job first run hits the warm cache. The pin is resolved from
+# nixos-modules/flake.lock (the reprobuild node rev) so the runner image and the
+# nix hosts install byte-identical `repro` from ONE source of truth.
 #
 # IM4 note: the cache path MUST match GARM's Linux install template, which
 # looks for a cached runner at exactly `/home/<RunnerUsername>/actions-runner`
@@ -72,7 +106,15 @@ RUNNER_USER="${VMH_RUNNER_USER:-runner}"
 # Default to the GARM-expected cached path /home/<user>/actions-runner so the
 # per-job bootstrap uses the baked runner instead of re-downloading it.
 RUNNER_CACHE="${VMH_RUNNER_CACHE:-/home/${RUNNER_USER}/actions-runner}"
-BLD="im2-bld-runner"
+# Throwaway build container. DERIVED FROM THE TARGET ALIAS so that two
+# invocations of this same recipe for DIFFERENT aliases (e.g. the plain
+# `vmh-linux-runner` and the nested `vmh-linux-runner-nested`) never share one
+# build container. They previously both hard-coded `im2-bld-runner`, so when
+# both ran at once each recipe's opening `incus delete --force "$BLD"` destroyed
+# the other's in-flight container and both builds failed (SIGKILL/137 on the
+# next `incus exec`) and crash-looped, producing no image. Overridable for
+# callers that need an explicit name.
+BLD="${VMH_BUILD_CONTAINER:-vmh-bld-${ALIAS#vmh-}}"
 
 # HR1 (nested Docker): when VMH_RUNNER_DOCKER is set (=1), bake docker/moby +
 # fuse-overlayfs into the image so a per-job container launched with the
@@ -94,7 +136,24 @@ DOCKER_VERSION="${VMH_DOCKER_VERSION:-27.5.1}"
 # the same egress + apt seam as HR1, so VMH_RUNNER_DOCKER=1 VMH_RUNNER_KVM=1
 # bakes BOTH into one image (the `incus-nested` prod class needs both).
 KVM="${VMH_RUNNER_KVM:-}"
-RECIPE_REVISION="${VMH_RUNNER_RECIPE_REVISION:-linux-x64-runner-v1}"
+RECIPE_REVISION="${VMH_RUNNER_RECIPE_REVISION:-linux-x64-runner-v2}"
+# HR-REPRO (repro CLI bake): ON by default so the live `vmh-linux-runner` image
+# ships `repro` on PATH. Set VMH_RUNNER_REPRO=0 to skip (e.g. to reproduce the
+# pre-repro image byte-for-byte). The pin is resolved from nixos-modules'
+# flake.lock unless VMH_REPRO_PIN pins a reprobuild rev explicitly; a pre-built
+# bundle can be supplied via VMH_REPRO_BUNDLE (host path) to skip the nix build.
+REPRO="${VMH_RUNNER_REPRO:-1}"
+REPRO_PIN="${VMH_REPRO_PIN:-}"
+REPRO_BUNDLE="${VMH_REPRO_BUNDLE:-}"
+# nixos-modules is the single source of truth for the reprobuild pin. Default to
+# the sibling checkout in this multi-repo workspace (…/infra and …/nixos-modules
+# are siblings; this recipe lives at vm-harness/guest-recipes/linux-x64-runner).
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NIXOS_MODULES_LOCK="${VMH_NIXOS_MODULES_LOCK:-${_SCRIPT_DIR}/../../../nixos-modules/flake.lock}"
+# Where the self-extractor is installed on PATH inside the image, and the runner
+# user's HOME whose .cache the pre-warmed extraction is baked under.
+REPRO_BIN="/usr/local/bin/repro"
+RUNNER_HOME="/home/${RUNNER_USER}"
 # Pre-downloaded docker static bundle on the HOST (containers have egress only
 # once a static IP + gateway are configured — see the egress step below); the
 # static bundle is STREAMED in (cat|incus exec tar) rather than `incus file
@@ -156,6 +215,74 @@ teardown_build_egress() {
   EGRESS_BIP=""
 }
 
+# HR-REPRO helpers ────────────────────────────────────────────────────────────
+# Resolve the reprobuild rev to build `repro-portable` from. nixos-modules'
+# flake.lock is the SINGLE source of truth (its `reprobuild` node rev). An
+# explicit VMH_REPRO_PIN overrides it (e.g. to test an unlanded rev). We resolve
+# a concrete rev — rather than build `github:…/reprobuild#repro-portable` at a
+# floating branch — so the runner image and the nix fleet install byte-identical
+# `repro` from the same commit. nixos-modules does NOT re-export repro-portable
+# (its mcl-reprobuild module installs the NATIVE package for nix hosts only), so
+# we build the `repro-portable` output straight from the reprobuild flake AT the
+# rev nixos-modules pins.
+resolve_repro_pin() {
+  if [ -n "$REPRO_PIN" ]; then
+    log "HR-REPRO: using explicit reprobuild pin VMH_REPRO_PIN=${REPRO_PIN}"
+    return 0
+  fi
+  if [ ! -f "$NIXOS_MODULES_LOCK" ]; then
+    echo "[build-runner-image] HR-REPRO: nixos-modules flake.lock not found at ${NIXOS_MODULES_LOCK}" >&2
+    echo "  (set VMH_NIXOS_MODULES_LOCK to its path, or VMH_REPRO_PIN to a reprobuild rev)" >&2
+    exit 1
+  fi
+  # Pull the reprobuild node's locked rev out of the lock JSON. Prefer python3
+  # (present on the host); fall back to a grep/sed extraction.
+  if command -v python3 >/dev/null 2>&1; then
+    REPRO_PIN="$(python3 - "$NIXOS_MODULES_LOCK" <<'PY'
+import json, sys
+lock = json.load(open(sys.argv[1]))
+node = lock["nodes"]["reprobuild"]["locked"]
+assert node["type"] == "github" and node["repo"] == "reprobuild", node
+print(node["rev"])
+PY
+)"
+  else
+    REPRO_PIN="$(grep -A6 '"reprobuild"' "$NIXOS_MODULES_LOCK" | sed -n 's/.*"rev": *"\([0-9a-f]\{40\}\)".*/\1/p' | head -1)"
+  fi
+  if [ -z "$REPRO_PIN" ]; then
+    echo "[build-runner-image] HR-REPRO: could not resolve reprobuild rev from ${NIXOS_MODULES_LOCK}" >&2
+    exit 1
+  fi
+  log "HR-REPRO: resolved reprobuild pin ${REPRO_PIN} from nixos-modules/flake.lock (single source of truth)"
+}
+
+# Build the self-extracting `repro-portable` bundle on the HOST (the build
+# CONTAINER has no reliable egress and no nix). Sets REPRO_BUNDLE to the built
+# path unless one was supplied. The bundle is the reprobuild flake's
+# `packages.<system>.repro-portable` (a ~234 MB toArx executable).
+build_repro_bundle() {
+  if [ -n "$REPRO_BUNDLE" ] && [ -f "$REPRO_BUNDLE" ]; then
+    log "HR-REPRO: using pre-built repro-portable bundle: $REPRO_BUNDLE"
+    return 0
+  fi
+  if ! command -v nix >/dev/null 2>&1; then
+    echo "[build-runner-image] HR-REPRO: nix not found on the host — cannot build repro-portable." >&2
+    echo "  Supply a pre-built bundle via VMH_REPRO_BUNDLE=/path/to/repro-portable, or set" >&2
+    echo "  VMH_RUNNER_REPRO=0 to skip the repro bake." >&2
+    exit 1
+  fi
+  local flakeref="github:metacraft-labs/reprobuild/${REPRO_PIN}#repro-portable"
+  log "HR-REPRO: building ${flakeref} on the host (this is the ~234 MB toArx bundle; slow on a cold cache)"
+  REPRO_BUNDLE="$(nix build --no-link --print-out-paths \
+    --extra-experimental-features 'nix-command flakes' \
+    "$flakeref")"
+  if [ -z "$REPRO_BUNDLE" ] || [ ! -f "$REPRO_BUNDLE" ]; then
+    echo "[build-runner-image] HR-REPRO: nix build did not produce a bundle file (got: '${REPRO_BUNDLE}')" >&2
+    exit 1
+  fi
+  log "HR-REPRO: built repro-portable at $REPRO_BUNDLE ($(du -h "$REPRO_BUNDLE" | cut -f1))"
+}
+
 # 0. Ensure a local cloud base image exists (cloud-init present). If not,
 #    copy it from the remote (host has network).
 if ! "${INCUS[@]}" image info "$CLOUD_BASE" >/dev/null 2>&1; then
@@ -212,18 +339,101 @@ log "checking runner runtime dependencies in the base image"
 #         reason the CIP-5 incus jobs went red);
 #       * `xz` is needed to unpack the Nix installer's `.xz` payload for the
 #         `nix` flavor;
-#       * `ca-certificates` keeps the authenticated github HTTPS clones valid.
+#       * `ca-certificates` keeps the authenticated github HTTPS clones valid;
+#       * `fuse3` ships the SETUID `/usr/bin/fusermount3`, without which NO
+#         FUSE filesystem can be mounted by an unprivileged process in the
+#         guest. `tup` — codetracer's frontend build tool — tracks
+#         dependencies by mounting FUSE on `.tup/mnt`, and libfuse3 does not
+#         mount it itself: it spawns `fusermount3` (first at the absolute path
+#         baked into the library, then by BARE NAME through PATH) and receives
+#         the `/dev/fuse` descriptor back over a socket. Both resolutions
+#         ultimately need Debian's setuid helper to EXIST — this step installs
+#         it; step 3c then makes the absolute path resolve to it too, which is
+#         what keeps a Nix dev shell from shadowing it. Without the package,
+#         every tup build dies with
+#             posix_spawn(p)() for fusermount3 failed: No such file or directory
+#             tup error: Unable to mount FUSE on .tup/mnt
+#         which reads as "tup is broken" rather than "the image is missing a
+#         package". A Nix dev shell CANNOT substitute for this: it can put a
+#         `fusermount3` on PATH, but nothing in a Nix store is setuid.
+#
+#         `/dev/fuse` itself needs NO container-side configuration: Incus/LXC
+#         bind-mounts it into every container from the host's static device
+#         set, unprivileged and idmapped included, so the device is already
+#         there (verified `crw-rw-rw- 1 nobody nogroup 10, 229 /dev/fuse` on a
+#         live `eph-linux-x64` job container). FUSE mounts from inside a user
+#         namespace have been permitted since Linux 4.18, so no
+#         `security.privileged` / `security.nesting` / extra `unix-char`
+#         device is required — only this package.
 #     apt needs egress, which incusbr0 does not lease; bring up the shared
 #     static build IP for the install (idempotent — the HR1/HR2 bakes reuse it).
-log "installing CI baseline tools (git, xz-utils, ca-certificates)"
+log "installing CI baseline tools (git, xz-utils, ca-certificates, fuse3)"
 ensure_build_egress
 "${INCUS[@]}" exec "$BLD" -- sh -c "
   set -e
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq --no-install-recommends git xz-utils ca-certificates
+  apt-get install -y -qq --no-install-recommends git xz-utils ca-certificates fuse3
   command -v git
   command -v xz
+  # Assert the helper is present AND setuid — an installed-but-not-setuid
+  # fusermount3 fails later, at build time, with the far less obvious
+  # 'fusermount3: mount failed: Operation not permitted'.
+  command -v fusermount3
+  test -u \"\$(command -v fusermount3)\" || {
+    echo '[build-runner-image] fusermount3 is not setuid — unprivileged FUSE mounts will fail' >&2
+    exit 1
+  }
+"
+
+# 3c. Publish the setuid helper at the ABSOLUTE path libfuse tries FIRST.
+#
+#     Installing fuse3 (3b) is necessary but NOT sufficient, and the gap is
+#     easy to miss because it only opens once a job enters a Nix dev shell.
+#     libfuse resolves its mount helper in two steps:
+#
+#       1. posix_spawn("/run/wrappers/bin/fusermount3", …) — an ABSOLUTE path
+#          nixpkgs patches in, no PATH search;
+#       2. posix_spawnp("fusermount3", …) — a BARE name, so PATH *is* searched.
+#
+#     On a Debian guest step 1 misses (/run/wrappers does not exist), so
+#     everything rides on step 2 — and step 2 finds whatever is FIRST on PATH.
+#     CI jobs build inside a Nix dev shell that deliberately lists `fuse3`
+#     (codetracer's nix/shells/ci-base.nix explains why: it is what satisfies
+#     step 2 on hosts that have no wrapper). That store copy is EARLIER on PATH
+#     than /usr/bin and is NOT setuid — nothing in a Nix store can be — so the
+#     mount is attempted by an unprivileged helper and dies with
+#         fusermount3: mount failed: Operation not permitted
+#         tup error: Unable to mount FUSE on .tup/mnt
+#     i.e. the same build failure, one step further along, on an image that
+#     looks correctly provisioned. Verified by reproducing exactly this in a
+#     container that HAD fuse3 installed.
+#
+#     Making step 1 resolve removes the dependency on PATH ordering entirely.
+#     A SYMLINK is enough: the kernel applies the setuid bit of the RESOLVED
+#     inode, so /run/wrappers/bin/fusermount3 -> /usr/bin/fusermount3 executes
+#     with the same privilege as the target. /run is a tmpfs, so the link
+#     cannot be baked into the image directly — it is recreated on every boot
+#     by systemd-tmpfiles, which is exactly what tmpfiles.d is for.
+log "publishing /run/wrappers/bin/fusermount3 (absolute path libfuse tries first)"
+"${INCUS[@]}" exec "$BLD" -- sh -c "
+  set -e
+  cat > /etc/tmpfiles.d/fuse-mount-helper.conf <<'TMPFILES'
+# Give libfuse the absolute mount-helper path it probes BEFORE searching PATH
+# (nixpkgs patches /run/wrappers/bin/fusermount3 into libfuse and into tup).
+# Without this, a Nix dev shell's non-setuid fusermount3 shadows Debian's
+# setuid /usr/bin/fusermount3 and every FUSE mount fails with
+# 'mount failed: Operation not permitted'. A symlink suffices: setuid is a
+# property of the resolved inode.
+d /run/wrappers 0755 root root -
+d /run/wrappers/bin 0755 root root -
+L+ /run/wrappers/bin/fusermount3 - - - - /usr/bin/fusermount3
+TMPFILES
+  # Apply now too, so the BUILD container matches what guests will boot into
+  # and the assertion below tests the real thing rather than the config text.
+  systemd-tmpfiles --create /etc/tmpfiles.d/fuse-mount-helper.conf
+  test -x /run/wrappers/bin/fusermount3
+  test -u /run/wrappers/bin/fusermount3
 "
 
 # 4. Create the unprivileged runner user with passwordless sudo.
@@ -271,6 +481,107 @@ log "clearing root-owned runtime dirs + re-asserting ${RUNNER_USER} ownership"
   rm -rf '${RUNNER_CACHE}/_diag' '${RUNNER_CACHE}/_work'
   chown -R ${RUNNER_USER}:${RUNNER_USER} '${RUNNER_CACHE}'
 "
+
+# 5a-REPRO. HR-REPRO — bake the pinned `repro` CLI onto PATH + PRE-WARM its
+#     extraction so per-job first-run is fast. Default-ON (VMH_RUNNER_REPRO=1);
+#     set VMH_RUNNER_REPRO=0 to reproduce the pre-repro image. See the header
+#     for the full rationale (ephemeral runners must not pay the ~50 s cold
+#     extraction per job).
+if [ "$REPRO" != "0" ]; then
+  resolve_repro_pin
+  build_repro_bundle
+
+  # (a0) The toArx self-extractor decompresses its embedded closure with bzip2
+  #     (the `dat` payload is BZh/bzip2 — verified on the built bundle) plus tar.
+  #     `tar` + `gzip` ship in the Debian cloud base but `bzip2` does NOT, so the
+  #     FIRST run would die with "tar (grandchild): bzip2: Cannot exec". Install
+  #     it (tiny). Egress is already up from step 3b's baseline install;
+  #     ensure_build_egress is idempotent so this is a no-op then.
+  log "HR-REPRO: installing bzip2 (the toArx extractor's decompressor)"
+  ensure_build_egress
+  "${INCUS[@]}" exec "$BLD" -- sh -c "
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    command -v bzip2 >/dev/null 2>&1 || {
+      apt-get update -qq
+      apt-get install -y -qq --no-install-recommends bzip2
+    }
+    command -v bzip2
+  "
+
+  # (a) Enable unprivileged user namespaces in the image. The toArx bundle runs
+  #     nix-user-chroot, which needs unprivileged userns to map the extracted
+  #     store to /nix/store. Debian 12 enables this by default, but the legacy
+  #     `kernel.unprivileged_userns_clone` knob (present on Debian/Ubuntu
+  #     kernels) can be flipped off by hardening; assert it =1 via a sysctl
+  #     drop-in so the image is robust regardless of host defaults. The
+  #     mainline `user.max_user_namespaces` is also raised in case it was
+  #     zeroed. `sysctl -p` is best-effort: on a kernel WITHOUT the legacy knob
+  #     (e.g. this is a container whose /proc lacks it) writing it errors
+  #     harmlessly and the mainline default already permits userns.
+  log "HR-REPRO: enabling unprivileged user namespaces (sysctl drop-in) for nix-user-chroot"
+  "${INCUS[@]}" exec "$BLD" -- sh -c "
+    set -e
+    cat > /etc/sysctl.d/99-repro-userns.conf <<'EOF'
+# repro-portable (toArx / nix-user-chroot) needs unprivileged user namespaces.
+kernel.unprivileged_userns_clone = 1
+user.max_user_namespaces = 28633
+EOF
+    sysctl -p /etc/sysctl.d/99-repro-userns.conf >/dev/null 2>&1 || true
+  "
+
+  # (b) Install the self-extractor on PATH. STREAMED in (cat|incus exec) rather
+  #     than `incus file push`ed — the same blocker-A workaround the ~200 MB
+  #     runner tarball uses (incus file push corrupts large files on this host).
+  log "HR-REPRO: installing repro-portable to ${REPRO_BIN} (streamed; blocker-A workaround)"
+  cat "$REPRO_BUNDLE" | "${INCUS[@]}" exec "$BLD" -- sh -c "
+    set -e
+    cat > '${REPRO_BIN}'
+    chmod 0755 '${REPRO_BIN}'
+    test -x '${REPRO_BIN}'
+  "
+
+  # (c) PRE-WARM the extraction AS THE RUNNER USER so the extracted closure is
+  #     baked under /home/<user>/.cache/tmpx-<hash> — the deterministic shared
+  #     dir the toArx launcher reuses (shared=true ⇒ it re-uses an existing
+  #     `dat` and NEVER re-extracts). Running as the runner user (not root) is
+  #     essential: the launcher keys the cache dir off $HOME, and the per-job
+  #     runner runs as this user, so the warm cache must live in THIS user's
+  #     HOME. `sudo -u` gives a clean login-ish env; we set HOME explicitly so
+  #     the cache lands in the right place even under a minimal env. A first
+  #     invocation extracts (~50 s); we assert it prints the version.
+  log "HR-REPRO: pre-warming repro extraction as '${RUNNER_USER}' (baking the ~364 MB closure into the image)"
+  "${INCUS[@]}" exec "$BLD" -- sh -c "
+    set -e
+    install -d -o '${RUNNER_USER}' -g '${RUNNER_USER}' '${RUNNER_HOME}/.cache'
+    sudo -u '${RUNNER_USER}' -H env HOME='${RUNNER_HOME}' '${REPRO_BIN}' --version
+  "
+
+  # (d) VERIFY the warm cache persists AND is reused (no re-extraction) by a
+  #     second run: capture the extracted `dat` mtime, run again, assert the
+  #     mtime is unchanged (⇒ the closure was not re-unpacked). This is the
+  #     property that makes per-job first-run fast.
+  log "HR-REPRO: verifying warm-cache reuse (second run must not re-extract)"
+  "${INCUS[@]}" exec "$BLD" -- sh -c "
+    set -e
+    cache_dat=\$(find '${RUNNER_HOME}/.cache' -maxdepth 2 -type d -name dat 2>/dev/null | head -1)
+    if [ -z \"\$cache_dat\" ]; then
+      echo '[build-runner-image] HR-REPRO: extracted cache dir not found after pre-warm' >&2
+      exit 1
+    fi
+    before=\$(stat -c %Y \"\$cache_dat\")
+    sudo -u '${RUNNER_USER}' -H env HOME='${RUNNER_HOME}' '${REPRO_BIN}' --version >/dev/null
+    after=\$(stat -c %Y \"\$cache_dat\")
+    if [ \"\$before\" != \"\$after\" ]; then
+      echo \"[build-runner-image] HR-REPRO: cache dat mtime changed (\$before -> \$after) — re-extraction happened, pre-warm did NOT persist\" >&2
+      exit 1
+    fi
+    # Belt-and-braces: the whole tree must be runner-owned (pre-warm ran as the
+    # runner user, but assert it so a per-job listener never hits a perm error).
+    chown -R '${RUNNER_USER}:${RUNNER_USER}' '${RUNNER_HOME}/.cache'
+    echo \"[build-runner-image] HR-REPRO: warm cache reused (dat mtime stable at \$after); repro is fast per-job\"
+  "
+fi
 
 # 5b. HR1/HR2 — build-time egress for the nested-capability apt steps (opt-in).
 #     Both the HR1 docker bake and the HR2 kvm bake below need Debian packages
@@ -441,9 +752,13 @@ fi
 teardown_build_egress
 
 # 6. Record the image provenance.
+REPRO_PROV=""
+if [ "$REPRO" != "0" ]; then
+  REPRO_PROV=" + repro-portable [HR-REPRO pin ${REPRO_PIN}]"
+fi
 "${INCUS[@]}" exec "$BLD" -- sh -c "
-  printf 'vmh-linux-runner: %s (cloud) + actions-runner %s + cloud-init%s%s\n' \
-    '${CLOUD_BASE}' '${RUNNER_VERSION}' \"${DOCKER:+ + docker ${DOCKER_VERSION} (${DOCKER_STORAGE_DRIVER}) [HR1 nested]}\" \"${KVM:+ + qemu-system-x86 [HR2 nested-kvm]}\" > /etc/vmh-linux-runner-release
+  printf 'vmh-linux-runner: %s (cloud) + actions-runner %s + cloud-init%s%s%s\n' \
+    '${CLOUD_BASE}' '${RUNNER_VERSION}' \"${DOCKER:+ + docker ${DOCKER_VERSION} (${DOCKER_STORAGE_DRIVER}) [HR1 nested]}\" \"${KVM:+ + qemu-system-x86 [HR2 nested-kvm]}\" \"${REPRO_PROV}\" > /etc/vmh-linux-runner-release
 "
 
 # 7. Stop + publish as the runner image alias (replace any prior copy).

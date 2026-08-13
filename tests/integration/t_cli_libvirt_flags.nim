@@ -24,7 +24,7 @@
 ## CLI → BaselineSpec → backend-construction wiring and lets the
 ## live-virsh case land with M4 Phase B's integration suite.
 
-import std/[os, strutils, tables, unittest]
+import std/[os, strutils, tables, tempfiles, unittest]
 import vm_harness
 import vm_harness/cli
 
@@ -40,8 +40,10 @@ proc applyDefaultsForTest(opts: CliOpts): BaselineSpec =
     result.guestOs = opts.guest
   result.recipeDir = opts.recipeDir
   result.firstBootScript = opts.firstBootScript
+  result.provisionScripts = opts.provisionScripts
   result.controllerPubKey = opts.controllerPubKey
   result.networkBridge = opts.networkBridge
+  result.imagePoolDir = opts.imagePoolDir
   result.backendOptions = initTable[string, string]()
 
 suite "CLI libvirt M4 canonical-command flag plumbing":
@@ -144,6 +146,56 @@ suite "CLI libvirt M4 canonical-command flag plumbing":
     check spec.networkBridge == "virbr0"
     check spec.firstBootScript == firstBoot
     check spec.recipeDir.endsWith("windows-x64-base")
+
+  test "--provision-script reads file contents into CliOpts and threads through BaselineSpec":
+    # lima-only knob: each --provision-script is read at parse time and
+    # its CONTENTS (not the path) land in provisionScripts, repeatable.
+    let tmp = createTempDir("vmh-cli-prov-", "")
+    defer: removeDir(tmp)
+    let s1 = tmp / "setup-a.sh"
+    let s2 = tmp / "setup-b.sh"
+    writeFile(s1, "#!/bin/sh\napt-get install -y ripgrep\n")
+    writeFile(s2, "#!/bin/sh\napt-get install -y fd-find\n")
+    let opts = parseCliOpts(@[
+      "provision",
+      "--backend", "lima",
+      "--baseline", "base-clean",
+      "--provision-script", s1,
+      "--provision-script", s2
+    ])
+    check opts.provisionScripts.len == 2
+    check "ripgrep" in opts.provisionScripts[0]
+    check "fd-find" in opts.provisionScripts[1]
+    let spec = applyDefaultsForTest(opts)
+    check spec.provisionScripts == opts.provisionScripts
+
+  test "--provision-script rejects a missing file at parse time":
+    expect ValueError:
+      discard parseCliOpts(@[
+        "provision", "--backend", "lima", "--baseline", "b",
+        "--provision-script", "/definitely/not/here-xyzzy.sh"])
+
+  test "--image-pool-dir lands in CliOpts and threads through BaselineSpec":
+    let opts = parseCliOpts(@[
+      "provision",
+      "--backend", "libvirt",
+      "--name", "windows-runner-001",
+      "--image-pool-dir", "/storage/libvirt"
+    ])
+    check opts.imagePoolDir == "/storage/libvirt"
+    let spec = applyDefaultsForTest(opts)
+    check spec.imagePoolDir == "/storage/libvirt"
+
+  test "--image-pool-dir absent ⇒ empty (backend default preserved)":
+    let opts = parseCliOpts(@[
+      "provision", "--backend", "libvirt", "--name", "windows-runner-001"
+    ])
+    check opts.imagePoolDir == ""
+    let spec = applyDefaultsForTest(opts)
+    check spec.imagePoolDir == ""
+    # An empty override must NOT disturb the backend's configured default.
+    let b = newLibvirtBackend()
+    check b.imagePoolDir == DefaultLibvirtImagePool
 
   test "--cpus and --vcpu are interchangeable":
     let a = parseCliOpts(@["provision", "--cpus", "2"])

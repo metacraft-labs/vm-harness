@@ -78,6 +78,25 @@ vm-harness provision \
 
 Wall-clock: 25-50 minutes on first run (mostly Win11 Setup).
 
+Before it launches `virt-install`, `provisionBaseline` validates that the
+Windows install ISO carries a UEFI (EFI) El Torito boot record
+(`LibvirtBackend.validateWindowsIsoBootable`, via `xorriso`). A BIOS-only
+ISO can't boot the UEFI q35 domain — OVMF drops to the UEFI shell and
+`--wait` would stall ~90 minutes — so the CLI fails fast with guidance to
+supply a UEFI-bootable Win11 ISO. This protects the one-command flow above
+even when the operator skipped the recipe's `fetch-iso.sh` prep (which runs
+the identical check). Missing `xorriso` ⇒ the check is skipped with a
+warning, never a hard failure.
+
+When the host's storage lives outside the default libvirt image pool
+(`/var/lib/libvirt/images`) — e.g. a large ZFS pool mounted at
+`/storage` — add `--image-pool-dir /storage/libvirt`; the domain's
+qcow2 then lands at `/storage/libvirt/<name>.qcow2` instead. Omit it to
+keep the default byte-for-byte. This threads through
+`BaselineSpec.imagePoolDir` into `LibvirtBackend.imagePoolDir` and is
+honoured by both the ISO-install and the `.qcow2`-import provision
+paths.
+
 The flags `--recipe`, `--name`, `--vcpu`, `--memory-gb`,
 `--network-bridge`, and `--first-boot-script` are the canonical
 libvirt-slice surface — `parseCliOpts` resolves them at parse time

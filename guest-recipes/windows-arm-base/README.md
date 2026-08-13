@@ -300,8 +300,11 @@ built, every per-gate revert is the harness's ≤20s clone budget.
   qemus/virtiso-arm ARM64 `virtio-win-0.1.285.tar.xz` release asset,
   then extracts `NetKVM/w11/ARM64` into `./build/virtio/` for offline
   guest driver install.
-- `fetch-iso.sh` — validates `VMH_WIN11_ARM_ISO` or points at the
-  official Microsoft Windows 11 Arm64 ISO page.
+- `fetch-iso.sh` — validates `VMH_WIN11_ARM_ISO` (or an already-present
+  `./build/win11-arm64.iso`) or points at the official Microsoft
+  Windows 11 Arm64 ISO page. Also validates the ISO carries a UEFI
+  (EFI) El Torito boot record (via `xorriso`): a BIOS-only ISO is
+  rejected because the UEFI-only virt/AAVMF domain boots to nothing.
 - `build-autounattend-iso.sh` — wraps `autounattend.xml` +
   `repro-sysprep.xml` + `provision-openssh.ps1` and, when available
   or required, `openssh/OpenSSH-ARM64.zip` and

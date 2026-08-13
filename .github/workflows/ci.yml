@@ -40,7 +40,19 @@ jobs:
         with:
           name: lint-logs-${{ matrix.runner }}
           path: test-logs/
-          retention-days: 30
+          retention-days: 1
+      - name: Mirror logs to S3 (non-blocking)
+        if: always()
+        continue-on-error: true
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@main
+        with:
+          path: test-logs/
+          prefix: lint-logs-${{ matrix.runner }}/${{ github.run_id }}
+          endpoint: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
+          bucket: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
+          region: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
+          access-key-id: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
 
   test:
     name: Test (${{ matrix.runner }})
@@ -66,7 +78,19 @@ jobs:
         with:
           name: test-logs-${{ matrix.runner }}
           path: test-logs/
-          retention-days: 30
+          retention-days: 1
+      - name: Mirror logs to S3 (non-blocking)
+        if: always()
+        continue-on-error: true
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@main
+        with:
+          path: test-logs/
+          prefix: test-logs-${{ matrix.runner }}/${{ github.run_id }}
+          endpoint: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
+          bucket: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
+          region: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
+          access-key-id: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
 
   build-cli:
     name: Build CLI (${{ matrix.runner }})
@@ -92,7 +116,19 @@ jobs:
         with:
           name: build-logs-${{ matrix.runner }}
           path: test-logs/
-          retention-days: 30
+          retention-days: 1
+      - name: Mirror logs to S3 (non-blocking)
+        if: always()
+        continue-on-error: true
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@main
+        with:
+          path: test-logs/
+          prefix: build-logs-${{ matrix.runner }}/${{ github.run_id }}
+          endpoint: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
+          bucket: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
+          region: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
+          access-key-id: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
 
   nix-build:
     name: Nix Build (${{ matrix.runner }})
@@ -118,4 +154,16 @@ jobs:
         with:
           name: nix-build-logs-${{ matrix.runner }}
           path: test-logs/
-          retention-days: 30
+          retention-days: 1
+      - name: Mirror logs to S3 (non-blocking)
+        if: always()
+        continue-on-error: true
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@main
+        with:
+          path: test-logs/
+          prefix: nix-build-logs-${{ matrix.runner }}/${{ github.run_id }}
+          endpoint: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
+          bucket: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
+          region: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
+          access-key-id: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}

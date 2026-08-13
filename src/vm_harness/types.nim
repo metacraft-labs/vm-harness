@@ -96,6 +96,25 @@ type
                                  ## (``virbr0`` for default NAT, ``br0`` for an
                                  ## L2 bridge). Empty means "use the backend's
                                  ## configured default". Other backends ignore.
+    imagePoolDir*: string        ## libvirt-specific: directory the domain's
+                                 ## qcow2 disk is written to (the disk lands at
+                                 ## ``<imagePoolDir>/<name>.qcow2``). Lets an
+                                 ## operator whose storage lives outside the
+                                 ## default ``/var/lib/libvirt/images`` (e.g. a
+                                 ## large ZFS pool at ``/storage``) place the
+                                 ## disk there without abandoning the CLI. Empty
+                                 ## means "use the backend's configured default".
+                                 ## Other backends ignore.
+    provisionScripts*: seq[string]
+                                 ## lima-specific: first-boot provisioning
+                                 ## scripts (each a full shell-script body) baked
+                                 ## into the generated Lima template's
+                                 ## ``provision:`` section so every per-gate
+                                 ## ephemeral comes up already provisioned,
+                                 ## instead of the consumer re-running an
+                                 ## in-guest setup script on every run. Empty ⇒
+                                 ## no ``provision:`` block (default template
+                                 ## unchanged). Other backends ignore.
     backendOptions*: Table[string, string]
                                  ## Free-form per-backend overrides. Used as the
                                  ## escape hatch for backend-specific knobs that

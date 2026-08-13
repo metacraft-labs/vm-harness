@@ -67,28 +67,28 @@ type
 
   EphemeralIncusSpec* = object
     ## Inputs for one per-job ephemeral container.
-    name*: string                ## container name (must be unique per job)
-    baseImage*: string           ## base image alias/fingerprint to launch
-                                 ## from; empty ⇒ backend default ``baseImage``
-    ephemeral*: bool             ## pass ``--ephemeral`` to ``incus launch``
-                                 ## so the daemon auto-removes the container
-                                 ## on stop (defence in depth; explicit
-                                 ## ``delete --force`` in stopAndCleanup is
-                                 ## still the reliable teardown)
-    profiles*: seq[string]       ## optional profiles (``--profile p``); empty
-                                 ## ⇒ the ``default`` profile
-    userData*: string            ## optional cloud-init user-data. When set it
-                                 ## is injected via
-                                 ## ``incus config set <name>
-                                 ##   cloud-init.user-data <...>`` — the IM2
-                                 ## JIT bootstrap-injection seam. Requires a
-                                 ## cloud-init-enabled image to take effect.
+    name*: string          ## container name (must be unique per job)
+    baseImage*: string     ## base image alias/fingerprint to launch
+                           ## from; empty ⇒ backend default ``baseImage``
+    ephemeral*: bool       ## pass ``--ephemeral`` to ``incus launch``
+                           ## so the daemon auto-removes the container
+                           ## on stop (defence in depth; explicit
+                           ## ``delete --force`` in stopAndCleanup is
+                           ## still the reliable teardown)
+    profiles*: seq[string] ## optional profiles (``--profile p``); empty
+                           ## ⇒ the ``default`` profile
+    userData*: string      ## optional cloud-init user-data. When set it
+                           ## is injected via
+                           ## ``incus config set <name>
+                           ##   cloud-init.user-data <...>`` — the IM2
+                           ## JIT bootstrap-injection seam. Requires a
+                           ## cloud-init-enabled image to take effect.
     config*: Table[string, string]
-                                 ## optional raw ``incus config set`` keys
-                                 ## (e.g. ``security.nesting`` ,
-                                 ## ``cloud-init.vendor-data``). Applied after
-                                 ## launch (before start when ``--ephemeral``
-                                 ## containers still need a config pass).
+      ## optional raw ``incus config set`` keys
+      ## (e.g. ``security.nesting`` ,
+      ## ``cloud-init.vendor-data``). Applied after
+      ## launch (before start when ``--ephemeral``
+      ## containers still need a config pass).
 
 const
   DefaultIncusBaseImage* = "vmh-base"
@@ -146,13 +146,22 @@ proc runProcessCapture(cmd: seq[string], cwd: string = "",
                        env = procEnv,
                        options = {poUsePath, poStdErrToStdOut})
   defer: p.close()
-  if stdinData.len > 0:
-    try:
-      let s = p.inputStream
-      if s != nil:
-        s.write(stdinData)
+  # ALWAYS close the child's stdin (after writing any stdinData). Nim's
+  # startProcess hands the child a stdin PIPE whose write end stays open until
+  # we close it; leaving it open makes any tool that slurps an optional config
+  # from a non-tty stdin block forever on EOF. ``incus create``/``launch`` does
+  # exactly this — ``cmd/incus/create.go`` calls ``io.ReadAll(os.Stdin)`` when
+  # stdin is not a terminal — so an un-closed stdin wedges every launch
+  # indefinitely (the read loop below then never sees the deadline because the
+  # blocking read never returns). Closing stdin gives the child immediate EOF.
+  block:
+    let s = p.inputStream
+    if s != nil:
+      try:
+        if stdinData.len > 0:
+          s.write(stdinData)
         s.close()
-    except CatchableError: discard
+      except CatchableError: discard
   let outStream = p.outputStream
   var stdout = ""
   let deadline = if timeoutSec > 0: epochTime() + timeoutSec.float else: 0.0
@@ -246,13 +255,118 @@ proc deleteContainer*(b: IncusBackend, name: string): ExecResult =
   b.runIncus(@["delete", "--force", name], timeoutSec = 60)
 
 # ---------------------------------------------------------------------------
+# Network + NIC-device primitives — the S2 (network-primitive) surface. These
+# map Incus managed networks and per-container NIC attachment onto the CLI in
+# the same style the deployment rehearsal wires the topology (managed bridge
+# with ``ipv4.nat`` + ``ipv6.address=none``; extra segments attached as
+# ``eth1``/``eth2`` NIC devices). Each is a thin ``runIncus`` wrapper following
+# the existing error-raising convention; ``networkExists`` / ``listNetworks`` /
+# ``listDevices`` let the resource driver's ``observe`` check existence first so
+# apply stays idempotent-friendly.
+
+proc networkExists*(b: IncusBackend, name: string): bool =
+  ## ``incus network info <name>`` exits 0 iff the managed network is defined.
+  let r = b.runIncus(@["network", "info", name], timeoutSec = 30)
+  r.exitCode == 0
+
+proc createNetwork*(b: IncusBackend, name, cidr: string;
+                    config: Table[string, string] =
+                      initTable[string, string]()): ExecResult =
+  ## ``incus network create <name> ipv4.address=<cidr> ipv4.nat=true
+  ##   ipv6.address=none [<k>=<v> ...]`` — a managed bridge with the topology's
+  ## network config style (the deployment rehearsal uses ipv4.nat + ipv6 none).
+  ## ``cidr`` is passed verbatim as ``ipv4.address`` (Incus reads a CIDR-form
+  ## address as the gateway + subnet). Extra ``config`` keys are appended as
+  ## additional ``k=v`` settings (they override the defaults if they repeat a
+  ## key, since Incus takes the last value). Raises on non-zero exit.
+  if name.len == 0:
+    raise newException(ValueError, "createNetwork: empty name")
+  if cidr.len == 0:
+    raise newException(ValueError, "createNetwork: empty cidr")
+  var sub = @["network", "create", name,
+              "ipv4.address=" & cidr,
+              "ipv4.nat=true",
+              "ipv6.address=none"]
+  for k, v in config:
+    sub.add(k & "=" & v)
+  result = b.runIncus(sub, timeoutSec = 60)
+  if result.exitCode != 0:
+    raise newVmHarnessError($b.id, lpProvisioning,
+      "incus network create " & name & " failed (exit " &
+      $result.exitCode & "): " & result.stdout)
+
+proc deleteNetwork*(b: IncusBackend, name: string): ExecResult =
+  ## ``incus network delete <name>``. Idempotent-ish: Incus returns non-zero
+  ## for a missing network, which the caller treats as already-clean.
+  b.runIncus(@["network", "delete", name], timeoutSec = 60)
+
+proc listNetworks*(b: IncusBackend): seq[string] =
+  ## ``incus network list --format csv -c n`` — every network the daemon knows
+  ## about (managed + the physical/unmanaged ones it can see). Returns an empty
+  ## seq on error. NOTE: this lists ALL networks on the host — callers assert
+  ## only on their OWN throwaway names, never on live bridges (incusbr0/lxdbr0).
+  let r = b.runIncus(@["network", "list", "--format", "csv", "-c", "n"],
+                     timeoutSec = 30)
+  if r.exitCode != 0:
+    return @[]
+  for line in r.stdout.splitLines():
+    let s = line.strip()
+    if s.len > 0:
+      result.add(s)
+
+proc networkConfigGet*(b: IncusBackend, name, key: string): string =
+  ## ``incus network get <name> <key>`` — a single managed-network config
+  ## value (e.g. ``ipv4.address``), stripped. Empty on error / unset. Lets a
+  ## caller assert the CIDR actually took effect.
+  let r = b.runIncus(@["network", "get", name, key], timeoutSec = 30)
+  if r.exitCode != 0:
+    return ""
+  result = r.stdout.strip()
+
+proc addDeviceToContainer*(b: IncusBackend, container, nic,
+                           network: string): ExecResult =
+  ## ``incus config device add <container> <nic> nic network=<network>
+  ##   name=<nic>`` — attach a managed-network NIC to a container as device
+  ## ``<nic>`` with the in-guest interface name ``<nic>`` (matching the
+  ## rehearsal's ``eth1``/``eth2`` additional-segment wiring). Raises on
+  ## non-zero exit.
+  if container.len == 0 or nic.len == 0 or network.len == 0:
+    raise newException(ValueError,
+      "addDeviceToContainer: container/nic/network must be non-empty")
+  let r = b.runIncus(@["config", "device", "add", container, nic, "nic",
+                       "network=" & network, "name=" & nic], timeoutSec = 60)
+  if r.exitCode != 0:
+    raise newVmHarnessError($b.id, lpProvisioning,
+      "incus config device add " & container & " " & nic & " failed (exit " &
+      $r.exitCode & "): " & r.stdout)
+  result = r
+
+proc removeDevice*(b: IncusBackend, container, nic: string): ExecResult =
+  ## ``incus config device remove <container> <nic>``. Idempotent-ish:
+  ## removing a missing device returns non-zero, treated as already-clean.
+  b.runIncus(@["config", "device", "remove", container, nic], timeoutSec = 60)
+
+proc listDevices*(b: IncusBackend, container: string): seq[string] =
+  ## ``incus config device list <container>`` — the NIC/disk/... device names
+  ## explicitly attached to the container (one per line). Returns an empty seq
+  ## on error. Used to assert a declared NIC actually attached.
+  let r = b.runIncus(@["config", "device", "list", container], timeoutSec = 30)
+  if r.exitCode != 0:
+    return @[]
+  for line in r.stdout.splitLines():
+    let s = line.strip()
+    if s.len > 0:
+      result.add(s)
+
+# ---------------------------------------------------------------------------
 # provisionEphemeralClone + teardown (the per-job core).
 
 proc applyConfig(b: IncusBackend, name: string, spec: EphemeralIncusSpec) =
   ## Inject cloud-init user-data (the IM2 JIT seam) + any raw config keys.
   if spec.userData.len > 0:
     let r = b.runIncus(@["config", "set", name,
-                         "cloud-init.user-data", spec.userData], timeoutSec = 30)
+                         "cloud-init.user-data", spec.userData],
+                         timeoutSec = 30)
     if r.exitCode != 0:
       raise newVmHarnessError($b.id, lpProvisioning,
         "incus config set cloud-init.user-data failed (exit " &
@@ -487,13 +601,19 @@ method stopAndCleanup*(b: IncusBackend, vm: VmHandle, deleteVm: bool = true) =
 # are implemented for parity so consumers that snapshot a longer-lived
 # container work.
 
-method snapshot*(b: IncusBackend, vmName: string, snapshotName: string): string =
+method snapshot*(b: IncusBackend, vmName: string,
+    snapshotName: string): string =
   when defined(linux):
-    let r = b.runIncus(@["snapshot", vmName, snapshotName], timeoutSec = 60)
+    # ``incus snapshot create <name> <snap>`` is the current subcommand form
+    # (incus 6.0.x). The bare top-level ``incus snapshot <name> <snap>`` is
+    # no longer accepted and errors "unknown command", so we spell out the
+    # ``create`` subcommand explicitly.
+    let r = b.runIncus(@["snapshot", "create", vmName, snapshotName],
+                       timeoutSec = 60)
     if r.exitCode != 0:
       raise newVmHarnessError($b.id, lpProvisioning,
-        "incus snapshot " & vmName & " " & snapshotName & " failed (exit " &
-        $r.exitCode & "): " & r.stdout)
+        "incus snapshot create " & vmName & " " & snapshotName &
+        " failed (exit " & $r.exitCode & "): " & r.stdout)
     return snapshotName
   else:
     raise newException(BackendUnavailableError,
@@ -508,11 +628,14 @@ method snapshotRunning*(b: IncusBackend, vmName,
 
 method restoreSnapshot*(b: IncusBackend, vmName, snapshotName: string) =
   when defined(linux):
-    let r = b.runIncus(@["restore", vmName, snapshotName], timeoutSec = 60)
+    # ``incus snapshot restore <name> <snap>`` — the bare top-level
+    # ``incus restore`` form is no longer accepted on incus 6.0.x.
+    let r = b.runIncus(@["snapshot", "restore", vmName, snapshotName],
+                       timeoutSec = 60)
     if r.exitCode != 0:
       raise newVmHarnessError($b.id, lpRevert,
-        "incus restore " & vmName & " " & snapshotName & " failed (exit " &
-        $r.exitCode & "): " & r.stdout)
+        "incus snapshot restore " & vmName & " " & snapshotName &
+        " failed (exit " & $r.exitCode & "): " & r.stdout)
   else:
     raise newException(BackendUnavailableError,
       "IncusBackend.restoreSnapshot requires a Linux host")
@@ -538,6 +661,141 @@ method removeSnapshot*(b: IncusBackend, vmName, snapshotName: string) =
                        timeoutSec = 60)
   else:
     discard
+
+# ---------------------------------------------------------------------------
+# Layered base images — the reprobuild-specs §7.4 "install-once,
+# reuse-everywhere" machinery on the container surface. A base image is a
+# chain of snapshot edges: ``publishAsImage`` turns a snapshot (an edge's
+# cached output) into a reusable local base image, and
+# ``exportBaseline``/``importBaseline`` bridge that base image to a
+# transferable on-disk bundle (the cache-payload artifact).
+
+const IncusBaselineManifest = "incus-baseline.manifest"
+
+proc publishAsImage*(b: IncusBackend, source: string, alias: string): string =
+  ## Turn a container OR a container snapshot into a reusable LOCAL base
+  ## image (``incus publish <source> --alias <alias> --reuse``). ``source``
+  ## is either ``<container>`` or ``<container>/<snapshot>``.
+  ##
+  ## The snapshot form (``c1/edge-a``) is PREFERRED: publishing from a
+  ## snapshot works while the container keeps running and does not disturb
+  ## it — the clean path for the layered-base-image model where the running
+  ## node is snapshotted, then that snapshot is published as the next
+  ## layer's base. ``--reuse`` makes a re-publish overwrite an existing
+  ## image of the same alias (idempotent republish). ``--force`` is NOT
+  ## needed when publishing from a snapshot.
+  ##
+  ## Returns ``alias``. Raises ``newVmHarnessError`` on non-zero exit.
+  when defined(linux):
+    if source.len == 0:
+      raise newException(ValueError, "publishAsImage: empty source")
+    if alias.len == 0:
+      raise newException(ValueError, "publishAsImage: empty alias")
+    let r = b.runIncus(@["publish", source, "--alias", alias, "--reuse"],
+                       timeoutSec = 600)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "incus publish " & source & " --alias " & alias &
+        " failed (exit " & $r.exitCode & "): " & r.stdout)
+    return alias
+  else:
+    raise newException(BackendUnavailableError,
+      "IncusBackend.publishAsImage requires a Linux host")
+
+method exportBaseline*(b: IncusBackend, vmName, destDir: string;
+                       baselineName: string = "") =
+  ## Export a published base-image bundle (the cache payload) for ``vmName``
+  ## at snapshot ``baselineName`` into ``destDir``.
+  ##
+  ## Steps: verify the named snapshot exists on ``vmName``; publish
+  ## ``vmName/baselineName`` to a deterministic temp alias
+  ## (``vmh-export-<vm>-<snap>``); ``incus image export <alias>
+  ## <destDir>/<prefix>`` — on this incus (6.0.6) a CONTAINER image exports
+  ## as a SINGLE unified ``<prefix>.tar.gz`` (metadata + rootfs in one
+  ## gzip'd tarball), which ``importBaseline`` re-imports directly. The
+  ## resulting filename is recorded in the manifest so import stays robust
+  ## if a future incus splits it. The transient publish alias is deleted
+  ## after export — the on-disk bundle is the artifact.
+  ##
+  ## ``baselineName`` is REQUIRED for incus: unlike VM backends there is no
+  ## "whole snapshot tree" to export, only a specific snapshot to publish.
+  when defined(linux):
+    if baselineName.len == 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "IncusBackend.exportBaseline requires a snapshot name " &
+        "(baselineName) — incus export publishes one named snapshot")
+    if baselineName notin b.listSnapshots(vmName):
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "exportBaseline: snapshot '" & baselineName & "' not found on " &
+        "container '" & vmName & "'")
+    createDir(destDir)
+    let alias = "vmh-export-" & vmName & "-" & baselineName
+    discard b.publishAsImage(vmName & "/" & baselineName, alias)
+    # Export the published image to a deterministic file prefix.
+    let filePrefix = "incus-baseline-" & vmName & "-" & baselineName
+    let exportRes = b.runIncus(@["image", "export", alias,
+                                 destDir / filePrefix], timeoutSec = 600)
+    if exportRes.exitCode != 0:
+      # Best-effort cleanup of the transient alias before surfacing.
+      discard b.runIncus(@["image", "delete", alias], timeoutSec = 60)
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "incus image export " & alias & " failed (exit " &
+        $exportRes.exitCode & "): " & exportRes.stdout)
+    # incus 6.0.x writes a single ``<prefix>.tar.gz`` for a container image.
+    let tarball = filePrefix & ".tar.gz"
+    if not fileExists(destDir / tarball):
+      discard b.runIncus(@["image", "delete", alias], timeoutSec = 60)
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "exportBaseline: expected tarball '" & tarball & "' not produced " &
+        "in " & destDir & " (export output: " & exportRes.stdout & ")")
+    writeFile(destDir / IncusBaselineManifest,
+              "vm=" & vmName & "\n" &
+              "snapshot=" & baselineName & "\n" &
+              "alias=" & alias & "\n" &
+              "tarball=" & tarball & "\n")
+    # The bundle on disk is the artifact; the local publish alias is
+    # transient — drop it so a fresh consumer genuinely re-imports.
+    discard b.runIncus(@["image", "delete", alias], timeoutSec = 60)
+  else:
+    raise newException(BackendUnavailableError,
+      "IncusBackend.exportBaseline requires a Linux host")
+
+method importBaseline*(b: IncusBackend, srcDir: string): seq[string] =
+  ## Consume a bundle produced by ``exportBaseline``: read
+  ## ``incus-baseline.manifest``, ``incus image import
+  ## <srcDir>/<tarball> --alias <alias>`` (single unified tarball on this
+  ## incus), and return ``@[alias]`` so callers can assert the round-trip.
+  ## Raises if the manifest or tarball is missing.
+  when defined(linux):
+    let manifest = srcDir / IncusBaselineManifest
+    if not fileExists(manifest):
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "importBaseline: manifest not found at " & manifest)
+    var alias = ""
+    var tarball = ""
+    for line in readFile(manifest).splitLines():
+      if line.startsWith("alias="):
+        alias = line["alias=".len .. ^1]
+      elif line.startsWith("tarball="):
+        tarball = line["tarball=".len .. ^1]
+    if alias.len == 0 or tarball.len == 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "importBaseline: malformed manifest (missing alias= or tarball=) " &
+        "at " & manifest)
+    let tarPath = srcDir / tarball
+    if not fileExists(tarPath):
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "importBaseline: bundle tarball not found at " & tarPath)
+    let r = b.runIncus(@["image", "import", tarPath, "--alias", alias],
+                       timeoutSec = 600)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "incus image import " & tarPath & " --alias " & alias &
+        " failed (exit " & $r.exitCode & "): " & r.stdout)
+    return @[alias]
+  else:
+    raise newException(BackendUnavailableError,
+      "IncusBackend.importBaseline requires a Linux host")
 
 # ---------------------------------------------------------------------------
 # Backend registration. Importing this module is enough to make

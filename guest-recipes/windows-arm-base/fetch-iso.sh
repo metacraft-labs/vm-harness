@@ -17,6 +17,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 ISO_PATH="${BUILD_DIR}/win11-arm64.iso"
 OFFICIAL_URL="https://www.microsoft.com/en-us/software-download/windows11arm64"
+# shellcheck source=../lib/validate-uefi-iso.sh
+. "${SCRIPT_DIR}/../lib/validate-uefi-iso.sh"
 
 if [[ -n "${VMH_WIN11_ARM_ISO:-}" ]]; then
   echo "fetch-iso: VMH_WIN11_ARM_ISO=${VMH_WIN11_ARM_ISO} — skipping download."
@@ -24,6 +26,10 @@ if [[ -n "${VMH_WIN11_ARM_ISO:-}" ]]; then
     echo "fetch-iso: error — ${VMH_WIN11_ARM_ISO} does not exist." >&2
     exit 1
   fi
+  # The UTM/qemu virt Win11-on-ARM domain is UEFI-only (AAVMF); a
+  # BIOS-only ISO boots to nothing. Fail fast with a clear cause.
+  validate_uefi_iso "${VMH_WIN11_ARM_ISO}" \
+    "the Windows 11 Arm64 ISO (${VMH_WIN11_ARM_ISO})"
   mkdir -p "${BUILD_DIR}"
   ln -sf "${VMH_WIN11_ARM_ISO}" "${ISO_PATH}"
   echo "fetch-iso: using existing ISO at ${VMH_WIN11_ARM_ISO}"
@@ -34,6 +40,8 @@ fi
 if [[ -f "${ISO_PATH}" ]]; then
   echo "fetch-iso: ISO already present at ${ISO_PATH} — skipping download."
   echo "fetch-iso: delete it and re-run to refresh."
+  # Validate the resident ISO too — it may have been dropped in by hand.
+  validate_uefi_iso "${ISO_PATH}" "the Windows 11 Arm64 ISO (${ISO_PATH})"
   exit 0
 fi
 
