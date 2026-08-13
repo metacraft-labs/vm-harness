@@ -16,7 +16,12 @@
 #   * an unprivileged `runner` user with passwordless sudo (the runner
 #     refuses to run as root),
 #   * the runner's .NET runtime deps (libicu/libssl/libkrb5/zlib) — the
-#     `debian/12/cloud` base already ships them, so no apt is needed.
+#     `debian/12/cloud` base already ships them, so no apt is needed,
+#   * `fuse3`, which ships the SETUID `/usr/bin/fusermount3` an unprivileged
+#     process needs before libfuse can mount anything (see step 3b), PLUS a
+#     boot-time `/run/wrappers/bin/fusermount3` symlink to it (step 3c) so
+#     libfuse's absolute-path probe resolves and a Nix dev shell's own
+#     non-setuid `fusermount3` cannot shadow it on PATH.
 #
 # Base image: a Debian *cloud* variant (has cloud-init). The default base
 # alias is `im2-debian-cloud` (pulled during IM0/IM2 prep); if it is absent
@@ -58,7 +63,7 @@
 #   VMH_RUNNER_DOCKER   bake nested Docker (HR1)  (default: off; set =1)
 #   VMH_RUNNER_KVM      bake nested KVM (HR2)     (default: off; set =1)
 #   VMH_RUNNER_RECIPE_REVISION
-#                       image recipe revision property (default: linux-x64-runner-v1)
+#                       image recipe revision property (default: linux-x64-runner-v2)
 #   VMH_RUNNER_REPRO    bake the `repro` CLI      (default: ON; set =0 to skip)
 #   VMH_REPRO_PIN       reprobuild rev to build   (default: resolved from
 #                       repro-portable from       nixos-modules/flake.lock —
@@ -131,7 +136,7 @@ DOCKER_VERSION="${VMH_DOCKER_VERSION:-27.5.1}"
 # the same egress + apt seam as HR1, so VMH_RUNNER_DOCKER=1 VMH_RUNNER_KVM=1
 # bakes BOTH into one image (the `incus-nested` prod class needs both).
 KVM="${VMH_RUNNER_KVM:-}"
-RECIPE_REVISION="${VMH_RUNNER_RECIPE_REVISION:-linux-x64-runner-v1}"
+RECIPE_REVISION="${VMH_RUNNER_RECIPE_REVISION:-linux-x64-runner-v2}"
 # HR-REPRO (repro CLI bake): ON by default so the live `vmh-linux-runner` image
 # ships `repro` on PATH. Set VMH_RUNNER_REPRO=0 to skip (e.g. to reproduce the
 # pre-repro image byte-for-byte). The pin is resolved from nixos-modules'
@@ -334,18 +339,101 @@ log "checking runner runtime dependencies in the base image"
 #         reason the CIP-5 incus jobs went red);
 #       * `xz` is needed to unpack the Nix installer's `.xz` payload for the
 #         `nix` flavor;
-#       * `ca-certificates` keeps the authenticated github HTTPS clones valid.
+#       * `ca-certificates` keeps the authenticated github HTTPS clones valid;
+#       * `fuse3` ships the SETUID `/usr/bin/fusermount3`, without which NO
+#         FUSE filesystem can be mounted by an unprivileged process in the
+#         guest. `tup` — codetracer's frontend build tool — tracks
+#         dependencies by mounting FUSE on `.tup/mnt`, and libfuse3 does not
+#         mount it itself: it spawns `fusermount3` (first at the absolute path
+#         baked into the library, then by BARE NAME through PATH) and receives
+#         the `/dev/fuse` descriptor back over a socket. Both resolutions
+#         ultimately need Debian's setuid helper to EXIST — this step installs
+#         it; step 3c then makes the absolute path resolve to it too, which is
+#         what keeps a Nix dev shell from shadowing it. Without the package,
+#         every tup build dies with
+#             posix_spawn(p)() for fusermount3 failed: No such file or directory
+#             tup error: Unable to mount FUSE on .tup/mnt
+#         which reads as "tup is broken" rather than "the image is missing a
+#         package". A Nix dev shell CANNOT substitute for this: it can put a
+#         `fusermount3` on PATH, but nothing in a Nix store is setuid.
+#
+#         `/dev/fuse` itself needs NO container-side configuration: Incus/LXC
+#         bind-mounts it into every container from the host's static device
+#         set, unprivileged and idmapped included, so the device is already
+#         there (verified `crw-rw-rw- 1 nobody nogroup 10, 229 /dev/fuse` on a
+#         live `eph-linux-x64` job container). FUSE mounts from inside a user
+#         namespace have been permitted since Linux 4.18, so no
+#         `security.privileged` / `security.nesting` / extra `unix-char`
+#         device is required — only this package.
 #     apt needs egress, which incusbr0 does not lease; bring up the shared
 #     static build IP for the install (idempotent — the HR1/HR2 bakes reuse it).
-log "installing CI baseline tools (git, xz-utils, ca-certificates)"
+log "installing CI baseline tools (git, xz-utils, ca-certificates, fuse3)"
 ensure_build_egress
 "${INCUS[@]}" exec "$BLD" -- sh -c "
   set -e
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq --no-install-recommends git xz-utils ca-certificates
+  apt-get install -y -qq --no-install-recommends git xz-utils ca-certificates fuse3
   command -v git
   command -v xz
+  # Assert the helper is present AND setuid — an installed-but-not-setuid
+  # fusermount3 fails later, at build time, with the far less obvious
+  # 'fusermount3: mount failed: Operation not permitted'.
+  command -v fusermount3
+  test -u \"\$(command -v fusermount3)\" || {
+    echo '[build-runner-image] fusermount3 is not setuid — unprivileged FUSE mounts will fail' >&2
+    exit 1
+  }
+"
+
+# 3c. Publish the setuid helper at the ABSOLUTE path libfuse tries FIRST.
+#
+#     Installing fuse3 (3b) is necessary but NOT sufficient, and the gap is
+#     easy to miss because it only opens once a job enters a Nix dev shell.
+#     libfuse resolves its mount helper in two steps:
+#
+#       1. posix_spawn("/run/wrappers/bin/fusermount3", …) — an ABSOLUTE path
+#          nixpkgs patches in, no PATH search;
+#       2. posix_spawnp("fusermount3", …) — a BARE name, so PATH *is* searched.
+#
+#     On a Debian guest step 1 misses (/run/wrappers does not exist), so
+#     everything rides on step 2 — and step 2 finds whatever is FIRST on PATH.
+#     CI jobs build inside a Nix dev shell that deliberately lists `fuse3`
+#     (codetracer's nix/shells/ci-base.nix explains why: it is what satisfies
+#     step 2 on hosts that have no wrapper). That store copy is EARLIER on PATH
+#     than /usr/bin and is NOT setuid — nothing in a Nix store can be — so the
+#     mount is attempted by an unprivileged helper and dies with
+#         fusermount3: mount failed: Operation not permitted
+#         tup error: Unable to mount FUSE on .tup/mnt
+#     i.e. the same build failure, one step further along, on an image that
+#     looks correctly provisioned. Verified by reproducing exactly this in a
+#     container that HAD fuse3 installed.
+#
+#     Making step 1 resolve removes the dependency on PATH ordering entirely.
+#     A SYMLINK is enough: the kernel applies the setuid bit of the RESOLVED
+#     inode, so /run/wrappers/bin/fusermount3 -> /usr/bin/fusermount3 executes
+#     with the same privilege as the target. /run is a tmpfs, so the link
+#     cannot be baked into the image directly — it is recreated on every boot
+#     by systemd-tmpfiles, which is exactly what tmpfiles.d is for.
+log "publishing /run/wrappers/bin/fusermount3 (absolute path libfuse tries first)"
+"${INCUS[@]}" exec "$BLD" -- sh -c "
+  set -e
+  cat > /etc/tmpfiles.d/fuse-mount-helper.conf <<'TMPFILES'
+# Give libfuse the absolute mount-helper path it probes BEFORE searching PATH
+# (nixpkgs patches /run/wrappers/bin/fusermount3 into libfuse and into tup).
+# Without this, a Nix dev shell's non-setuid fusermount3 shadows Debian's
+# setuid /usr/bin/fusermount3 and every FUSE mount fails with
+# 'mount failed: Operation not permitted'. A symlink suffices: setuid is a
+# property of the resolved inode.
+d /run/wrappers 0755 root root -
+d /run/wrappers/bin 0755 root root -
+L+ /run/wrappers/bin/fusermount3 - - - - /usr/bin/fusermount3
+TMPFILES
+  # Apply now too, so the BUILD container matches what guests will boot into
+  # and the assertion below tests the real thing rather than the config text.
+  systemd-tmpfiles --create /etc/tmpfiles.d/fuse-mount-helper.conf
+  test -x /run/wrappers/bin/fusermount3
+  test -u /run/wrappers/bin/fusermount3
 "
 
 # 4. Create the unprivileged runner user with passwordless sudo.
