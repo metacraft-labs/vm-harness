@@ -657,6 +657,7 @@ $pipe    = '\\.\pipe\{psQuote(pipeName)}'
 $mediaPath = '{psQuote(mediaPath)}'
 $seedIso = '{psQuote(seedIsoPath)}'
 $scratchVhdx = '{psQuote(scratchVhdxPath)}'
+$scratchIso = Join-Path (Split-Path -Parent $scratchVhdx) "$vmName.boot.iso"
 $gen     = {generation}
 $memMB   = {memMB}
 $cpus    = {cpus}
@@ -680,6 +681,10 @@ if ($kind -eq 'iso') {{
   }}
   $dir = Split-Path -Parent $scratchVhdx
   if (-not (Test-Path $dir)) {{ New-Item -ItemType Directory -Force -Path $dir | Out-Null }}
+  # Hyper-V's service account cannot attach media through WSL UNC shares.
+  # Localize every ISO into the transient VM directory while this process
+  # still has access to the caller's source path.
+  Copy-Item -LiteralPath $mediaPath -Destination $scratchIso -Force
   New-VHD -Path $scratchVhdx -SizeBytes 8GB -Dynamic | Out-Null
 }} elseif ($kind -eq 'qcow2') {{
   if (-not (Test-Path -LiteralPath $mediaPath)) {{
@@ -727,7 +732,7 @@ Set-VMComPort -VMName $vmName -Number 1 -Path $pipe
 
 # Path B (ISO) attaches the ISO as DVD #1 + first boot device.
 if ($kind -eq 'iso') {{
-  Add-VMDvdDrive -VMName $vmName -Path $mediaPath
+  Add-VMDvdDrive -VMName $vmName -Path $scratchIso
   if ($gen -eq 2) {{
     $dvd = Get-VMDvdDrive -VMName $vmName | Select-Object -First 1
     if ($dvd) {{ Set-VMFirmware -VMName $vmName -FirstBootDevice $dvd }}

@@ -247,6 +247,23 @@ suite "newHyperVBackend":
       check not b.probeAvailability()
 
 suite "Hyper-V boot media command":
+  test "ISO media is localized before Hyper-V attaches it":
+    let b = newHyperVBackend()
+    let spec = BootMediaSpec(
+      kind: bmkIso,
+      mediaPath: "\\\\wsl.localhost\\repro-ubuntu\\root\\reproos.iso",
+      cpus: 2,
+      memoryMB: 4096)
+    let script = b.buildNewBootVmCommand(
+      spec,
+      "repro-test-boot-unit",
+      "repro-test-boot-unit-com1",
+      "D:\\scratch\\reproos.vhdx")
+    check "$scratchIso = Join-Path" in script
+    check "Copy-Item -LiteralPath $mediaPath -Destination $scratchIso -Force" in script
+    check "Add-VMDvdDrive -VMName $vmName -Path $scratchIso" in script
+    check "Add-VMDvdDrive -VMName $vmName -Path $mediaPath" notin script
+
   test "QCOW2 media is converted to a transient VHDX":
     let b = newHyperVBackend()
     let spec = BootMediaSpec(
