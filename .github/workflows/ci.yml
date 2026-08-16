@@ -13,6 +13,17 @@ permissions:
 # hosts. Their named host-level contract substitutes are maintained in infra:
 # checks/t_windows_sysprep_golden.sh and checks/t_m3_arm_ephemeral.sh.
 
+# Collapse superseded pull-request runs only.
+#
+# `github.head_ref` is set on `pull_request` and empty everywhere else, so PR
+# runs group per source branch and a new push cancels the run it superseded.
+# Pushes to the mainline branches fall through to `github.run_id`, which is
+# unique per run: each keeps a group of its own and is never cancelled, so the
+# per-commit build history stays complete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     name: Lint (${{ matrix.runner }})
