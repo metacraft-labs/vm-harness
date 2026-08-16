@@ -262,4 +262,7 @@ suite "Hyper-V boot media command":
     check "$kind    = 'qcow2'" in script
     check "Get-Command qemu-img" in script
     check "convert -f qcow2 -O vhdx -o subformat=dynamic" in script
+    check "Get-Command fsutil" in script
+    check "sparse setflag $scratchVhdx 0" in script
+    check "[System.IO.FileAttributes]::SparseFile" in script
     check "D:\\scratch\\reproos.vhdx" in script

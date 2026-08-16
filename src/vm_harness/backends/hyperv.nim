@@ -695,6 +695,18 @@ if ($kind -eq 'iso') {{
   if ($LASTEXITCODE -ne 0) {{
     throw "qemu-img failed to convert QCOW2 to VHDX (exit $LASTEXITCODE)"
   }}
+  # qemu-img marks its Windows output as an NTFS sparse file. Hyper-V
+  # rejects sparse VHDX attachments even when the VHDX itself uses the
+  # dynamic subformat, so clear and verify the host filesystem flag.
+  $fsutil = Get-Command fsutil -ErrorAction Stop
+  & $fsutil.Source sparse setflag $scratchVhdx 0 | Out-Null
+  if ($LASTEXITCODE -ne 0) {{
+    throw "fsutil failed to clear the sparse flag on converted VHDX (exit $LASTEXITCODE)"
+  }}
+  $attributes = (Get-Item -LiteralPath $scratchVhdx).Attributes
+  if (($attributes -band [System.IO.FileAttributes]::SparseFile) -ne 0) {{
+    throw "converted VHDX remains sparse after fsutil: $scratchVhdx"
+  }}
 }} else {{
   if (-not (Test-Path -LiteralPath $bootVhdx)) {{
     throw "bmkVhdx requires mediaPath (used as boot disk) to exist: $bootVhdx"
