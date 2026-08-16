@@ -33,6 +33,19 @@ golden is NEVER mutated in place; it is the live backing file of the running
    `bin\Runner.Listener.exe` present) so no per-job download is needed.
 3. The runner's transient state (`.runner`/`.credentials`/`.service`/`_diag`)
    is REMOVED so the golden ships a clean runner dir.
+4. **Git for Windows** (PortableGit, pinned + checksummed) at
+   `C:\PortableGit`, with `C:\PortableGit\bin` on the **machine** PATH —
+   inherited from the base golden, which installs it via
+   `../lib/provision-git.ps1` in its FirstLogonCommands.
+
+> **Goldens built before that base-recipe change have NO Git**, so their
+> clones have no `bash.exe`: every `shell: bash` step fails with
+> `bash: command not found` and `actions/checkout` falls back to the REST
+> API. See [README.md §"Retrofitting Git onto an already-built
+> golden"](README.md#retrofitting-git-onto-an-already-built-golden) for
+> how to layer it onto an existing golden without a full rebuild, and
+> [README.md §"Git for Windows"](README.md#git-for-windows-and-why-the-machine-path-matters)
+> for why the *machine* PATH is the part that matters to a runner service.
 
 ## Build steps (what produced the current golden)
 

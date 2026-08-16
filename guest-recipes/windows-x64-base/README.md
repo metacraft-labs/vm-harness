@@ -29,11 +29,66 @@ A `qemu:///system` libvirt domain configured for:
 - Windows OpenSSH server (`Server` capability) enabled and set to
   start automatically on boot.
 - Firewall rule allowing inbound TCP/22.
+- **Git for Windows** (PortableGit, pinned + checksummed) at
+  `C:\PortableGit`, with `C:\PortableGit\bin` on the **machine** PATH.
+  This is what supplies `bash.exe`; see
+  [§Git for Windows](#git-for-windows-and-why-the-machine-path-matters).
 - WinRM disabled (we use SSH, not PSRemoting, to mirror the cross-
   backend transport contract).
 - virtio-win guest tools installed (qemu-guest-agent + paravirt
   driver MSI bundle) so `virsh domifaddr` returns the guest IP
   without leaning on the DHCP lease table.
+
+## Git for Windows, and why the machine PATH matters
+
+Clones of this golden run GitHub Actions jobs. Git for Windows is what
+supplies `bash.exe` on Windows, so without it:
+
+- every step with `shell: bash` fails with
+  `##[error]bash: command not found` — including the **first** step of
+  `metacraft-labs/metacraft-github-actions/setup-dev-env`, so jobs die
+  before any repo-specific work runs; and
+- `actions/checkout` logs *"The repository will be downloaded using the
+  GitHub REST API / To create a local Git repository instead, add Git
+  2.18 or higher to the PATH"* and leaves no `.git` behind.
+
+Earlier revisions of this recipe installed no Git at any stage, which is
+exactly the defect above.
+
+**The PATH scope is the load-bearing part.** The Actions runner runs as a
+Windows *service*. `services.exe` builds **one** environment block when
+it starts at boot, reading
+`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`, and
+hands a copy of that block to every service it launches. Therefore:
+
+- an installer that edits only the interactive user's PATH
+  (`HKCU\Environment`) is invisible to the service, permanently;
+- a `setx PATH` in a logon script is likewise invisible;
+- even a correct `HKLM` edit does not reach services already running, or
+  services started later in the same boot from the SCM's cached block.
+
+That is why the install belongs **in the golden, before capture** rather
+than in the per-instance bootstrap: the image ships with the machine PATH
+already extended, so on every clone's boot `services.exe` reads it from
+the registry and cloudbase-init (a service) plus the actions-runner it
+launches both inherit it — no ordering race, no reboot at job time.
+
+Only `C:\PortableGit\bin` goes on the machine PATH. Its three files
+(`bash.exe`, `sh.exe`, `git.exe`) are Git for Windows' ~47 KB
+`git-wrapper` shim, which prepends `..\usr\bin` and `..\mingw64\bin` to
+PATH *inside the spawned process* before exec'ing the real
+`usr\bin\bash.exe`. So `shell: bash` steps also get `sha256sum`, `awk`,
+`unzip` and `tar`, **without** shadowing the Windows `find.exe` and
+`sort.exe` machine-wide (which is what putting `usr\bin` itself on the
+machine PATH — the Inno installer's `/o:PathOption=CmdTools` — would do).
+
+MinGit was evaluated and rejected: it ships `sh.exe`/`dash.exe` but **no
+`bash.exe`**, and no `sha256sum`/`unzip`/`tar`/`curl`.
+
+The version and both SHA-256 checksums are pinned in
+[`../lib/provision-git.ps1`](../lib/provision-git.ps1), which is the
+single source of truth; `../lib/fetch-portable-git.sh` parses the pin out
+of it rather than repeating it.
 
 ## When to (re-)run this recipe
 
@@ -106,7 +161,15 @@ sudo usermod -aG libvirt "$USER"
 ./fetch-iso.sh
 # Downloads: ./build/virtio-win.iso
 # Verifies:  ${VMH_WIN11_X64_ISO:-/storage/iso/Win11_24H2_EnglishInternational_x64.iso}
+
+../lib/fetch-portable-git.sh --arch x64 --output ./build
+# Downloads + SHA-256-verifies: ./build/PortableGit-<pinned>-64-bit.7z.exe
 ```
+
+Fetching PortableGit host-side is optional but recommended: it keeps the
+golden build working on a NAT'd or offline builder and puts the download
+on the reproducible side of the fence. If you skip it, the guest
+downloads the same pinned asset itself and verifies the same checksum.
 
 The Win11 ISO is operator-supplied (Microsoft does not provide a
 stable no-login direct URL); the virtio-win driver disk is fetched
@@ -115,12 +178,19 @@ from <https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-vi
 ### 3. Assemble the autounattend ISO
 
 ```bash
-./build-autounattend-iso.sh --first-boot-script ./bootstrap-windows-runner-001.ps1
+./build-autounattend-iso.sh --first-boot-script ./bootstrap-windows-runner-001.ps1 \
+    --require-portable-git
 # Writes: ./build/autounattend.iso
 ```
 
+`--require-portable-git` makes the build fail loudly if step 2's
+PortableGit fetch was skipped, rather than silently producing an ISO
+whose guest has to reach github.com at first logon. Drop the flag if you
+intend the guest to download it.
+
 This wraps `autounattend.xml` (the SysPrep answer file in this
-directory) and the supplied first-boot.ps1 as an ISO9660+Joliet ISO
+directory), `../lib/provision-git.ps1`, the pinned PortableGit archive
+(under `git/`) and the supplied first-boot.ps1 as an ISO9660+Joliet ISO
 that libvirt attaches as a CD. Windows Setup looks for
 `autounattend.xml` on every attached removable medium at first
 boot and applies it automatically.
@@ -132,8 +202,11 @@ with three significant differences:
 2. A `<DriverPaths>` block in the WindowsPE pass that pulls
    virtio-blk + virtio-net drivers from the virtio-win driver disk
    so Setup can see the qcow2-backed system disk on the q35 board.
-3. A new FirstLogonCommand (#5/#6) that stages and runs the
+3. A new FirstLogonCommand (#11/#12) that stages and runs the
    operator-supplied first-boot.ps1.
+
+Both recipes share FirstLogonCommands that stage and run
+`provision-git.ps1` (x64 steps #9/#10).
 
 ### 4. Run virt-install (or `vm-harness provision`)
 
@@ -170,6 +243,51 @@ The recipe is complete when:
   succeeds and `Test-Path C:\Windows\Temp\repro-install-done`
   returns `True`.
 
+### Verify before finalizing — enforced, not just documented
+
+`provision-git.ps1` deliberately exits 0 even when it fails, so that a Git
+problem cannot wedge the rest of the FirstLogonCommands chain (including
+the shutdown that signals install-complete to `virt-install`).
+
+On its own that would be dangerous: the golden could be captured with no
+Git and nothing would notice until every Windows CI job failed at
+`bash: command not found` again. So the check is **enforced by
+[`../lib/assert-git-provisioned.ps1`](../lib/assert-git-provisioned.ps1)**,
+which `build-sysprep-golden.sh` runs as a **hard gate before SysPrep** — a
+Git-less image aborts the golden build instead of shipping.
+
+The gate asserts, and exits non-zero on any of:
+
+- `C:\Windows\Temp\vmh-git-provision-failed` exists (dumps the log tail);
+- the **raw** machine `PATH` registry value does not contain
+  `C:\PortableGit\bin` — the value that survives capture and that
+  `services.exe` hands to the runner service on every clone;
+- that value is no longer `REG_EXPAND_SZ` (which would stop
+  `%SystemRoot%`-style tokens expanding for every process);
+- any of `bash git sha256sum awk unzip tar curl` fails to resolve through
+  `C:\PortableGit\bin\bash.exe` — checked **individually**, so a missing
+  coreutil cannot hide behind a successful `bash`.
+
+To run it by hand against a booted guest (it is also staged at the
+autounattend ISO root):
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+    -File C:\Windows\Temp\assert-git-provisioned.ps1
+# exit 0 = fit to capture; exit 1 = do not capture
+```
+
+`VMH_SKIP_GIT_GATE=1` bypasses the gate in `build-sysprep-golden.sh`. It
+logs three `WARNING` lines and exists only for bisecting an unrelated
+SysPrep failure — never for producing a golden that will be shipped.
+
+Note that a **freshly logged-on interactive SSH session may not show the
+new PATH** even when the registry is correct, because the sshd service
+itself inherited the pre-install environment block. That is expected and
+is not a failure — the registry value is the thing that matters, since
+every clone boots a new `services.exe`. To see it end-to-end on the build
+VM itself, reboot the guest and re-check `$env:Path`.
+
 ### 5. Finalize
 
 Once the install is verified:
@@ -196,6 +314,35 @@ The M4 verification test (`tests/integration/t_libvirt_backend.nim`)
 runs without booting any VM and asserts on the argv shape +
 stub-method clarity. The live-libvirt lifecycle test will land
 with M4 Phase B (snapshots).
+
+## Retrofitting Git onto an already-built golden
+
+The goldens in the field (`golden-win11-post-install.qcow2` →
+`golden-win11-cloudbase.qcow2` → `golden-win11-cloudbase-sysprepped.qcow2`)
+predate this recipe change and have no Git. Rebuilding the base golden from
+scratch is 25–50 min plus re-layering cloudbase-init and the sysprep; the
+cheaper path is to apply `provision-git.ps1` as one more layer, using the
+same boot-a-copy / modify / capture-cold procedure that
+[`cloudbase-init-golden.md`](cloudbase-init-golden.md) documents:
+
+1. `qemu-img convert -O qcow2 <golden> /storage/scratch/git-work.qcow2`
+   (a full standalone copy — never mutate the live golden).
+2. Boot a throwaway UEFI/OVMF domain off the copy (see
+   `build-sysprep-golden.sh` for the exact domain XML) and SSH in.
+3. `scp ../lib/provision-git.ps1 admin@<ip>:C:/provision-git.ps1`, then
+   run it elevated:
+   `powershell -NoProfile -ExecutionPolicy Bypass -File C:\provision-git.ps1 -Arch x64`
+   (with no staged archive it downloads the pinned asset and verifies the
+   pinned checksum).
+4. Run the **Verify before finalizing** checks above.
+5. `Stop-Computer -Force`, then capture cold:
+   `qemu-img convert -O qcow2 /storage/scratch/git-work.qcow2 <new-golden>`.
+6. Re-point the GARM image at the new golden and drain/recreate the pool
+   so running instances are replaced.
+
+If the target is the **sysprepped** golden, do this on the *pre*-sysprep
+golden and re-run `build-sysprep-golden.sh`: booting a generalized image
+consumes the generalize.
 
 ## Total wall-clock
 
@@ -230,10 +377,17 @@ domain as long-lived and skips per-gate revert.
   shell). A BIOS-only ISO is rejected up front: it boots to nothing on
   the UEFI q35 domain (OVMF drops to the UEFI shell and virt-install
   stalls ~90 min). Supply a stock Microsoft ISO, which is UEFI-bootable.
-- `build-autounattend-iso.sh` — wraps autounattend.xml + an optional
-  first-boot.ps1 as a CD-ROM ISO9660+Joliet image.
+- `build-autounattend-iso.sh` — wraps autounattend.xml,
+  `../lib/provision-git.ps1`, the pinned PortableGit archive and an
+  optional first-boot.ps1 as a CD-ROM ISO9660+Joliet image.
 - `finalize-golden.sh` — verifies the domain is in the expected
   state, detaches install ISOs, marks autostart.
+- `../lib/provision-git.ps1` — shared with `windows-arm-base`. Installs
+  Git for Windows (PortableGit) and extends the **machine** PATH. Owns
+  the version + SHA-256 pin for both recipes. Also runnable standalone
+  over SSH against an already-built golden.
+- `../lib/fetch-portable-git.sh` — host-side cache + checksum verify for
+  the pinned PortableGit archive (`--arch x64|arm64`).
 
 All scripts are POSIX `bash` and self-contained; they accept
 `--help` for usage.

@@ -104,6 +104,7 @@ URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
 DISM_TIMEOUT="${VMH_DISM_TIMEOUT:-2700}"
 SYSPREP_TIMEOUT="${VMH_SYSPREP_TIMEOUT:-1800}"
 REARM_UNATTEND="${VMH_REARM_UNATTEND:-$SCRIPT_DIR/rearm-unattend.xml}"
+GIT_GATE_PS1="${VMH_GIT_GATE_PS1:-$SCRIPT_DIR/../lib/assert-git-provisioned.ps1}"
 DRY_RUN="${VMH_SYSPREP_DRY_RUN:-}"
 
 # shellcheck disable=SC2206
@@ -153,6 +154,9 @@ if [[ -n "$DRY_RUN" ]]; then
   log "DRY RUN — plan only, no VM booted, no golden written."
   log "  1) qemu-img convert -O qcow2 $SRC_GOLDEN $WORK   (full standalone copy)"
   log "  2) boot $WORK_DOMAIN (UEFI/OVMF, virtio, virbr0)"
+  log "  2b) GATE: assert-git-provisioned.ps1 in the guest — abort unless Git for"
+  log "      Windows is on the MACHINE PATH and the MSYS toolchain resolves"
+  log "      through bin\\bash.exe (VMH_SKIP_GIT_GATE=1 to override, loudly)"
   log "  3) guest: DISM /Online /Cleanup-Image /StartComponentCleanup /ResetBase; reboot"
   log "     guest: clear ReserveManager scenario + Set-ReservedStorageState Disabled"
   log "     guest: sysprep /generalize /oobe /shutdown /quiet /unattend:<rearm>"
@@ -237,6 +241,48 @@ for _ in $(seq 1 60); do
 done
 [[ "$SSH_OK" == 1 ]] || fail "work guest SSH never came up"
 log "work guest SSH reachable; base hostname: $(ssh_guest "$IP" 'hostname' 2>/dev/null | tr -d '\r')"
+
+# ── gate: refuse to build a golden whose clones have no usable Git ───────────
+#
+# guest-recipes/lib/provision-git.ps1 runs from FirstLogonCommands and exits 0
+# even when it fails, because a non-zero exit there can wedge the rest of the
+# chain (the install-done sentinel and the shutdown that signals
+# install-complete to virt-install). That is a reasonable trade-off ONLY
+# because of this gate.
+#
+# Without it, a Git-less image sails straight through: nothing in the
+# autounattend, in finalize-golden.sh, or here would notice, and the first
+# symptom would be every Windows CI job dying at `bash: command not found` --
+# the exact defect the Git provisioning was added to fix. A README section
+# telling the operator to check a marker file is documentation, not
+# enforcement, so the check lives here, in the script that actually mints the
+# golden the fleet is cloned from.
+#
+# Placed BEFORE the ~45-minute DISM /ResetBase so a bad image fails in seconds
+# rather than after the long leg. Nothing in steps 3a/3b touches C:\PortableGit
+# or the machine PATH -- /ResetBase drops superseded component-store payloads,
+# which Git is not -- so asserting here is equivalent to asserting immediately
+# before sysprep.
+#
+# Set VMH_SKIP_GIT_GATE=1 only to build a deliberately Git-less image (e.g.
+# bisecting an unrelated sysprep failure). It is loud on purpose.
+if [[ -n "${VMH_SKIP_GIT_GATE:-}" ]]; then
+  log "WARNING: VMH_SKIP_GIT_GATE set — NOT verifying Git for Windows."
+  log "WARNING: clones of the resulting golden may have no bash.exe and will"
+  log "WARNING: fail every GitHub Actions 'shell: bash' step. Do not ship this."
+else
+  [[ -f "$GIT_GATE_PS1" ]] || fail "Git gate script not found: $GIT_GATE_PS1"
+  log "gate: verifying Git for Windows is on the guest's MACHINE PATH and its toolchain resolves"
+  sshpass -p "$GUEST_PASSWORD" scp -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+    -o PreferredAuthentications=password "$GIT_GATE_PS1" \
+    "admin@$IP:C:/Windows/Temp/assert-git-provisioned.ps1" \
+    || fail "could not scp the Git gate script into the guest"
+  if ! ssh_guest "$IP" 'powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Temp\assert-git-provisioned.ps1' 2>&1 | sed 's/^/  [git-gate] /'; then
+    fail "Git for Windows gate FAILED — refusing to build a golden whose clones cannot run 'shell: bash' steps (see [git-gate] output above; re-run guest-recipes/lib/provision-git.ps1 in the guest, then retry)"
+  fi
+  log "gate passed: Git for Windows is usable by services on clones of this golden"
+fi
 
 # ── step 3a: component-store repair — DISM /ResetBase (THE UNBLOCK) ──────────
 log "step 3a/5: DISM /Online /Cleanup-Image /StartComponentCleanup /ResetBase (component-store repair — the unblock)"

@@ -24,6 +24,20 @@ containing:
   so direct `qemu-system-aarch64` cached boots can use
   `virtio-net-device` with user-mode hostfwd SSH.
 - Firewall rule allowing inbound TCP/22.
+- **Git for Windows** (PortableGit arm64, pinned + checksummed) at
+  `C:\PortableGit`, with `C:\PortableGit\bin` on the **machine** PATH.
+  Git for Windows is what supplies `bash.exe`; without it every GitHub
+  Actions `shell: bash` step fails with `bash: command not found` and
+  `actions/checkout` falls back to the REST-API tarball. The *machine*
+  scope is load-bearing because the Actions runner runs as a service and
+  `services.exe` builds its environment block at boot from
+  `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment` —
+  a user-PATH edit would never reach it. Full rationale, including why
+  only `C:\PortableGit\bin` (not `usr\bin`) is added and why MinGit is
+  unusable, is in
+  [`../windows-x64-base/README.md`](../windows-x64-base/README.md#git-for-windows-and-why-the-machine-path-matters);
+  the pin lives in [`../lib/provision-git.ps1`](../lib/provision-git.ps1)
+  and is shared with the x64 recipe.
 - WinRM disabled (we use SSH, not PSRemoting, to mirror the cross-
   backend transport contract).
 - UTM guest tools (`spice-guest-tools` for ARM) installed so
@@ -120,10 +134,25 @@ by git. To use a pre-extracted copy instead, pass
 `--virtio-netkvm-arm64-dir PATH` to `build-autounattend-iso.sh` or set
 `VMH_VIRTIO_NETKVM_ARM64_DIR`.
 
+Cache the pinned Git for Windows (PortableGit) arm64 archive as well:
+
+```bash
+../lib/fetch-portable-git.sh --arch arm64 --output ./build
+# Writes + SHA-256-verifies: ./build/PortableGit-<pinned>-arm64.7z.exe
+```
+
+The version and checksums are parsed out of `../lib/provision-git.ps1`,
+which is the single source of truth shared with `windows-x64-base`.
+Fetching host-side is optional — with nothing staged the guest downloads
+the same pinned asset and verifies the same checksum — but staging keeps
+the build working offline. To use a copy from elsewhere, pass
+`--portable-git PATH` or set `VMH_PORTABLE_GIT_ARCHIVE`.
+
 ### 4. Assemble the autounattend ISO
 
 ```bash
-./build-autounattend-iso.sh --require-openssh-arm64-zip --require-virtio-netkvm-arm64
+./build-autounattend-iso.sh --require-openssh-arm64-zip \
+    --require-virtio-netkvm-arm64 --require-portable-git
 # Writes: ./build/autounattend.iso
 ```
 
@@ -182,6 +211,46 @@ is written and `repro-install-done` is intentionally not created. If no
 NetKVM directory was staged, provisioning logs a skip message and
 continues; use `--require-virtio-netkvm-arm64` when building QEMU-ready
 goldens.
+
+### Verify before SysPrep
+
+`repro-install-done` is gated on OpenSSH only, **not** on Git: a Git
+failure must not make an otherwise-good golden look unprovisioned, and
+`provision-git.ps1` exits 0 either way so it cannot wedge the chain.
+
+That means nothing in the install chain will stop a Git-less image, so
+this step is the enforcement point. Unlike the x64 recipe — where
+`build-sysprep-golden.sh` runs the gate automatically — **this golden is
+captured by a manual SysPrep, so you must run the gate yourself.** It is
+staged into the guest during the specialize pass:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+    -File C:\Windows\Temp\assert-git-provisioned.ps1
+```
+
+**Do not proceed to §6 unless this exits 0.** It is a single command that
+either passes or fails loudly; it is not a checklist to eyeball. It
+asserts:
+
+- no `C:\Windows\Temp\vmh-git-provision-failed` marker (dumps the log
+  tail if present);
+- the **raw** machine `PATH` registry value contains `C:\PortableGit\bin`
+  — the value that survives capture and reaches the runner service on
+  every clone (`$env:Path` in your session is a stale, already-expanded
+  view and is *not* what matters);
+- that value is still `REG_EXPAND_SZ`;
+- `bash git sha256sum awk unzip tar curl` each resolve through
+  `C:\PortableGit\bin\bash.exe` — checked individually, so a missing
+  coreutil cannot hide behind a successful `bash`.
+
+On arm64 the MSYS tools come from `usr\bin` and `clangarm64\bin`; the
+`bin\bash.exe` shim prepends both inside the spawned process, which is why
+only `bin` needs to be on the machine PATH.
+
+A session that logged on before the install may not show the new PATH in
+`$env:Path` even when the registry is correct — the registry value is
+what matters, since every clone boots a fresh `services.exe`.
 
 ### 6. SysPrep and capture
 
@@ -282,8 +351,9 @@ built, every per-gate revert is the harness's ≤20s clone budget.
 - `README.md` — this document.
 - `autounattend.xml` — the SysPrep answer file. Single source of truth
   for admin credentials, locale, OOBE skip flags, `specialize`
-  staging, and FirstLogonCommands (OpenSSH install, firewall rule,
-  repro-install-done marker).
+  staging, and FirstLogonCommands (OpenSSH install, Git for Windows
+  install onto the machine PATH, firewall rule, repro-install-done
+  marker).
 - `repro-sysprep.xml` — the shutdown-after-generalize unattend.xml
   that's copied onto `C:\` by autounattend's FirstLogonCommands and
   used by the step-5 SysPrep invocation.
@@ -306,9 +376,18 @@ built, every per-gate revert is the harness's ≤20s clone budget.
   (EFI) El Torito boot record (via `xorriso`): a BIOS-only ISO is
   rejected because the UEFI-only virt/AAVMF domain boots to nothing.
 - `build-autounattend-iso.sh` — wraps `autounattend.xml` +
-  `repro-sysprep.xml` + `provision-openssh.ps1` and, when available
-  or required, `openssh/OpenSSH-ARM64.zip` and
-  `virtio/NetKVM/w11/ARM64` as a CD-ROM ISO.
+  `repro-sysprep.xml` + `provision-openssh.ps1` +
+  `../lib/provision-git.ps1` and, when available
+  or required, `openssh/OpenSSH-ARM64.zip`,
+  `virtio/NetKVM/w11/ARM64` and `git/PortableGit-*-arm64.7z.exe`
+  as a CD-ROM ISO.
+- `../lib/provision-git.ps1` — shared with `windows-x64-base`. Staged to
+  `C:\Windows\Temp\` during `specialize`, then run by FirstLogonCommands
+  to install Git for Windows (PortableGit) and extend the **machine**
+  PATH with `C:\PortableGit\bin`. Owns the version + SHA-256 pin for
+  both recipes; also runnable standalone over SSH.
+- `../lib/fetch-portable-git.sh` — host-side cache + checksum verify for
+  the pinned PortableGit archive (`--arch x64|arm64`).
 - `create-utm-bundle.sh` — assembles the UTM bundle skeleton and opens
   UTM so the install can proceed.
 - `finalize-golden.sh` — strips ISOs, renames to `repro-windows-arm-base`.

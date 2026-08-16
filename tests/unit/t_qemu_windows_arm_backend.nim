@@ -152,7 +152,7 @@ suite "QemuWindowsArmBackend pure behavior":
 
   test "windows-arm specialize stages OpenSSH provisioning script locally":
     let commands = windowsArmAutounattend().specializeDeploymentCommands()
-    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3"]
+    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3", "4", "5", "6"]
 
     let stage = commands[0].elementText("Path")
     check commands[0].elementText("Description") ==
@@ -165,7 +165,7 @@ suite "QemuWindowsArmBackend pure behavior":
 
   test "windows-arm specialize stages offline OpenSSH ARM64 zip locally when present":
     let commands = windowsArmAutounattend().specializeDeploymentCommands()
-    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3"]
+    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3", "4", "5", "6"]
 
     let stage = commands[1].elementText("Path")
     check commands[1].elementText("Description") ==
@@ -178,7 +178,7 @@ suite "QemuWindowsArmBackend pure behavior":
 
   test "windows-arm specialize stages offline VirtIO NetKVM ARM64 driver locally when present":
     let commands = windowsArmAutounattend().specializeDeploymentCommands()
-    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3"]
+    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3", "4", "5", "6"]
 
     let stage = commands[2].elementText("Path")
     check commands[2].elementText("Description") ==
@@ -190,7 +190,7 @@ suite "QemuWindowsArmBackend pure behavior":
 
   test "windows-arm FirstLogon launches staged local OpenSSH provisioning script":
     let commands = windowsArmAutounattend().firstLogonCommands()
-    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3"]
+    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3", "4"]
 
     let provision = commands[0].elementText("CommandLine")
     check commands[0].elementText("Description") ==
@@ -330,11 +330,21 @@ suite "QemuWindowsArmBackend pure behavior":
     check "VMH_VIRTIO_NETKVM_ARM64_DIR_OUT" in fetchScript
 
   test "windows-arm install-done marker is gated on OpenSSH success":
+    # Located by Description rather than by a hardcoded index: inserting a new
+    # FirstLogonCommand (as the Git for Windows provisioning step did) shifts
+    # every later position, and an index-pinned lookup then silently asserts
+    # against the WRONG command instead of reporting a missing one.
     let commands = windowsArmAutounattend().firstLogonCommands()
-    let marker = commands[2].elementText("CommandLine")
+    var marker = ""
+    var found = false
+    for command in commands:
+      if command.elementText("Description") ==
+          "Write install-done sentinel after OpenSSH is ready":
+        marker = command.elementText("CommandLine")
+        found = true
+        break
 
-    check commands[2].elementText("Description") ==
-      "Write install-done sentinel after OpenSSH is ready"
+    check found
     check "Test-Path -LiteralPath 'C:\\Windows\\Temp\\vmh-openssh-provision-failed'" in
       marker
     check "Get-Service -Name sshd" in marker
@@ -343,6 +353,38 @@ suite "QemuWindowsArmBackend pure behavior":
     check "exit 1" notin marker
     check "Set-Content -LiteralPath 'C:\\Windows\\Temp\\repro-install-done'" in
       marker
+
+  test "windows-arm provisions Git for Windows and stages its gate":
+    # Git for Windows supplies bash.exe; without it every GitHub Actions
+    # `shell: bash` step on a clone of this golden fails with
+    # "bash: command not found". The install step must therefore exist, must
+    # select the arm64 asset, and must not be able to wedge OOBE.
+    let xml = windowsArmAutounattend()
+    var gitCommand = ""
+    for command in xml.firstLogonCommands():
+      if "provision-git.ps1" in command.elementText("CommandLine"):
+        gitCommand = command.elementText("CommandLine")
+        break
+    check gitCommand.len > 0
+    check "-Arch arm64" in gitCommand
+    check "exit 0" in gitCommand
+
+    # The install media is detached before FirstLogonCommands on this recipe,
+    # so both scripts must be copied to C:\ during the SPECIALIZE pass.
+    var stagedProvision = false
+    var stagedGate = false
+    for command in xml.specializeDeploymentCommands():
+      let path = command.elementText("Path")
+      if "provision-git.ps1" in path and "C:\\Windows\\Temp" in path:
+        stagedProvision = true
+      if "assert-git-provisioned.ps1" in path and "C:\\Windows\\Temp" in path:
+        stagedGate = true
+    check stagedProvision
+    # provision-git.ps1 exits 0 even on failure so it cannot wedge the chain;
+    # assert-git-provisioned.ps1 is what turns that into a refusal to ship a
+    # Git-less golden, and this recipe is captured by a MANUAL sysprep, so the
+    # gate has to already be inside the guest.
+    check stagedGate
 
   test "windows-arm FirstLogonCommands do not abort OOBE":
     let commands = windowsArmAutounattend().firstLogonCommands()

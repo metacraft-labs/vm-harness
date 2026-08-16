@@ -35,8 +35,10 @@
       Windows install CD lands on E: and the virtio-win CD on D:
       with the q35 sata bus layout the libvirt backend uses).
     - FirstLogonCommands installs OpenSSH Server via DISM (no
-      Windows Update dependency), enables sshd, and writes the
-      install-done sentinel.
+      Windows Update dependency), enables sshd, installs Git for
+      Windows onto the MACHINE PATH (see step 10 — this is what makes
+      `bash.exe` reachable by the GitHub Actions runner service on
+      clones of this golden), and writes the install-done sentinel.
 
   Credentials baked in:
 
@@ -288,11 +290,23 @@
              blocking the rest of the FirstLogonCommands chain. The
              portable .zip from PowerShell/Win32-OpenSSH is the same
              binaries Microsoft ships in the FOD; the .zip includes
-             install-sshd.ps1 which registers the sshd service. -->
+             install-sshd.ps1 which registers the sshd service.
+
+             The SHA-256 below pins that asset. It was previously
+             unverified: the golden — the image the entire Windows
+             fleet is cloned from — installed and ran whatever bytes
+             github.com happened to return, over a link with no
+             integrity guarantee beyond TLS. The sibling ARM recipe
+             already checksums its OpenSSH zip
+             (fetch-openssh-arm64.sh), and provision-git.ps1 pins
+             PortableGit the same way, so this closes the last
+             unpinned download in the x64 chain. Verified by
+             downloading v9.5.0.0p1-Beta/OpenSSH-Win64.zip and running
+             sha256sum. -->
         <SynchronousCommand wcm:action="add">
           <Order>2</Order>
-          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $u='https://github.com/PowerShell/Win32-OpenSSH/releases/download/v9.5.0.0p1-Beta/OpenSSH-Win64.zip'; $z='C:\Windows\Temp\OpenSSH-Win64.zip'; $d='C:\Program Files\OpenSSH'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri $u -OutFile $z -UseBasicParsing; Expand-Archive -LiteralPath $z -DestinationPath 'C:\Program Files' -Force; if (Test-Path 'C:\Program Files\OpenSSH-Win64') { Move-Item -Force 'C:\Program Files\OpenSSH-Win64' $d }; powershell.exe -ExecutionPolicy Bypass -File (Join-Path $d 'install-sshd.ps1')"</CommandLine>
-          <Description>Download + install Win32-OpenSSH from GitHub release</Description>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $u='https://github.com/PowerShell/Win32-OpenSSH/releases/download/v9.5.0.0p1-Beta/OpenSSH-Win64.zip'; $sha='bd48fe985d400402c278c485db20e6a82bc4c7f7d8e0ef5a81128f523096530c'; $z='C:\Windows\Temp\OpenSSH-Win64.zip'; $d='C:\Program Files\OpenSSH'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri $u -OutFile $z -UseBasicParsing; $h=(Get-FileHash -LiteralPath $z -Algorithm SHA256).Hash.ToLower(); if ($h -ne $sha) { Remove-Item -LiteralPath $z -Force; throw ('OpenSSH-Win64.zip SHA-256 mismatch: expected ' + $sha + ' actual ' + $h) }; Expand-Archive -LiteralPath $z -DestinationPath 'C:\Program Files' -Force; if (Test-Path 'C:\Program Files\OpenSSH-Win64') { Move-Item -Force 'C:\Program Files\OpenSSH-Win64' $d }; powershell.exe -ExecutionPolicy Bypass -File (Join-Path $d 'install-sshd.ps1')"</CommandLine>
+          <Description>Download + verify + install Win32-OpenSSH from GitHub release</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
@@ -368,42 +382,92 @@
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 9. Stage the harness's first-boot bootstrap script onto C:\.
+        <!-- 9. Stage the Git for Windows provisioning helper onto C:\.
+             build-autounattend-iso.sh always places
+             guest-recipes/lib/provision-git.ps1 at the ISO root (and
+             the pinned PortableGit archive under git\ when the
+             operator ran ../lib/fetch-portable-git.sh). Same
+             removable-drive scan as the other staging steps because
+             drive letters under OOBE depend on attach order. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>9</Order>
+          <CommandLine>cmd.exe /c "for %i in (D E F G H) do if exist %i:\provision-git.ps1 copy /Y %i:\provision-git.ps1 C:\Windows\Temp\provision-git.ps1"</CommandLine>
+          <Description>Stage provision-git.ps1 on C:\Windows\Temp</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 10. Install Git for Windows (PortableGit) and put
+             C:\PortableGit\bin on the MACHINE PATH.
+
+             This is the fix for the defect that killed every Windows
+             CI job in the fleet: nothing in this chain installed Git,
+             so clones of this golden had no bash.exe. Every GitHub
+             Actions `shell: bash` step — including the FIRST step of
+             setup-dev-env — died with "bash: command not found", and
+             actions/checkout fell back to the REST-API tarball with
+             "add Git 2.18 or higher to the PATH".
+
+             MACHINE PATH, not user PATH, is the load-bearing detail.
+             The actions runner runs as a SERVICE, and services.exe
+             builds the environment block it hands to services once at
+             boot from HKLM\SYSTEM\CurrentControlSet\Control\Session
+             Manager\Environment. A user-PATH edit, or a setx in a
+             logon script, is invisible to it forever. Because the edit
+             lands here — in the golden, before capture — every clone's
+             boot-time services.exe reads it from the registry, so
+             cloudbase-init (a service) and the runner it launches both
+             inherit it with no ordering race and no reboot.
+
+             The helper is idempotent, pins the PortableGit version and
+             SHA-256, and writes
+             C:\Windows\Temp\vmh-git-provision-failed on failure
+             (see README §"Verify before finalizing"). It deliberately
+             exits 0 either way so a failure cannot wedge the rest of
+             this chain, including the shutdown that signals
+             install-complete to virt-install. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>10</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$p='C:\Windows\Temp\provision-git.ps1'; if (Test-Path -LiteralPath $p) { &amp; $p -Arch x64 } else { Set-Content -LiteralPath 'C:\Windows\Temp\vmh-git-provision-failed' -Value 'provision-git.ps1 not found on the autounattend ISO' -Encoding UTF8 -Force }; exit 0"</CommandLine>
+          <Description>Install Git for Windows on the machine PATH</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 11. Stage the harness's first-boot bootstrap script onto C:\.
              The autounattend ISO carries first-boot.ps1 (when the
              operator supplied the first-boot-script flag to
              build-autounattend-iso.sh). The CMD-side `for` loop
              searches removable drives for it because drive letters
              under OOBE depend on the device attach order. -->
         <SynchronousCommand wcm:action="add">
-          <Order>9</Order>
+          <Order>11</Order>
           <CommandLine>cmd.exe /c "for %i in (D E F G H) do if exist %i:\first-boot.ps1 copy /Y %i:\first-boot.ps1 C:\first-boot.ps1"</CommandLine>
           <Description>Stage first-boot.ps1 on C:\</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 10. Run the first-boot script if present (idempotent —
+        <!-- 12. Run the first-boot script if present (idempotent —
              the script itself is responsible for not re-running
              work on subsequent boots). -->
         <SynchronousCommand wcm:action="add">
-          <Order>10</Order>
+          <Order>12</Order>
           <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "if (Test-Path C:\first-boot.ps1) { &amp; C:\first-boot.ps1 *&gt; C:\Windows\Temp\first-boot.log }"</CommandLine>
           <Description>Run first-boot.ps1 if present</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 11. Marker file the recipe scripts (and the libvirt
+        <!-- 13. Marker file the recipe scripts (and the libvirt
              backend's startAndAwaitReady) poll for. Written before
              shutdown so the controller can confirm via SSH after the
              VM is restarted that the install finished without
              aborting partway through. -->
         <SynchronousCommand wcm:action="add">
-          <Order>11</Order>
+          <Order>13</Order>
           <CommandLine>cmd.exe /c "echo install-done > C:\Windows\Temp\repro-install-done"</CommandLine>
           <Description>Write install-done sentinel</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 12. Shut the guest down so the libvirt backend's
+        <!-- 14. Shut the guest down so the libvirt backend's
              virt-install wait flag sees the domain transition to
              "shut off" and treats that as install-complete. Without
              this, virt-install waits the full bootTimeoutSec (90
@@ -412,7 +476,7 @@
              controller restarts the VM in the next step
              (startAndAwaitReady) once provision returns. -->
         <SynchronousCommand wcm:action="add">
-          <Order>12</Order>
+          <Order>14</Order>
           <CommandLine>cmd.exe /c "shutdown /s /t 5 /c \"vm-harness FirstLogonCommands complete; signalling install-done to virt-install\""</CommandLine>
           <Description>Shut down to signal install-complete to virt-install wait</Description>
           <RequiresUserInput>false</RequiresUserInput>
