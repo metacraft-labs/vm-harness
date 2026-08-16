@@ -30,7 +30,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
+        # eph-linux-arm64 dropped: the only CPU conditional in the linted
+        # graph (types.nim `when defined(arm64)`) is nested inside
+        # `elif defined(macosx)`, so on Linux it is unreachable and this leg
+        # type-checked byte-identical code to eph-linux-x64. The macOS leg is
+        # kept because it genuinely covers the `defined(macosx)` branches in
+        # the tart/lima/utm/qemu_windows_arm backends that no Linux leg sees.
+        runner: [eph-linux-x64, eph-macos-arm64]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
