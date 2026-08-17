@@ -20,6 +20,19 @@ Rust port lives at `agent-harbor/main/crates/ah-vm/` (M17 of the
 > WinPE). Consumers add only their task-specific logic on top (see "Three-tier
 > ownership").
 
+## Documentation
+
+- **User guide** (`docs/user-guide/`) — task-oriented docs for *using*
+  vm-harness: [getting started](docs/user-guide/getting-started.md),
+  [driving a VM from code](docs/user-guide/driving-a-vm.md),
+  [backends](docs/user-guide/backends.md),
+  [guest recipes](docs/user-guide/guest-recipes.md), the
+  [CLI reference](docs/user-guide/cli-reference.md), and the
+  [parameters catalog](docs/user-guide/parameters.md) (the stable consumer
+  contract).
+- **Design reference** (`docs/design.md`) — internal architecture; see also the
+  per-backend notes under `docs/per-backend-notes/`.
+
 ## Status
 
 Shipped milestones:
