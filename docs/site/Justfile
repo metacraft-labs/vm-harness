@@ -1,0 +1,31 @@
+# vm-harness docs site -- task entry points.
+#
+# Every recipe runs inside THIS site's own dev shell. With direnv the shell is
+# already active (see ./.envrc -- it enters this site's self-contained flake,
+# which declares the isonim-docs framework + toolchain as inputs). Without
+# direnv, prefix a recipe with this flake -- no sibling checkouts needed:
+#   nix develop ./docs/site -c just --justfile docs/site/Justfile --working-directory docs/site build
+
+test:
+    nim c -r --hints:off tests/test_site_builds.nim
+
+# Static build into ./public/ (what the GitHub Pages workflow deploys).
+build:
+    nim c -r --hints:off -o:build/build src/build.nim
+
+# Live-reloading docs server: serves content/ + themed assets and hot-reloads
+# every open tab on any content edit. Run this, then `just open-docs`.
+dev-docs port='8000' host='127.0.0.1':
+    nim c -r --hints:off src/dev.nim {{port}} {{host}}
+
+# Live docs server bound to 0.0.0.0 for your private LAN (trusted networks only).
+dev-docs-lan port='8000':
+    @just dev-docs {{port}} 0.0.0.0
+
+# Open the running docs server in a browser (Linux xdg-open / macOS open).
+open-docs port='8000':
+    @xdg-open http://localhost:{{port}}/ 2>/dev/null || open http://localhost:{{port}}/ 2>/dev/null || echo "open http://localhost:{{port}}/ manually"
+
+# One-shot SSR docs preview (no live reload).
+serve-docs:
+    nim c -r --hints:off src/ssr.nim

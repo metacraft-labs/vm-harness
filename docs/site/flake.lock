@@ -1,0 +1,171 @@
+{
+  "nodes": {
+    "codetracer-design-system": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785252197,
+        "narHash": "sha256-S6zpF7PN62Es/jFxlX+v4YKqKSetMk/CknPYNnPmKPI=",
+        "owner": "metacraft-labs",
+        "repo": "codetracer-design-system",
+        "rev": "1febfae932ebb419746cd6162e8886a132e938c4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "repo": "codetracer-design-system",
+        "type": "github"
+      }
+    },
+    "flake-utils": {
+      "inputs": {
+        "systems": "systems"
+      },
+      "locked": {
+        "lastModified": 1731533236,
+        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "type": "github"
+      }
+    },
+    "isonim": {
+      "inputs": {
+        "flake-utils": "flake-utils",
+        "nixpkgs": "nixpkgs"
+      },
+      "locked": {
+        "lastModified": 1785881302,
+        "narHash": "sha256-hpkdvmGFKOchrFIujCXMuDT6vvxaz1cKP7vpCGz0qNM=",
+        "owner": "metacraft-labs",
+        "repo": "isonim",
+        "rev": "6d69995830bc730d1ff6e4a2a290543b8b800377",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "ref": "dev",
+        "repo": "isonim",
+        "type": "github"
+      }
+    },
+    "isonim-docs": {
+      "inputs": {
+        "isonim": [
+          "isonim"
+        ]
+      },
+      "locked": {
+        "lastModified": 1785881400,
+        "narHash": "sha256-OtgmYA1V77VIPNJ/juyvICLRXNogsG9INxA/aLluhc8=",
+        "owner": "metacraft-labs",
+        "repo": "isonim-docs",
+        "rev": "db998c23c15deba7e2bc4ec542d297a326c0315f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "ref": "main",
+        "repo": "isonim-docs",
+        "type": "github"
+      }
+    },
+    "nim-everywhere": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1786880131,
+        "narHash": "sha256-X5O8iPH0OP/T+4JP3pk86k/ZiXyRgfrBCRnJfXutaUA=",
+        "owner": "metacraft-labs",
+        "repo": "nim-everywhere",
+        "rev": "b2ce1c6b31743c4351aff4ad835f385f79b70edd",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "ref": "dev",
+        "repo": "nim-everywhere",
+        "type": "github"
+      }
+    },
+    "nim-faststreams": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1758821255,
+        "narHash": "sha256-Niu8Sr4uVYLao9CWx3GCS1Ay3OEoPEdkZyhXy7Tgy3g=",
+        "owner": "metacraft-labs",
+        "repo": "nim-faststreams",
+        "rev": "ce27581a3e881f782f482cb66dc5b07a02bd615e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "repo": "nim-faststreams",
+        "type": "github"
+      }
+    },
+    "nim-stew": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785862800,
+        "narHash": "sha256-Yx7RnPCjGsH0j5Q5PzVVZA39NksxXI75aCp/dZTQO6c=",
+        "owner": "status-im",
+        "repo": "nim-stew",
+        "rev": "232673b2c2ec5ef05962ad8082878869b3b6d084",
+        "type": "github"
+      },
+      "original": {
+        "owner": "status-im",
+        "repo": "nim-stew",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1774855581,
+        "narHash": "sha256-YkreHeMgTCYvJ5fESV0YyqQK49bHGe2B51tH6claUh4=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "15c6719d8c604779cf59e03c245ea61d3d7ab69b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "codetracer-design-system": "codetracer-design-system",
+        "isonim": "isonim",
+        "isonim-docs": "isonim-docs",
+        "nim-everywhere": "nim-everywhere",
+        "nim-faststreams": "nim-faststreams",
+        "nim-stew": "nim-stew"
+      }
+    },
+    "systems": {
+      "locked": {
+        "lastModified": 1681028828,
+        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
+        "owner": "nix-systems",
+        "repo": "default",
+        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-systems",
+        "repo": "default",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

@@ -1,0 +1,79 @@
+name: Docs — GitHub Pages
+
+# Build the vm-harness docs site (docs/site, an isonim-docs consumer) and
+# publish it to GitHub *project* Pages at https://metacraft-labs.github.io/vm-harness/
+# using the modern Pages flow (configure-pages + upload-pages-artifact +
+# deploy-pages). The site is self-contained: its flake (docs/site/flake.nix)
+# declares the isonim-docs framework + toolchain as inputs, so the build needs
+# no sibling checkouts.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/site/**"
+      - "docs/user-guide/**"
+      - ".github/workflows/docs-pages.yml"
+  workflow_dispatch:
+
+# GITHUB_TOKEN permissions needed by the deploy-pages action.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Serialize Pages deploys; don't cancel an in-flight production deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build docs site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          # Give Nix a token for github: flake-input fetches — avoids API rate
+          # limits and covers the metacraft-labs framework inputs. GITHUB_TOKEN
+          # is scoped to THIS repo; if any framework input repo is private, swap
+          # in a PAT/App token with read access to those repos.
+          extra-conf: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Nix build cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      # Build through the site's self-contained flake — the framework source
+      # comes from the flake inputs (isonim-docs, isonim, …), NOT from any
+      # sibling checkout. build.nim emits the static site into docs/site/public
+      # with the /vm-harness basePath baked in (see docs/site/src/docs_config.nim).
+      - name: Build static site
+        run: |
+          nix develop ./docs/site --command bash -c '
+            cd docs/site &&
+            nim c -r --hints:off -o:build/build src/build.nim
+          '
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/site/public
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
