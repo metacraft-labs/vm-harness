@@ -144,10 +144,51 @@ if (-not (Test-Path -LiteralPath $bashExe)) {
   # One `command -v` per tool, each tagged, so a missing tool is unambiguous.
   # `command -v` prints nothing and returns non-zero when a tool is absent, so
   # a combined one-liner would silently under-report.
+  # Run the probe from a FILE, not `bash -c <string>`. Windows PowerShell 5.1
+  # (what `powershell.exe` is in these goldens) does not escape the double
+  # quotes embedded in the probe when building the native command line, so
+  # `bash -c $inner` receives a mangled argv and dies with
+  #   -v: -c: line 2: unexpected EOF while looking for matching `)'
+  # without checking anything -- i.e. the gate would fail every image,
+  # including correct ones, and its failure would say nothing about Git.
+  # PowerShell 7 escapes those quotes correctly, so the `-c` form passes under
+  # `pwsh` and fails under the `powershell.exe` that actually runs here.
+  # A script path has no spaces and no quotes, so every argument-passing mode
+  # produces the same argv.
   $inner = 'for t in ' + ($RequiredTools -join ' ') +
            '; do p="$(command -v "$t" 2>/dev/null)"; ' +
            'if [ -n "$p" ]; then echo "TOOL $t $p"; else echo "TOOL $t -"; fi; done'
-  $probe = @(& $bashExe -c $inner 2>&1)
+  # LF-only and no BOM (a CR would reach bash as part of the last token), named
+  # with $PID so concurrent runs cannot truncate each other's probe, and removed
+  # in a `finally` so the gate leaves no residue in an image about to be
+  # captured for the whole fleet.
+  $probeScript = "C:\Windows\Temp\vmh-git-gate-probe-$PID.sh"
+  $probe = @()
+  try {
+    [System.IO.File]::WriteAllText(
+      $probeScript, ($inner -replace "`r", '') + "`n", (New-Object System.Text.ASCIIEncoding))
+    # PowerShell 5.1 turns ANY stderr line from a native command into a
+    # terminating NativeCommandError while $ErrorActionPreference is 'Stop' and
+    # stderr is redirected with 2>&1. Unhandled, that aborts this script with a
+    # PowerShell exception instead of the per-tool verdict below -- the exact
+    # "fails without saying anything about Git" shape this gate must not have.
+    # Relax the preference across the call only; the verdict comes from the
+    # TOOL lines, so a bash that cannot run still fails the gate, by name.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+      $probe = @(& $bashExe ($probeScript -replace '\\', '/') 2>&1)
+    } finally {
+      $ErrorActionPreference = $prevEap
+    }
+  } catch {
+    # Fail closed AND say why: an unwritable/unrunnable probe leaves the
+    # toolchain unproven, and unproven is not shippable.
+    Bad ('could not run the bash toolchain probe (' + $_.Exception.Message +
+         ') -- Git remains unproven on this image')
+  } finally {
+    Remove-Item -LiteralPath $probeScript -Force -ErrorAction SilentlyContinue
+  }
   foreach ($line in $probe) { Write-Host "  | $line" }
 
   foreach ($tool in $RequiredTools) {

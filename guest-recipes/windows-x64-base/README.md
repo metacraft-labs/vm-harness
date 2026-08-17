@@ -344,6 +344,35 @@ If the target is the **sysprepped** golden, do this on the *pre*-sysprep
 golden and re-run `build-sysprep-golden.sh`: booting a generalized image
 consumes the generalize.
 
+**Status (2026-08-17):** the retrofit has been applied on `high-mem-server`.
+`/storage/iso/golden-win11-cloudbase.qcow2` now carries PortableGit
+(`git version 2.55.0.windows.4`, `C:\PortableGit\bin` on the machine PATH,
+proved service-visible), and the pre-retrofit image is preserved at
+`/storage/iso/golden-win11-cloudbase-pre-git-20260817.qcow2` for a one-move
+rollback. Re-running `build-sysprep-golden.sh` against that golden now
+inherits Git without any extra step.
+
+### Known defects in the field (not fixed by this recipe)
+
+Two problems were found during that rollout. Neither is caused by the Git
+work and neither is fixed here; they are recorded so the next person does
+not rediscover them the hard way.
+
+- **The golden's `admin` password expired on 2026-08-03.** Windows refuses
+  password authentication for an expired account, so the `ssh admin@<ip>`
+  step in the retrofit procedure above — and in
+  [`cloudbase-init-golden.md`](cloudbase-init-golden.md) — fails on an
+  untouched copy of the golden. Any in-guest work has to go through another
+  channel (the QEMU guest agent works) until the account is fixed. The real
+  fix belongs in `autounattend.xml`: the `admin` account should be created
+  with a non-expiring password so goldens do not acquire an expiry date they
+  will eventually cross.
+- **A runner suspended itself (S3) mid-job.** The guest's power policy still
+  has a sleep idle timer, which no job used to run long enough to reach.
+  Jobs that now do reach it lose the machine part-way through. The image
+  should disable sleep/hibernate outright
+  (`powercfg /x standby-timeout-ac 0` and friends) as part of the recipe.
+
 ## Total wall-clock
 
 Rough budget on a 2024-era AMD EPYC server with NVMe storage:

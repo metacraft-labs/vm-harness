@@ -393,11 +393,52 @@ try {
   # `shell: bash` steps use them and they live in different directories
   # (usr\bin and mingw64\bin / clangarm64\bin), so between them they exercise
   # both paths the shim prepends.
+  # The probe is written to a FILE and run as `bash <file>` rather than passed
+  # as `bash -c <string>`. Windows PowerShell 5.1 -- which is what
+  # `powershell.exe` is in these goldens (5.1.22621.x) -- does NOT escape the
+  # double quotes embedded in the probe when it builds the native command line,
+  # so bash receives a mangled argv: the string splits at the first inner quote,
+  # `-v` lands in $0, and bash dies with
+  #   -v: -c: line 2: unexpected EOF while looking for matching `)'
+  # before running a single check. That turns the whole verification into a
+  # guaranteed false failure on every x64 golden. Handing bash a path sidesteps
+  # native-argument quoting entirely: the path has no spaces and no quotes, so
+  # every argument-passing mode produces the same argv.
+  #
+  # (PowerShell 7 escapes the quotes correctly, which is why the `-c` form
+  # looked fine when it was tried under `pwsh` and still failed in the guest.)
   $requiredTools = @('bash', 'git', 'sha256sum', 'awk', 'unzip', 'tar', 'curl')
   $inner = 'for t in ' + ($requiredTools -join ' ') +
            '; do p="$(command -v "$t" 2>/dev/null)"; ' +
            'if [ -n "$p" ]; then echo "TOOL $t $p"; else echo "TOOL $t -"; fi; done'
-  $probe = @(& $bashExe -c $inner 2>&1)
+  # LF-only, no trailing CR: a CR at end of line would reach bash as part of
+  # the last token.
+  #
+  # The name carries $PID so two runs cannot truncate each other's probe, and
+  # the file is deleted in a `finally` so it is never captured into the golden.
+  # A failed write throws before the invocation, so a stale file from an
+  # earlier run can never be executed in place of the current one.
+  $probeScript = "C:\Windows\Temp\vmh-git-probe-$PID.sh"
+  $probe = @()
+  try {
+    [System.IO.File]::WriteAllText(
+      $probeScript, ($inner -replace "`r", '') + "`n", (New-Object System.Text.ASCIIEncoding))
+    # PowerShell 5.1 turns ANY stderr line from a native command into a
+    # terminating NativeCommandError while $ErrorActionPreference is 'Stop'
+    # and stderr is redirected with 2>&1. We want stderr in the log, not an
+    # opaque abort, so relax the preference across the call only. A genuinely
+    # broken toolchain still fails below -- named tool by named tool -- because
+    # the verdict comes from the TOOL lines, not from the exit status.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+      $probe = @(& $bashExe ($probeScript -replace '\\', '/') 2>&1)
+    } finally {
+      $ErrorActionPreference = $prevEap
+    }
+  } finally {
+    Remove-Item -LiteralPath $probeScript -Force -ErrorAction SilentlyContinue
+  }
   foreach ($line in $probe) { Log "bash probe: $line" }
   $missingTools = @()
   foreach ($tool in $requiredTools) {
