@@ -4,6 +4,10 @@ Cross-platform VM lifecycle orchestration for test harnesses and dev
 workflows. One abstraction over Tart, UTM, Hyper-V, WSL, libvirt/QEMU,
 and Lima — so test code drives any of them through the same primitives.
 
+📖 **Documentation: <https://metacraft-labs.github.io/vm-harness/>** — the
+user guide (overview, getting started, driving a VM, backends, guest recipes)
+plus the CLI and parameters reference.
+
 This repository is the **canonical Nim implementation**; a nearly-identical
 Rust port lives at `agent-harbor/main/crates/ah-vm/` (M17 of the
 [Multi-OS VM Automation Campaign][campaign]).
