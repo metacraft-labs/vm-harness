@@ -40,6 +40,7 @@ let designSystem   = pathFor("VMH_DOCS_DESIGN_SYSTEM",     siblingRoot / "codetr
 
 switch("path", isonimSrc)
 switch("path", isonimDocsSrc) ## the framework (isonim-docs), a PATH dependency
+switch("path", designSystem / "nim") ## the shared docs theme helper (metacraft_docs_theme)
 switch("path", nimEverywhere)
 switch("path", nimFaststreams)
 switch("path", nimStew)

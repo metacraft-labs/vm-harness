@@ -3,11 +3,11 @@
     "codetracer-design-system": {
       "flake": false,
       "locked": {
-        "lastModified": 1785252197,
-        "narHash": "sha256-S6zpF7PN62Es/jFxlX+v4YKqKSetMk/CknPYNnPmKPI=",
+        "lastModified": 1787052349,
+        "narHash": "sha256-RA8VSlGPUULicTA8ndo38xv5/HpaCCEhCdgo9ty9Qqo=",
         "owner": "metacraft-labs",
         "repo": "codetracer-design-system",
-        "rev": "1febfae932ebb419746cd6162e8886a132e938c4",
+        "rev": "2af9bc48092553f3095b87b8cf20f75cb8fa8e2d",
         "type": "github"
       },
       "original": {
@@ -61,11 +61,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1785881400,
-        "narHash": "sha256-OtgmYA1V77VIPNJ/juyvICLRXNogsG9INxA/aLluhc8=",
+        "lastModified": 1787052468,
+        "narHash": "sha256-ounK9JoVpXIqnLxIglCdNDyPwiPorHnet0wcrTCi3CQ=",
         "owner": "metacraft-labs",
         "repo": "isonim-docs",
-        "rev": "db998c23c15deba7e2bc4ec542d297a326c0315f",
+        "rev": "4138122e911b108a6bbbc2b3af01626a6b90ded3",
         "type": "github"
       },
       "original": {

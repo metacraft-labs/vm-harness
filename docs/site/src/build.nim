@@ -19,25 +19,21 @@
 when defined(js):
   {.error: "build.nim is a C-target (SSG) entry; not for the JS target".}
 
-import std/os
-import build_site
-import core/docs_tokens
+import docs_scaffold
 import ./docs_config
 import ./theme_tokens
 import ./redirects
 
 when isMainModule:
-  let tokensCss = emitTokensCss(metacraftDocsTokenLayer(), designSystemTokens())
-  let n = buildSite(contentDir = "content", cfg = vmhDocsConfig(),
-                    docsTokensCss = tokensCss,
-                    # Compile this site's own JS mount entry (embeds THIS site's
-                    # content) into the hashed `assets/app.js` the pages
-                    # reference via `vmhDocsConfig().appScriptHref`.
-                    clientEntry = "src/main.nim")
-  if dirExists("static"):
-    copyDir("static", "public" / "assets")
-  # Emit any legacy-URL redirect stubs (none today). Runs AFTER buildSite (which
-  # wipes+rebuilds public/) and after the static copy so nothing is clobbered.
+  # The framework `buildDocsSite` scaffold: SSG build + design-system token CSS
+  # prepended onto the composed stylesheet (framework default; this site ships
+  # no `style.css` of its own) + this site's JS mount entry compiled into the
+  # hashed `assets/app.js` + `static/` copied verbatim.
+  let n = buildDocsSite(vmhDocsConfig(),
+                        docsTokensCss = metacraftDocsTokensCss(),
+                        clientEntry = "src/main.nim")
+  # Emit any legacy-URL redirect stubs (none today). Runs AFTER buildDocsSite
+  # (which wipes+rebuilds public/) so nothing is clobbered.
   let stubs = emitRedirects("public")
   echo "SSG: rendered ", n, " static pages into ./public/"
   echo "SSG: emitted ", stubs, " legacy-URL redirect stubs into ./public/"

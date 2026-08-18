@@ -12,23 +12,22 @@
 ## first arg is the port (default 8000), second the host (default loopback).
 
 import std/[os, strutils, asyncdispatch]
-import dev_server
-import core/docs_tokens
+import docs_scaffold
 import ./docs_config
 import ./theme_tokens
 
-export dev_server
+export docs_scaffold
 
 proc newDocsDevServer*(contentDir = "content";
                        assetsDirs = @["assets", "static"]): DevServer =
-  ## This site's themed live-reload dev server. Exposed so a test can drive the
-  ## exact `just dev-docs` wiring without binding a socket.
-  newDevServer(contentDir = contentDir, cfg = vmhDocsConfig(),
-               assetsDirs = assetsDirs,
-               docsTokensCss = docsTokensCssLive(),
-               tokensCssProvider = (proc(): string = docsTokensCssLive()),
-               watchPaths = @[docsDesignSystemPath],
-               clientEntry = "src/main.nim")
+  ## This site's themed live-reload dev server via the framework `docsDevServer`
+  ## scaffold, wiring the shared design-system token provider for hot reload.
+  ## Exposed so a test can drive the exact `just dev-docs` wiring without binding
+  ## a socket.
+  docsDevServer(vmhDocsConfig(), contentDir = contentDir, assetsDirs = assetsDirs,
+                tokensCssProvider = (proc(): string = docsTokensCssLive()),
+                watchPaths = @[docsDesignSystemPath],
+                clientEntry = "src/main.nim")
 
 when isMainModule:
   let port = if paramCount() >= 1: parseInt(paramStr(1)) else: 8000
