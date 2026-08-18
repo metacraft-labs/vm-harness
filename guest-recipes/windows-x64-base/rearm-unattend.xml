@@ -6,9 +6,12 @@
   on the NEXT boot of every CoW clone, Windows mini-setup:
     - generalize: keeps the virtio device drivers (PersistAllDeviceInstalls),
       so the clone still sees its virtio-blk/virtio-net devices;
-    - specialize: regenerates the machine SID (implicit to /generalize) and
+    - specialize: regenerates the machine SID (implicit to /generalize),
       assigns a RANDOM computer name (ComputerName=*) so every clone gets a
-      DISTINCT hostname;
+      DISTINCT hostname, and re-asserts the two hardening properties the
+      golden already carries (non-expiring local credential; no sleep,
+      hibernate or idle timeout on either power rail) as SYSTEM, before any
+      service starts;
     - oobeSystem: skips the entire Win11 24H2 OOBE (no MSA/region/EULA/
       wireless prompts) and boots straight to the logon screen, where the
       persisted `admin` local account + Automatic OpenSSH + Automatic
@@ -32,6 +35,53 @@
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <ComputerName>*</ComputerName>
       <TimeZone>UTC</TimeZone>
+    </component>
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <!-- Re-assert, on every clone, the two hardening properties the
+             golden already has from autounattend.xml (steps 1 and 2):
+             a non-expiring local credential, and no sleep/hibernate/idle
+             timeout. Both were field defects on the deployed x64 golden:
+             the `admin` password expired 42 days after capture and blocked
+             the documented SSH retrofit route, and a runner suspended
+             itself to S3 part-way through a job.
+
+             specialize, not FirstLogonCommands: this file deliberately has
+             no AutoLogon, so a headless clone may never see an interactive
+             logon and a FirstLogonCommand could sit unexecuted forever.
+             The specialize pass runs as SYSTEM during mini-setup on every
+             clone, before any service starts.
+
+             This is redundancy, not the primary fix: the primary fix is in
+             the golden, and these are HKLM values plus a SAM flag that
+             survive capture. It is here because whether SysPrep
+             /generalize leaves the active power scheme and the local
+             password policy untouched is not something this recipe can
+             prove outside a booted guest, and the cost of being wrong is
+             another runner asleep mid-job.
+
+             Each Path stays under the 259-character RunSynchronousCommand
+             limit, which is why the two power rails are separate commands
+             and why the credential command drops the -NoLogo the
+             FirstLogonCommands variants carry. Every command ends in an
+             explicit success exit: a non-zero RunSynchronousCommand fails
+             the specialize pass, i.e. the clone's boot. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "net.exe accounts /maxpwage:unlimited | Out-Null; try { $u=[ADSI]'WinNT://./admin,user'; $u.UserFlags.Value=$u.UserFlags.Value -bor 0x10000; $u.CommitChanges() } catch { }; exit 0"</Path>
+          <Description>Make local account passwords non-expiring</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd.exe /c powercfg /x standby-timeout-ac 0 &amp; powercfg /x hibernate-timeout-ac 0 &amp; powercfg /x monitor-timeout-ac 0 &amp; powercfg /x disk-timeout-ac 0 &amp; exit /b 0</Path>
+          <Description>Disable AC sleep, hibernation and idle timeouts</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>cmd.exe /c powercfg /x standby-timeout-dc 0 &amp; powercfg /x hibernate-timeout-dc 0 &amp; powercfg /x monitor-timeout-dc 0 &amp; powercfg /x disk-timeout-dc 0 &amp; powercfg /hibernate off &amp; exit /b 0</Path>
+          <Description>Disable DC sleep, hibernation and idle timeouts</Description>
+        </RunSynchronousCommand>
+      </RunSynchronous>
     </component>
   </settings>
 

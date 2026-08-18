@@ -23,7 +23,13 @@ A `qemu:///system` libvirt domain configured for:
 - q35 board with UEFI + SMM (Win11 requires both).
 - virtio-blk system disk, virtio-net adapter on `virbr0` (default
   NAT bridge; overridable via `--network-bridge`).
-- `admin` user, password `repro-windows-x64`, auto-logon enabled.
+- `admin` user, password `repro-windows-x64`, auto-logon enabled, and the
+  password set **never to expire** — an unattended image whose credential
+  ages out 42 days after capture breaks the SSH retrofit route below (it
+  did; see [§Defects found in the field](#defects-found-in-the-field-and-where-they-are-fixed)).
+- **No sleep, hibernation or idle timeout**, on both the AC and DC power
+  rails, so a long job cannot lose the machine to S3 part-way through.
+  `hiberfil.sys` is removed and fast startup is off.
 - OOBE skipped via autounattend.xml (no first-run dialogs, no
   Microsoft account, no telemetry prompts).
 - Windows OpenSSH server (`Server` capability) enabled and set to
@@ -202,11 +208,12 @@ with three significant differences:
 2. A `<DriverPaths>` block in the WindowsPE pass that pulls
    virtio-blk + virtio-net drivers from the virtio-win driver disk
    so Setup can see the qcow2-backed system disk on the q35 board.
-3. A new FirstLogonCommand (#11/#12) that stages and runs the
+3. A new FirstLogonCommand (#13/#14) that stages and runs the
    operator-supplied first-boot.ps1.
 
 Both recipes share FirstLogonCommands that stage and run
-`provision-git.ps1` (x64 steps #9/#10).
+`provision-git.ps1` (x64 steps #11/#12), and the credential/power
+hardening in steps #1/#2.
 
 ### 4. Run virt-install (or `vm-harness provision`)
 
@@ -352,26 +359,96 @@ proved service-visible), and the pre-retrofit image is preserved at
 rollback. Re-running `build-sysprep-golden.sh` against that golden now
 inherits Git without any extra step.
 
-### Known defects in the field (not fixed by this recipe)
+### Defects found in the field, and where they are fixed
 
-Two problems were found during that rollout. Neither is caused by the Git
-work and neither is fixed here; they are recorded so the next person does
-not rediscover them the hard way.
+Two problems surfaced during that rollout. Neither was caused by the Git
+work. Both are now fixed **in the recipe**, which means they reach the fleet
+only when a golden is next built or retrofitted — see
+[§Applying these to an existing golden](#applying-these-to-an-existing-golden).
 
-- **The golden's `admin` password expired on 2026-08-03.** Windows refuses
-  password authentication for an expired account, so the `ssh admin@<ip>`
-  step in the retrofit procedure above — and in
-  [`cloudbase-init-golden.md`](cloudbase-init-golden.md) — fails on an
-  untouched copy of the golden. Any in-guest work has to go through another
-  channel (the QEMU guest agent works) until the account is fixed. The real
-  fix belongs in `autounattend.xml`: the `admin` account should be created
-  with a non-expiring password so goldens do not acquire an expiry date they
-  will eventually cross.
-- **A runner suspended itself (S3) mid-job.** The guest's power policy still
-  has a sleep idle timer, which no job used to run long enough to reach.
-  Jobs that now do reach it lose the machine part-way through. The image
-  should disable sleep/hibernate outright
-  (`powercfg /x standby-timeout-ac 0` and friends) as part of the recipe.
+- **The golden's `admin` password expired on 2026-08-03**, 42 days after
+  capture (Windows' local `MaxPasswordAge` default). Windows refuses
+  password authentication for an expired account, so `ssh admin@<ip>` — the
+  route the retrofit procedure above and
+  [`cloudbase-init-golden.md`](cloudbase-init-golden.md) both document as
+  *the* way to change an already-built golden — failed on an untouched copy
+  of it. The rollout had to work around it via the QEMU guest agent. An
+  unattended CI image must not carry a credential that silently expires:
+  the failure lands months later, on whoever next has to touch the image,
+  and presents as a wrong password rather than an expired one.
+
+  **Fixed** by `autounattend.xml` FirstLogonCommand **#1**, which sets the
+  machine-wide policy (`net accounts /maxpwage:unlimited`, so accounts added
+  after capture by cloudbase-init or GARM are covered too) and sets
+  `ADS_UF_DONT_EXPIRE_PASSWD` on `admin` itself. `rearm-unattend.xml`
+  re-asserts it in the `specialize` pass of every clone, and the ARM sibling
+  carries the same fix in `windows-arm-base/autounattend.xml` plus
+  `repro-sysprep.xml` (which re-creates the account per clone, restarting
+  the clock).
+
+- **A runner suspended itself (S3) mid-job.** The guest kept Windows'
+  default sleep idle timer. This was invisible only while jobs died in ~90
+  seconds; now that they run 30+ minutes they reach the timer, and a VM that
+  sleeps mid-job hangs that job until the orchestrator times it out.
+
+  **Fixed** by FirstLogonCommand **#2**, which zeroes the standby,
+  hibernate, monitor and disk timeouts on **both** the AC and DC rails and
+  runs `powercfg /hibernate off` (which also removes the RAM-sized
+  `hiberfil.sys` from the capture and disables fast startup). Same
+  re-assert in `rearm-unattend.xml` and the same fix on the ARM recipe.
+
+Both fixes are held by `tests/unit/t_windows_golden_recipe_hardening.nim`,
+which asserts the directives exist, in a pass that executes, ahead of the
+network steps that can strand the chain, in files whose `Order` sequences
+are contiguous and whose commands respect the unattend length limits. What
+those tests cannot prove is that Windows *honours* the directives — that
+`net accounts` really cleared the expiry, or that `powercfg` really stopped
+the idle timer. That is guest-only, and is what the checks in
+[§Applying these to an existing golden](#applying-these-to-an-existing-golden)
+are for.
+
+### Applying these to an existing golden
+
+A recipe change reaches the fleet only through a new image. For the
+credential and power fixes above, an operator has to either:
+
+- **rebuild** the base golden (§Build steps) and re-layer cloudbase-init +
+  `build-sysprep-golden.sh`; or
+- **retrofit** the existing golden with the same boot-a-copy / modify /
+  capture-cold procedure used for Git above. The in-guest half is two
+  elevated commands:
+
+  ```powershell
+  net accounts /maxpwage:unlimited
+  $u = [ADSI]'WinNT://./admin,user'
+  $u.UserFlags.Value = $u.UserFlags.Value -bor 0x10000
+  $u.CommitChanges()
+
+  foreach ($s in 'standby-timeout-ac','standby-timeout-dc',
+                 'hibernate-timeout-ac','hibernate-timeout-dc',
+                 'monitor-timeout-ac','monitor-timeout-dc',
+                 'disk-timeout-ac','disk-timeout-dc') {
+      powercfg /x $s 0
+  }
+  powercfg /hibernate off
+  ```
+
+  Verify in-guest before capturing — this is the part no test in this repo
+  can reach:
+
+  ```powershell
+  net user admin | findstr /i "Password expires"   # expect: Never
+  powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE   # expect: 0x00000000
+  ```
+
+  Then `Stop-Computer -Force`, capture cold, and re-run
+  `build-sysprep-golden.sh` if the sysprepped golden is the target (booting
+  a generalized image consumes the generalize).
+
+Note that on an **expired** golden the SSH route is unavailable — that is
+the defect itself — so the first retrofit has to go through the QEMU guest
+agent (`virsh qemu-agent-command`), which is how the 2026-08-17 rollout did
+its in-guest work. Once the credential fix is in, SSH works again.
 
 ## Total wall-clock
 
@@ -398,8 +475,16 @@ domain as long-lived and skips per-gate revert.
 - `README.md` — this document.
 - `autounattend.xml` — the Win11 answer file. Single source of
   truth for admin credentials, locale, OOBE skip flags,
-  FirstLogonCommands (OpenSSH install, firewall rule, virtio-win
-  guest tools install, first-boot.ps1 run, install-done sentinel).
+  FirstLogonCommands (non-expiring credential, sleep/hibernate
+  disable, OpenSSH install, firewall rule, virtio-win guest tools
+  install, Git for Windows, first-boot.ps1 run, install-done
+  sentinel).
+- `rearm-unattend.xml` — the answer file `build-sysprep-golden.sh`
+  hands to `sysprep /generalize`. Randomises the computer name per
+  clone and re-asserts the credential + power hardening in the
+  `specialize` pass (it has no AutoLogon, so FirstLogonCommands would
+  be the wrong hook: a headless clone may never see an interactive
+  logon).
 - `fetch-iso.sh` — downloads virtio-win.iso, verifies the
   operator-supplied Win11 ISO exists AND validates it carries a UEFI
   (EFI) El Torito boot record (via `xorriso`, provided by the dev

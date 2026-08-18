@@ -12,7 +12,18 @@ containing:
 
 - Windows 11 Arm64 from Microsoft's official ISO download page:
   <https://www.microsoft.com/en-us/software-download/windows11arm64>.
-- `admin` user, password `repro-windows-arm`, auto-logon enabled.
+- `admin` user, password `repro-windows-arm`, auto-logon enabled, and the
+  password set **never to expire**. Windows' local `MaxPasswordAge` default
+  is 42 days: the x64 sibling of this recipe shipped a golden whose `admin`
+  password expired six weeks after capture, which took the documented
+  `ssh admin@<ip>` retrofit route down with it. `autounattend.xml`
+  FirstLogonCommand #1 sets the machine-wide policy and
+  `ADS_UF_DONT_EXPIRE_PASSWD` on the account; `repro-sysprep.xml` repeats it
+  because it re-creates the account on every clone, restarting the clock.
+- **No sleep, hibernation or idle timeout** (FirstLogonCommand #2), on both
+  the AC and DC rails. A live x64 runner suspended itself to S3 in the
+  middle of a job for want of this; a VM that sleeps mid-job hangs that job
+  until the orchestrator times it out.
 - OOBE skipped via autounattend.xml (no first-run dialogs, no
   Microsoft account, no telemetry prompts).
 - Windows OpenSSH server (`Server` capability) enabled and set to

@@ -189,12 +189,24 @@ suite "QemuWindowsArmBackend pure behavior":
     check "xcopy /E /I /Y %i:\\virtio C:\\Windows\\Temp\\virtio" in stage
 
   test "windows-arm FirstLogon launches staged local OpenSSH provisioning script":
+    # Located by Description, not by index, for the reason spelled out on
+    # the install-done test below: inserting a FirstLogonCommand (the
+    # credential and power-policy hardening steps did) shifts every later
+    # position, and an index-pinned lookup then asserts against the WRONG
+    # command instead of reporting a missing one. Order contiguity is
+    # covered for every pass of every answer file by
+    # tests/unit/t_windows_golden_recipe_hardening.nim.
     let commands = windowsArmAutounattend().firstLogonCommands()
-    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3", "4"]
+    var provision = ""
+    var found = false
+    for command in commands:
+      if command.elementText("Description") ==
+          "Provision OpenSSH Server with diagnostics":
+        provision = command.elementText("CommandLine")
+        found = true
+        break
 
-    let provision = commands[0].elementText("CommandLine")
-    check commands[0].elementText("Description") ==
-      "Provision OpenSSH Server with diagnostics"
+    check found
     check provision.len < 1024
     check "$p='C:\\Windows\\Temp\\provision-openssh.ps1'" in provision
     check "Test-Path -LiteralPath $p" in provision

@@ -80,20 +80,46 @@
       </AutoLogon>
 
       <FirstLogonCommands>
+        <!-- This file re-creates `admin` on every clone (the LocalAccount
+             block above), which restarts the 42-day MaxPasswordAge clock
+             each time. Hardening only the golden would therefore leave
+             every clone expiring six weeks after it was cloned, so the
+             same non-expiry fix has to run here as well. Machine-wide
+             policy plus ADS_UF_DONT_EXPIRE_PASSWD (0x10000) on the account
+             itself; ADSI rather than Set-LocalUser because the
+             LocalAccounts module is not dependable on Windows-on-ARM. -->
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
+          <CommandLine><![CDATA[powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "net.exe accounts /maxpwage:unlimited | Out-Null; try { $u=[ADSI]'WinNT://./admin,user'; $u.UserFlags.Value=$u.UserFlags.Value -bor 0x10000; $u.CommitChanges() } catch { }; exit 0"]]></CommandLine>
+          <Description>Make local account passwords non-expiring</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+        <!-- Re-assert the power policy on every clone. The golden itself
+             has it (autounattend.xml step 2), and these are HKLM values
+             that survive capture; re-asserting costs milliseconds and
+             removes the need to be certain that SysPrep /generalize leaves
+             the active power scheme alone, which is not something this
+             recipe can prove outside a booted guest. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <CommandLine><![CDATA[powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "foreach ($s in 'standby-timeout-ac','standby-timeout-dc','hibernate-timeout-ac','hibernate-timeout-dc','monitor-timeout-ac','monitor-timeout-dc','disk-timeout-ac','disk-timeout-dc') { powercfg.exe /x $s 0 | Out-Null }; powercfg.exe /hibernate off | Out-Null; exit 0"]]></CommandLine>
+          <Description>Disable sleep, hibernation and idle timeouts</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>3</Order>
           <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"</CommandLine>
           <Description>Ensure OpenSSH Server capability is present</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
         <SynchronousCommand wcm:action="add">
-          <Order>2</Order>
+          <Order>4</Order>
           <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Set-Service -Name sshd -StartupType Automatic; Start-Service sshd"</CommandLine>
           <Description>Enable and start sshd</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
         <SynchronousCommand wcm:action="add">
-          <Order>3</Order>
+          <Order>5</Order>
           <CommandLine>cmd.exe /c "echo install-done > C:\Windows\Temp\repro-install-done"</CommandLine>
           <Description>Write install-done sentinel</Description>
           <RequiresUserInput>false</RequiresUserInput>

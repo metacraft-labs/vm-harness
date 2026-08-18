@@ -276,18 +276,74 @@
       </AutoLogon>
 
       <FirstLogonCommands>
-        <!-- 1. Provision OpenSSH Server with durable diagnostics. The
+        <!-- 1. Make the local credential non-expiring.
+
+             Windows' local MaxPasswordAge default is 42 days, so a golden
+             captured today hands every clone a password that stops working
+             six weeks later. That is not hypothetical: it happened to the
+             x64 sibling of this recipe, whose `admin` password expired on
+             2026-08-03 and took the documented `ssh admin@<ip>` retrofit
+             route down with it. This recipe creates its account with the
+             same shape, so it carries the same fix.
+
+             `net accounts /maxpwage:unlimited` is the machine-wide half;
+             it also covers accounts this image does not create itself. The
+             ADSI half sets ADS_UF_DONT_EXPIRE_PASSWD (0x10000) on `admin`
+             itself so a later policy change cannot silently re-arm the
+             expiry. ADSI rather than Set-LocalUser because the
+             Microsoft.PowerShell.LocalAccounts module is not dependable on
+             Windows-on-ARM.
+
+             `admin` is created by the UserAccounts block in this same
+             oobeSystem pass, so this cannot run any earlier than
+             FirstLogonCommands. It is first in the chain because the steps
+             below can block on the network or on staged media. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine><![CDATA[powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "net.exe accounts /maxpwage:unlimited | Out-Null; try { $u=[ADSI]'WinNT://./admin,user'; $u.UserFlags.Value=$u.UserFlags.Value -bor 0x10000; $u.CommitChanges() } catch { }; exit 0"]]></CommandLine>
+          <Description>Make local account passwords non-expiring</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 2. Disable every sleep, hibernate and idle timeout, on both
+             the AC and the DC rail.
+
+             A live ephemeral x64 runner suspended itself to S3 in the
+             middle of a job because its golden retained Windows' default
+             sleep idle timer; long jobs reach it and hang until the
+             orchestrator times them out. This golden has the same default,
+             so it gets the same treatment before it can bite here too.
+
+             Both rails matter: a VM has no battery, but with no AC adapter
+             exposed Windows can apply the DC profile anyway. Display and
+             disk timeouts are meaningless on a headless guest and are
+             cleared with the rest. `powercfg /hibernate off` deletes
+             hiberfil.sys (RAM-sized, and it would otherwise ride along in
+             every capture) and disables fast startup.
+
+             The payload passes no double-quoted argument to a native
+             command: `powershell.exe` here is Windows PowerShell 5.1,
+             which does not escape embedded double quotes when it builds a
+             native command line. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <CommandLine><![CDATA[powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "foreach ($s in 'standby-timeout-ac','standby-timeout-dc','hibernate-timeout-ac','hibernate-timeout-dc','monitor-timeout-ac','monitor-timeout-dc','disk-timeout-ac','disk-timeout-dc') { powercfg.exe /x $s 0 | Out-Null }; powercfg.exe /hibernate off | Out-Null; exit 0"]]></CommandLine>
+          <Description>Disable sleep, hibernation and idle timeouts</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 3. Provision OpenSSH Server with durable diagnostics. The
              install-done marker below is intentionally gated on this
              command's success marker/state so a guest that reaches the
              desktop without sshd does not look provisioned. -->
         <SynchronousCommand wcm:action="add">
-          <Order>1</Order>
+          <Order>3</Order>
           <CommandLine><![CDATA[powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$p='C:\Windows\Temp\provision-openssh.ps1'; if (Test-Path -LiteralPath $p) { & $p } else { Set-Content -LiteralPath 'C:\Windows\Temp\vmh-openssh-provision-failed' -Value 'provision-openssh.ps1 not found' -Encoding UTF8 -Force }; exit 0"]]></CommandLine>
           <Description>Provision OpenSSH Server with diagnostics</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 2. Install Git for Windows (PortableGit) and put
+        <!-- 4. Install Git for Windows (PortableGit) and put
              C:\PortableGit\bin on the MACHINE PATH.
 
              Git for Windows is what supplies bash.exe. Without it every
@@ -311,28 +367,28 @@
              exits 0 either way so it cannot wedge the sentinel step
              below; see README §"Verify before SysPrep". -->
         <SynchronousCommand wcm:action="add">
-          <Order>2</Order>
+          <Order>4</Order>
           <CommandLine><![CDATA[powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$p='C:\Windows\Temp\provision-git.ps1'; if (Test-Path -LiteralPath $p) { & $p -Arch arm64 } else { Set-Content -LiteralPath 'C:\Windows\Temp\vmh-git-provision-failed' -Value 'provision-git.ps1 not found' -Encoding UTF8 -Force }; exit 0"]]></CommandLine>
           <Description>Install Git for Windows on the machine PATH</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 3. Copy the SysPrep answer file from the autounattend ISO
+        <!-- 5. Copy the SysPrep answer file from the autounattend ISO
              to C:\ so the manual step-5 SysPrep invocation finds it. -->
         <SynchronousCommand wcm:action="add">
-          <Order>3</Order>
+          <Order>5</Order>
           <CommandLine>cmd.exe /c "for %i in (D E F G H) do if exist %i:\repro-sysprep.xml copy /Y %i:\repro-sysprep.xml C:\repro-sysprep.xml"</CommandLine>
           <Description>Stage repro-sysprep.xml on C:\</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 4. Marker file the recipe scripts poll for. Written only if
+        <!-- 6. Marker file the recipe scripts poll for. Written only if
              OpenSSH provisioning did not leave a failure marker and the
              sshd service is running. If OpenSSH is unavailable, inspect
              C:\Windows\Temp\vmh-openssh-provision.log and
              C:\Windows\Temp\vmh-openssh-provision-failed. -->
         <SynchronousCommand wcm:action="add">
-          <Order>4</Order>
+          <Order>6</Order>
           <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "if ((Test-Path -LiteralPath 'C:\Windows\Temp\vmh-openssh-provision-failed') -or ((Get-Service -Name sshd -ErrorAction SilentlyContinue).Status -ne 'Running')) { exit 0 }; Set-Content -LiteralPath 'C:\Windows\Temp\repro-install-done' -Value 'install-done' -Encoding ASCII -Force; exit 0"</CommandLine>
           <Description>Write install-done sentinel after OpenSSH is ready</Description>
           <RequiresUserInput>false</RequiresUserInput>
