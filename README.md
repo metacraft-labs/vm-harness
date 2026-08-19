@@ -148,6 +148,9 @@ repro test --tool-provisioning=path --daemon=off
 The checked-in `repro.nim` builds the CLI and models every deterministic test
 as typed build and execute edges. Tests requiring a live host hypervisor remain
 in the explicit `just test-host` catalog.
+On Linux, the CLI's runtime profile also carries pinned `virsh`, `virt-install`,
+and `qemu-img` tools so downstream Reprobuild run edges do not depend on the
+daemon's ambient `PATH`.
 
 ## CLI reference
 

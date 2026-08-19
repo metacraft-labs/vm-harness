@@ -8,6 +8,7 @@
 
 import repro_project_dsl
 import ct_test_nim_unittest
+import repro_dsl_stdlib/nixpkgs_pin
 
 # TI2 producer-surface declaration: vm-harness's resource providers live in a
 # SEPARATE module (`src/vm_harness/repro/resources.nim`, re-authored via the RP4
@@ -77,6 +78,12 @@ package vm_harness:
     else:
       "gcc >=12"
 
+  runtimeDeps:
+    when defined(linux):
+      "vmHarnessVirsh"
+      "vmHarnessVirtInstall"
+      "vmHarnessQemuImg"
+
   library vm_harness
 
   executable vmHarness:
@@ -127,3 +134,31 @@ package vm_harness:
 
     discard collect("test-builds", testBuildActions)
     discard collect("test", testExecuteActions)
+
+when defined(linux):
+  package vmHarnessVirsh:
+    provisioning:
+      nixPackage "nixpkgs#libvirt", executablePath = "bin/virsh",
+        nixpkgsRev = CanonicalNixpkgsRev,
+        nixpkgsNarHash = CanonicalNixpkgsNarHash
+
+    executable virsh:
+      name: "virsh"
+
+  package vmHarnessVirtInstall:
+    provisioning:
+      nixPackage "nixpkgs#virt-manager", executablePath = "bin/virt-install",
+        nixpkgsRev = CanonicalNixpkgsRev,
+        nixpkgsNarHash = CanonicalNixpkgsNarHash
+
+    executable virtInstall:
+      name: "virt-install"
+
+  package vmHarnessQemuImg:
+    provisioning:
+      nixPackage "nixpkgs#qemu", executablePath = "bin/qemu-img",
+        nixpkgsRev = CanonicalNixpkgsRev,
+        nixpkgsNarHash = CanonicalNixpkgsNarHash
+
+    executable qemuImg:
+      name: "qemu-img"
