@@ -460,8 +460,8 @@ suite "QemuWindowsArmBackend pure behavior":
           let pidA = parseInt(fieldsA[1])
           let pidB = parseInt(fieldsB[1])
           defer:
-            discard execCmd("/bin/kill -TERM " & $pidA)
-            discard execCmd("/bin/kill -TERM " & $pidB)
+            discard execCmd("kill -TERM " & $pidA)
+            discard execCmd("kill -TERM " & $pidB)
           check portA != portB
           check preferredPort in [portA, portB]
     else:

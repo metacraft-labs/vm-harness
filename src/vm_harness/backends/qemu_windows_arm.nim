@@ -845,16 +845,12 @@ method stopAndCleanup*(b: QemuWindowsArmBackend, vm: VmHandle,
   try:
     let pidText = vm.extra.getOrDefault("qemuPid", "")
     if pidText.len > 0:
-      discard runProcessCapture(@["/bin/kill", "-TERM", pidText], timeoutSec = 5)
-      sleep(1000)
-      discard runProcessCapture(@["/bin/kill", "-KILL", pidText], timeoutSec = 5)
+      stopStartedProcess(parseInt(pidText))
     if vm.name in b.qemuPids:
       b.qemuPids.del(vm.name)
     let swtpmPidText = vm.extra.getOrDefault("swtpmPid", "")
     if swtpmPidText.len > 0:
-      discard runProcessCapture(@["/bin/kill", "-TERM", swtpmPidText], timeoutSec = 5)
-      sleep(500)
-      discard runProcessCapture(@["/bin/kill", "-KILL", swtpmPidText], timeoutSec = 5)
+      stopStartedProcess(parseInt(swtpmPidText))
     if vm.name in b.swtpmPids:
       b.swtpmPids.del(vm.name)
     # Release the per-instance lock before removing the directory so the fd
