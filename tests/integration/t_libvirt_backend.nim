@@ -185,6 +185,25 @@ suite "LibvirtBackend smoke (no live virsh)":
           kind: bmkQcow2,
           mediaPath: "/tmp/never.qcow2"))
 
+  test "transient boot flags support modern virt-install and serial capture":
+    let argv = transientBootCompatibilityArgs()
+    check argv[argv.find("--osinfo") + 1] == "detect=on,require=off"
+    check argv[argv.find("--console") + 1] == "pty,target_type=serial"
+
+    let b = newLibvirtBackend(
+      virshCmd = "/opt/libvirt/bin/virsh",
+      libvirtUri = "qemu:///session")
+    let consoleArgv = b.buildConsoleCaptureArgs(
+      "repro-test-boot-libvirt-abc123", "/opt/util-linux/bin/script")
+    check consoleArgv[0] == "/opt/util-linux/bin/script"
+    check "--quiet" in consoleArgv
+    check "--flush" in consoleArgv
+    check "--command" in consoleArgv
+    let command = consoleArgv[consoleArgv.find("--command") + 1]
+    check "/opt/libvirt/bin/virsh" in command
+    check "qemu:///session" in command
+    check "repro-test-boot-libvirt-abc123" in command
+
   test "installArgvTraceShim raises a clear M4 Phase B error":
     let b = newLibvirtBackend()
     let vm = VmHandle(

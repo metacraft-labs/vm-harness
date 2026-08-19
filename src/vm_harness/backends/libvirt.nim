@@ -28,10 +28,8 @@
 ##  - ``installArgvTraceShim`` (M4 Phase B — Windows shim shape is
 ##    identical to ``hyperv.nim``'s, but the install path needs to
 ##    transit SSH instead of PowerShell Direct).
-##  - ``captureSerial`` / ``expectLine`` / ``serialSend`` (M4 Phase B —
-##    QEMU's ``-serial pty`` + named pipe wiring exists; threading it
-##    through the ``SerialStream`` contract is deferred until the
-##    Hyper-V boot-harness equivalent is needed on Linux hosts).
+##  - Serial capture for long-lived baseline guests beyond the transient
+##    ``bootFromMedia`` path.
 ##
 ## *Transport*:
 ##
@@ -71,10 +69,11 @@
 ## helpers can run anywhere. Backend *registration* is unconditional,
 ## but ``probeAvailability`` returns false on non-Linux hosts.
 
-import std/[options, os, osproc, streams, strtabs,
+import std/[options, os, osproc, sequtils, streams, strtabs,
             strutils, tables, times]
 import ../types
 import ../auto
+import ../serial
 
 # ---------------------------------------------------------------------------
 # Backend type.
@@ -1624,6 +1623,28 @@ proc newBootDomainName(prefix: string = BootDomainNamePrefix): string =
   ## sessions don't collide.
   prefix & toHex(int64(epochTime() * 1000.0) and 0xFFFFFF'i64, 6).toLowerAscii()
 
+proc transientBootCompatibilityArgs*(): seq[string] =
+  ## Flags required by current virt-install releases and by the serial
+  ## assertion contract used after a transient domain starts.
+  @["--osinfo", "detect=on,require=off",
+    "--console", "pty,target_type=serial"]
+
+proc buildConsoleCaptureArgs*(b: LibvirtBackend, vmName: string,
+                              scriptCmd = "script"): seq[string] =
+  ## ``virsh console`` rejects redirected stdio unless it has a controlling
+  ## terminal. util-linux ``script`` supplies that PTY and forwards its duplex
+  ## stream to the harness process.
+  let consoleCommand = @[b.virshCmd, "--connect", b.libvirtUri,
+                         "console", vmName, "--force"]
+                       .mapIt(quoteShell(it)).join(" ")
+  @[scriptCmd, "--quiet", "--flush", "--command", consoleCommand, "/dev/null"]
+
+type
+  LibvirtSerialStream* = ref object of SerialStream
+    buf*: SerialLineBuffer
+    consoleProc*: Process
+    reader*: PipeReader
+
 method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
   ## *Transient boot from media*
   ##
@@ -1665,6 +1686,7 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
       "--graphics", "none",
       "--noautoconsole",
       "--noreboot"]
+    argv.add(transientBootCompatibilityArgs())
     case spec.kind
     of bmkQcow2, bmkVhdx:
       argv.add("--import")
@@ -1713,6 +1735,77 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
   else:
     raise newException(BackendUnavailableError,
       "LibvirtBackend.bootFromMedia requires a Linux host")
+
+method captureSerial*(b: LibvirtBackend, vm: VmHandle): SerialStream =
+  ## Attach to the transient domain's first serial console. ``virt-install``
+  ## creates the PTY; ``virsh console`` provides a portable duplex stream.
+  when defined(linux):
+    let logPath = vm.extra.getOrDefault("serialLogPath")
+    let scriptCmd = findExe("script")
+    if scriptCmd.len == 0:
+      raise newException(BackendUnavailableError,
+        "LibvirtBackend.captureSerial requires util-linux script on PATH")
+    let argv = b.buildConsoleCaptureArgs(vm.name, scriptCmd)
+    let p = startProcess(argv[0], args = argv[1 .. ^1],
+                         options = {poUsePath, poStdErrToStdOut})
+    let buf = newSerialLineBuffer(logPath)
+    let reader = startPipeReader(p, buf)
+    result = LibvirtSerialStream(
+      vm: vm,
+      logPath: logPath,
+      buf: buf,
+      consoleProc: p,
+      reader: reader)
+  else:
+    raise newException(BackendUnavailableError,
+      "LibvirtBackend.captureSerial requires a Linux host")
+
+method expectLine*(b: LibvirtBackend, stream: SerialStream,
+                   pattern: string, timeoutSec: int = 60): SerialMatch =
+  when defined(linux):
+    let s = LibvirtSerialStream(stream)
+    result = expectLineImpl(s.buf, pattern, timeoutSec * 1000, 100, nil)
+  else:
+    raise newException(BackendUnavailableError,
+      "LibvirtBackend.expectLine requires a Linux host")
+
+method serialSend*(b: LibvirtBackend, stream: SerialStream, text: string) =
+  when defined(linux):
+    let s = LibvirtSerialStream(stream)
+    if s.consoleProc == nil:
+      raise newException(ValueError, "serialSend: stream not started")
+    try:
+      let input = s.consoleProc.inputStream
+      if input != nil:
+        input.write(text)
+        input.flush()
+    except CatchableError as e:
+      raise newVmHarnessError($b.id, lpExec,
+        "LibvirtBackend.serialSend failed: " & e.msg)
+  else:
+    raise newException(BackendUnavailableError,
+      "LibvirtBackend.serialSend requires a Linux host")
+
+method closeSerial*(b: LibvirtBackend, stream: SerialStream) =
+  when defined(linux):
+    let s = LibvirtSerialStream(stream)
+    try:
+      if s.consoleProc != nil and s.consoleProc.running:
+        try: s.consoleProc.terminate()
+        except CatchableError: discard
+        try: discard s.consoleProc.waitForExit(timeout = 3000)
+        except CatchableError: discard
+      if s.reader != nil:
+        try: stopPipeReader(s.reader)
+        except CatchableError: discard
+      if s.consoleProc != nil:
+        try: s.consoleProc.close()
+        except CatchableError: discard
+      s.buf.close()
+    except CatchableError:
+      discard
+  else:
+    discard
 
 # ---------------------------------------------------------------------------
 # Backend registration. Importing this module is enough to make
