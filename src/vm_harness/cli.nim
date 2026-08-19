@@ -54,6 +54,8 @@ type
     graphics*: string
     videoModel*: string
     viewer*: bool
+    screenshotPath*: string
+    screenshotDelaySec*: int
     cpus*: int
     memoryMB*: int
     diskGB*: int
@@ -224,6 +226,10 @@ Common flags:
   --video <model>                `boot`: video model (default: virtio).
   --viewer                       `boot`: open virt-viewer for libvirt and
                                   clean up when the window closes.
+  --screenshot <path>            `boot`: capture the graphical console after
+                                  --expect succeeds, then clean up by default.
+  --screenshot-delay-sec <int>   `boot`: settle time after --expect before
+                                  capture (default: 0).
   --cpus <int>                    Backend default applies when omitted.
   --vcpu <int>                    Alias for --cpus (canonical libvirt M4 shape).
   --memory-mb <int>
@@ -403,6 +409,15 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.videoModel = args[i]; inc i
     of "--viewer":
       result.viewer = true
+      inc i
+    of "--screenshot":
+      inc i; result.screenshotPath = args[i]; inc i
+    of "--screenshot-delay-sec":
+      inc i
+      result.screenshotDelaySec = parseInt(args[i])
+      if result.screenshotDelaySec < 0:
+        raise newException(ValueError,
+          "--screenshot-delay-sec expects a non-negative integer")
       inc i
     of "--cpus", "--vcpu":
       # ``--vcpu`` is the canonical libvirt M4 spelling; ``--cpus`` is
@@ -686,10 +701,21 @@ proc applyDefaults(spec: var BaselineSpec, opts: CliOpts) =
     spec.backendOptions["ephemeralPrefix"] = opts.ephemeralPrefix
 
 proc cmdBoot(opts: CliOpts): int =
-  if not opts.keepEphemeral and opts.expectPattern.len == 0 and not opts.viewer:
+  if not opts.keepEphemeral and opts.expectPattern.len == 0 and
+      not opts.viewer and opts.screenshotPath.len == 0:
     raise newException(ValueError,
       "boot: pass --keep to leave the VM running, --viewer for manual " &
-      "inspection, or --expect <regex> for a self-cleaning assertion")
+      "inspection, --expect <regex> for a self-cleaning assertion, or " &
+      "--screenshot <path> for a self-cleaning graphical capture")
+  if opts.screenshotPath.len > 0 and opts.expectPattern.len == 0:
+    raise newException(ValueError,
+      "boot --screenshot requires --expect so capture has a readiness gate")
+  if opts.screenshotPath.len == 0 and opts.screenshotDelaySec > 0:
+    raise newException(ValueError,
+      "boot --screenshot-delay-sec requires --screenshot")
+  if opts.screenshotPath.len > 0 and opts.graphics == "none" and not opts.viewer:
+    raise newException(ValueError,
+      "boot --screenshot requires --graphics vnc or --graphics spice")
 
   let mediaPath = resolveBootMediaPath(opts.sourceImage)
   let mediaKind = parseBootMediaKind(opts.mediaKind, mediaPath)
@@ -757,6 +783,15 @@ proc cmdBoot(opts: CliOpts): int =
       # Let Start-VM leave the PowerShell launcher before closing its serial
       # reader. Closing the reader does not stop the VM.
       sleep(1000)
+
+    if opts.screenshotPath.len > 0:
+      if opts.screenshotDelaySec > 0:
+        sleep(opts.screenshotDelaySec * 1000)
+      let screenshotPath = absolutePath(opts.screenshotPath)
+      backend.captureScreenshot(vm, screenshotPath)
+      logEvent(opts.logFormat, "info", "graphical console captured",
+               {"backend": $id, "vm": vm.name,
+                "screenshot": screenshotPath})
 
     if opts.viewer:
       if id != biLibvirt:

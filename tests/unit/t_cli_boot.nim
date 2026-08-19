@@ -13,6 +13,8 @@ suite "CLI boot media":
       "--generation", "2",
       "--graphics", "vnc",
       "--video", "virtio",
+      "--screenshot", "build/welcome.png",
+      "--screenshot-delay-sec", "3",
       "--viewer",
       "--timeout-sec", "90"])
     check opts.subcommand == "boot"
@@ -22,6 +24,8 @@ suite "CLI boot media":
     check opts.generation == 2
     check opts.graphics == "vnc"
     check opts.videoModel == "virtio"
+    check opts.screenshotPath == "build/welcome.png"
+    check opts.screenshotDelaySec == 3
     check opts.viewer
     check opts.timeoutSec == 90
 
@@ -37,6 +41,9 @@ suite "CLI boot media":
       discard parseCliOpts(@["boot", "--generation", "3"])
     expect ValueError:
       discard parseCliOpts(@["boot", "--graphics", "public-vnc"])
+    expect ValueError:
+      discard parseCliOpts(@[
+        "boot", "--screenshot-delay-sec", "-1"])
 
   test "media kind is inferred from supported extensions":
     check parseBootMediaKind("auto", "reproos.iso") == bmkIso

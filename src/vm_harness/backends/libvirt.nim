@@ -1880,6 +1880,35 @@ method captureSerial*(b: LibvirtBackend, vm: VmHandle): SerialStream =
     raise newException(BackendUnavailableError,
       "LibvirtBackend.captureSerial requires a Linux host")
 
+method captureScreenshot*(b: LibvirtBackend, vm: VmHandle,
+                          outputPath: string) =
+  ## ``virsh screenshot`` captures the primary QEMU graphical console. The
+  ## output format follows the filename extension; use ``.png`` for visual
+  ## assertion tools.
+  when defined(linux):
+    if outputPath.len == 0:
+      raise newException(ValueError,
+        "LibvirtBackend.captureScreenshot: output path is empty")
+    let destination = absolutePath(outputPath)
+    let outputDir = parentDir(destination)
+    if outputDir.len > 0:
+      createDir(outputDir)
+    if fileExists(destination):
+      removeFile(destination)
+    let r = b.runVirsh(@[
+      "screenshot", vm.name, destination, "--screen", "0"],
+      timeoutSec = 60)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpExec,
+        "virsh screenshot " & vm.name & " failed (exit " &
+        $r.exitCode & "): " & r.stdout)
+    if not fileExists(destination) or getFileSize(destination) <= 0:
+      raise newVmHarnessError($b.id, lpExec,
+        "virsh screenshot did not create a non-empty file: " & destination)
+  else:
+    raise newException(BackendUnavailableError,
+      "LibvirtBackend.captureScreenshot requires a Linux host")
+
 method expectLine*(b: LibvirtBackend, stream: SerialStream,
                    pattern: string, timeoutSec: int = 60): SerialMatch =
   when defined(linux):

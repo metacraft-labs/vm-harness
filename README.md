@@ -159,6 +159,8 @@ vm-harness provision --backend <id|auto> --guest <linux|windows|macos> \
 vm-harness boot      --backend <id|auto> --source-image <file-or-dir> \
                      [--kind <auto|iso|qcow2|vhdx>] \
                      [--cpus N] [--memory-mb N] \
+                     [--graphics <none|vnc|spice>] \
+                     [--screenshot <png> --screenshot-delay-sec N] \
                      (--keep | --expect <serial-regex>)
 
 vm-harness run       --backend <id|auto> --guest <linux|windows|macos> \
@@ -178,6 +180,9 @@ attach QCOW2 directly, so the backend converts it to a transient dynamic VHDX
 with `qemu-img` and removes that conversion when a self-cleaning boot finishes.
 Passing an output directory selects its newest `.iso`, `.qcow2`, or `.vhdx`,
 which supports content-addressed recipe outputs without scripting a filename.
+With `--screenshot`, the harness waits for the required `--expect` marker,
+captures the graphical console, and removes the transient VM unless `--keep`
+is also set.
 
 `--backend auto` picks per the dispatch table (design doc §6):
 

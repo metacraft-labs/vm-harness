@@ -22,7 +22,7 @@
 ##    debugging the unimplemented surface get a clear signpost.
 ##  - The backend is registered with the auto-selection factory.
 
-import std/[options, os, sequtils, strutils, tables, unittest]
+import std/[options, os, sequtils, strutils, tables, tempfiles, unittest]
 import vm_harness
 
 suite "LibvirtBackend smoke (no live virsh)":
@@ -217,6 +217,28 @@ suite "LibvirtBackend smoke (no live virsh)":
                    "--video", "virtio"]
     let headless = transientBootGraphicsArgs(BootMediaSpec())
     check headless == @["--graphics", "none"]
+
+  test "captureScreenshot writes a non-empty console frame":
+    when defined(linux):
+      let root = createTempDir("vmh-libvirt-screenshot", "")
+      defer: removeDir(root)
+      let fakeVirsh = root / "virsh"
+      writeFile(fakeVirsh,
+        "#!/bin/sh\n" &
+        "test \"$3\" = screenshot || exit 2\n" &
+        "printf fake-png > \"$5\"\n")
+      setFilePermissions(fakeVirsh, getFilePermissions(fakeVirsh) +
+        {fpUserExec})
+      let b = newLibvirtBackend(
+        virshCmd = fakeVirsh, libvirtUri = "qemu:///test")
+      let vm = VmHandle(
+        backend: b, name: "repro-test-boot-libvirt-frame",
+        baseline: "<boot-from-media>", ipAddress: none(string),
+        sshPort: 0, sshUser: "", sshAuth: SshAuth(kind: saNone),
+        extra: initTable[string, string]())
+      let output = root / "frame.png"
+      b.captureScreenshot(vm, output)
+      check readFile(output) == "fake-png"
 
   test "installArgvTraceShim raises a clear M4 Phase B error":
     let b = newLibvirtBackend()

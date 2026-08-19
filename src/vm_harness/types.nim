@@ -436,6 +436,14 @@ method captureSerial*(b: VmBackend, vm: VmHandle): SerialStream {.base.} =
   raise newException(BackendUnavailableError,
     "captureSerial not implemented for backend " & $b.id)
 
+method captureScreenshot*(b: VmBackend, vm: VmHandle,
+                          outputPath: string) {.base.} =
+  ## Capture the guest's primary graphical console to ``outputPath``.
+  ## Callers must request a graphical console when booting the VM. Backends
+  ## should return only after the file exists and is non-empty.
+  raise newException(BackendUnavailableError,
+    "captureScreenshot not implemented for backend " & $b.id)
+
 method expectLine*(b: VmBackend, stream: SerialStream,
                   pattern: string, timeoutSec: int = 60): SerialMatch {.base.} =
   ## Block until ``pattern`` (Perl-flavoured regex) matches a line in the
