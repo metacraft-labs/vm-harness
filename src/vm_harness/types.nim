@@ -189,6 +189,11 @@ type
     bmkQcow2 = "qcow2"         ## boot from qcow2 (libvirt/QEMU)
     bmkRootfsTar = "rootfs-tar" ## boot from tarball rootfs (WSL2)
 
+  BootGraphicsKind* = enum
+    bgNone = "none"            ## no graphical console
+    bgVnc = "vnc"              ## loopback-only VNC console
+    bgSpice = "spice"          ## loopback-only SPICE console
+
   BootMediaSpec* = object
     ## Direct-boot media for testing OS bring-up itself (not test-in-guest).
     ## Distinct from BaselineSpec: BaselineSpec provisions a long-lived
@@ -200,8 +205,10 @@ type
     secondaryIsoPath*: string       ## optional second ISO (e.g. cloud-init seed)
     cpus*: int                      ## defaults to 2 when zero
     memoryMB*: int                  ## defaults to 2048 when zero
-    generation*: int                ## Hyper-V: 1 or 2 (UEFI); defaults to 2
+    generation*: int                ## 1 (legacy BIOS) or 2 (UEFI); defaults to 2
     secureBootEnabled*: bool        ## defaults to false (most test ISOs unsigned)
+    graphics*: BootGraphicsKind     ## graphical console; defaults to none
+    videoModel*: string             ## backend video model; defaults to virtio
     serialPipeName*: string         ## backend may override; otherwise auto-generated
     serialLogPath*: string          ## host-side path where serial bytes are logged
     extra*: Table[string, string]   ## backend-specific scratch (post-import scripts...)

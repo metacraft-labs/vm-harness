@@ -14,7 +14,7 @@
 ## CLI falls back to NoopBackend if ``--allow-noop-fallback`` is set
 ## (used by the M0 selection test on hosts without real hypervisors).
 
-import std/[json, options, os, sequtils, strformat, strutils, tables,
+import std/[json, options, os, osproc, sequtils, strformat, strutils, tables,
             terminal, times]
 import ./types, ./output, ./auto, ./orchestrator
 # Import every backend module so its registerBackend bootstrap runs.
@@ -50,6 +50,10 @@ type
     sourceImage*: string
     mediaKind*: string
     expectPattern*: string
+    generation*: int
+    graphics*: string
+    videoModel*: string
+    viewer*: bool
     cpus*: int
     memoryMB*: int
     diskGB*: int
@@ -215,6 +219,11 @@ Common flags:
   --kind <auto|iso|qcow2|vhdx|rootfs-tar>
                                   Media kind for `boot` (default: extension).
   --expect <regex>                `boot`: wait for a serial-console match.
+  --generation <1|2>             `boot`: legacy BIOS or UEFI (default: 2).
+  --graphics <none|vnc|spice>    `boot`: graphical console (default: none).
+  --video <model>                `boot`: video model (default: virtio).
+  --viewer                       `boot`: open virt-viewer for libvirt and
+                                  clean up when the window closes.
   --cpus <int>                    Backend default applies when omitted.
   --vcpu <int>                    Alias for --cpus (canonical libvirt M4 shape).
   --memory-mb <int>
@@ -333,6 +342,9 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
   result.cpus = 0
   result.memoryMB = 0
   result.diskGB = 0
+  result.generation = 2
+  result.graphics = "none"
+  result.videoModel = "virtio"
   if args.len == 0 or args[0] in ["-h", "--help", "help"]:
     result.subcommand = "help"
     return
@@ -374,6 +386,24 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.mediaKind = args[i]; inc i
     of "--expect":
       inc i; result.expectPattern = args[i]; inc i
+    of "--generation":
+      inc i
+      result.generation = parseInt(args[i])
+      if result.generation notin [1, 2]:
+        raise newException(ValueError, "--generation expects 1 or 2")
+      inc i
+    of "--graphics":
+      inc i
+      result.graphics = args[i].toLowerAscii()
+      if result.graphics notin ["none", "vnc", "spice"]:
+        raise newException(ValueError,
+          "--graphics expects none, vnc, or spice")
+      inc i
+    of "--video":
+      inc i; result.videoModel = args[i]; inc i
+    of "--viewer":
+      result.viewer = true
+      inc i
     of "--cpus", "--vcpu":
       # ``--vcpu`` is the canonical libvirt M4 spelling; ``--cpus`` is
       # the historical vm-harness spelling. Both produce the same
@@ -656,10 +686,10 @@ proc applyDefaults(spec: var BaselineSpec, opts: CliOpts) =
     spec.backendOptions["ephemeralPrefix"] = opts.ephemeralPrefix
 
 proc cmdBoot(opts: CliOpts): int =
-  if not opts.keepEphemeral and opts.expectPattern.len == 0:
+  if not opts.keepEphemeral and opts.expectPattern.len == 0 and not opts.viewer:
     raise newException(ValueError,
-      "boot: pass --keep to leave the VM running or --expect <regex> " &
-      "for a self-cleaning boot assertion")
+      "boot: pass --keep to leave the VM running, --viewer for manual " &
+      "inspection, or --expect <regex> for a self-cleaning assertion")
 
   let mediaPath = resolveBootMediaPath(opts.sourceImage)
   let mediaKind = parseBootMediaKind(opts.mediaKind, mediaPath)
@@ -675,6 +705,16 @@ proc cmdBoot(opts: CliOpts): int =
                     getTempDir() / "vm-harness-boot"
   createDir(outputDir)
   var extra = initTable[string, string]()
+  if opts.uefiLoader.len > 0:
+    extra["uefiLoader"] = absolutePath(opts.uefiLoader)
+  if opts.uefiNvramTemplate.len > 0:
+    extra["uefiNvramTemplate"] = absolutePath(opts.uefiNvramTemplate)
+  let requestedGraphics =
+    if opts.viewer and opts.graphics == "none": "vnc" else: opts.graphics
+  let graphics = case requestedGraphics
+    of "vnc": bgVnc
+    of "spice": bgSpice
+    else: bgNone
   let spec = BootMediaSpec(
     name: "",
     kind: mediaKind,
@@ -682,8 +722,10 @@ proc cmdBoot(opts: CliOpts): int =
     secondaryIsoPath: "",
     cpus: (if opts.cpus > 0: opts.cpus else: 2),
     memoryMB: (if opts.memoryMB > 0: opts.memoryMB else: 4096),
-    generation: 2,
+    generation: opts.generation,
     secureBootEnabled: false,
+    graphics: graphics,
+    videoModel: opts.videoModel,
     serialPipeName: "",
     serialLogPath: outputDir / "boot.serial.log",
     extra: extra)
@@ -715,6 +757,26 @@ proc cmdBoot(opts: CliOpts): int =
       # Let Start-VM leave the PowerShell launcher before closing its serial
       # reader. Closing the reader does not stop the VM.
       sleep(1000)
+
+    if opts.viewer:
+      if id != biLibvirt:
+        raise newException(BackendUnavailableError,
+          "boot --viewer is currently supported by the libvirt backend")
+      let viewer = findExe("virt-viewer")
+      if viewer.len == 0:
+        raise newException(BackendUnavailableError,
+          "boot --viewer requires virt-viewer on PATH")
+      let lb = LibvirtBackend(backend)
+      logEvent(opts.logFormat, "info", "opening graphical console",
+               {"backend": $id, "vm": vm.name})
+      let viewerProcess = startProcess(viewer,
+        args = @["--connect", lb.libvirtUri, "--wait", vm.name],
+        options = {poUsePath, poParentStreams})
+      let viewerExit = viewerProcess.waitForExit()
+      viewerProcess.close()
+      if viewerExit != 0:
+        raise newException(VmHarnessError,
+          "virt-viewer exited with status " & $viewerExit)
 
     if opts.keepEphemeral:
       logEvent(opts.logFormat, "info", "VM left running",

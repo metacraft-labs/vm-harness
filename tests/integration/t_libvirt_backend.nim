@@ -188,21 +188,35 @@ suite "LibvirtBackend smoke (no live virsh)":
   test "transient boot flags support modern virt-install and serial capture":
     let argv = transientBootCompatibilityArgs()
     check argv[argv.find("--osinfo") + 1] == "detect=on,require=off"
-    check argv[argv.find("--console") + 1] == "pty,target_type=serial"
+    check "--console" notin argv
+    let serial = transientBootSerialArgs("/tmp/reproos.serial.log")
+    check serial == @["--serial", "file,path=/tmp/reproos.serial.log"]
 
-    let b = newLibvirtBackend(
-      virshCmd = "/opt/libvirt/bin/virsh",
-      libvirtUri = "qemu:///session")
-    let consoleArgv = b.buildConsoleCaptureArgs(
-      "repro-test-boot-libvirt-abc123", "/opt/util-linux/bin/script")
-    check consoleArgv[0] == "/opt/util-linux/bin/script"
-    check "--quiet" in consoleArgv
-    check "--flush" in consoleArgv
-    check "--command" in consoleArgv
-    let command = consoleArgv[consoleArgv.find("--command") + 1]
-    check "/opt/libvirt/bin/virsh" in command
-    check "qemu:///session" in command
-    check "repro-test-boot-libvirt-abc123" in command
+  test "transient boot honors UEFI generation and explicit NixOS firmware":
+    let spec = BootMediaSpec(
+      kind: bmkQcow2,
+      generation: 2,
+      secureBootEnabled: false,
+      extra: initTable[string, string]())
+    let argv = transientBootFirmwareArgs(spec,
+      "/nix/store/ovmf/FV/OVMF_CODE.fd",
+      "/nix/store/ovmf/FV/OVMF_VARS.fd")
+    check argv[0] == "--boot"
+    check "loader=/nix/store/ovmf/FV/OVMF_CODE.fd" in argv[1]
+    check "loader.secure=no" in argv[1]
+    check "nvram.template=/nix/store/ovmf/FV/OVMF_VARS.fd" in argv[1]
+
+  test "legacy transient boot does not request UEFI firmware":
+    let spec = BootMediaSpec(kind: bmkQcow2, generation: 1)
+    check transientBootFirmwareArgs(spec).len == 0
+
+  test "transient graphical consoles are loopback-only":
+    let vnc = transientBootGraphicsArgs(BootMediaSpec(
+      graphics: bgVnc, videoModel: "virtio"))
+    check vnc == @["--graphics", "vnc,listen=127.0.0.1",
+                   "--video", "virtio"]
+    let headless = transientBootGraphicsArgs(BootMediaSpec())
+    check headless == @["--graphics", "none"]
 
   test "installArgvTraceShim raises a clear M4 Phase B error":
     let b = newLibvirtBackend()

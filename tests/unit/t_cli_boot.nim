@@ -10,12 +10,33 @@ suite "CLI boot media":
       "--source-image", "images",
       "--kind", "qcow2",
       "--expect", "systemd",
+      "--generation", "2",
+      "--graphics", "vnc",
+      "--video", "virtio",
+      "--viewer",
       "--timeout-sec", "90"])
     check opts.subcommand == "boot"
     check opts.sourceImage == "images"
     check opts.mediaKind == "qcow2"
     check opts.expectPattern == "systemd"
+    check opts.generation == 2
+    check opts.graphics == "vnc"
+    check opts.videoModel == "virtio"
+    check opts.viewer
     check opts.timeoutSec == 90
+
+  test "boot graphics and firmware defaults are explicit":
+    let opts = parseCliOpts(@["boot", "--source-image", "reproos.qcow2",
+                              "--keep"])
+    check opts.generation == 2
+    check opts.graphics == "none"
+    check opts.videoModel == "virtio"
+
+  test "invalid boot generation and graphics are rejected":
+    expect ValueError:
+      discard parseCliOpts(@["boot", "--generation", "3"])
+    expect ValueError:
+      discard parseCliOpts(@["boot", "--graphics", "public-vnc"])
 
   test "media kind is inferred from supported extensions":
     check parseBootMediaKind("auto", "reproos.iso") == bmkIso

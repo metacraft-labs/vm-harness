@@ -69,7 +69,7 @@
 ## helpers can run anywhere. Backend *registration* is unconditional,
 ## but ``probeAvailability`` returns false on non-Linux hosts.
 
-import std/[options, os, osproc, sequtils, streams, strtabs,
+import std/[algorithm, options, os, osproc, sequtils, streams, strtabs,
             strutils, tables, times]
 import ../types
 import ../auto
@@ -1498,8 +1498,9 @@ method stopAndCleanup*(b: LibvirtBackend, vm: VmHandle,
   ## never touched (only the ``.overlay.qcow2`` is removed).
   when defined(linux):
     let isEphemeral = vm.extra.getOrDefault("ephemeral", "") == "true"
+    let isTransientBoot = vm.baseline == "<boot-from-media>"
     try:
-      if isEphemeral:
+      if isEphemeral or isTransientBoot:
         # Force-stop immediately — a per-job VM has no state worth a
         # graceful ACPI shutdown, and it may already have powered itself
         # off (the tiny golden's init calls ``poweroff -f``).
@@ -1611,9 +1612,8 @@ method importBaseline*(b: LibvirtBackend, srcDir: string): seq[string] =
 # M1.5 — bootFromMedia + serial-stream primitives.
 #
 # The base method handles ISO and qcow2 BootMediaSpec.kind values via
-# virt-install --import; serial-stream capture is deferred to M4
-# Phase B (the implementation pattern mirrors hyperv.nim's named-pipe
-# wiring but uses QEMU's `-serial pty` + `virsh console` instead).
+# virt-install. Libvirt writes the serial stream to a durable host file from
+# the first firmware byte, and the assertion path incrementally polls it.
 
 const BootDomainNamePrefix* = "repro-test-boot-libvirt-"
 
@@ -1624,26 +1624,126 @@ proc newBootDomainName(prefix: string = BootDomainNamePrefix): string =
   prefix & toHex(int64(epochTime() * 1000.0) and 0xFFFFFF'i64, 6).toLowerAscii()
 
 proc transientBootCompatibilityArgs*(): seq[string] =
-  ## Flags required by current virt-install releases and by the serial
-  ## assertion contract used after a transient domain starts.
-  @["--osinfo", "detect=on,require=off",
-    "--console", "pty,target_type=serial"]
+  ## Flags required by current virt-install releases.
+  @["--osinfo", "detect=on,require=off"]
 
-proc buildConsoleCaptureArgs*(b: LibvirtBackend, vmName: string,
-                              scriptCmd = "script"): seq[string] =
-  ## ``virsh console`` rejects redirected stdio unless it has a controlling
-  ## terminal. util-linux ``script`` supplies that PTY and forwards its duplex
-  ## stream to the harness process.
-  let consoleCommand = @[b.virshCmd, "--connect", b.libvirtUri,
-                         "console", vmName, "--force"]
-                       .mapIt(quoteShell(it)).join(" ")
-  @[scriptCmd, "--quiet", "--flush", "--command", consoleCommand, "/dev/null"]
+proc transientBootSerialArgs*(serialLogPath: string): seq[string] =
+  ## Let QEMU own the durable serial log from the first firmware byte. This
+  ## avoids losing early diagnostics while a separate console client attaches.
+  @["--serial", "file,path=" & serialLogPath]
+
+proc transientBootFirmwareArgs*(spec: BootMediaSpec,
+                                loaderPath = "",
+                                nvramTemplate = ""): seq[string] =
+  ## Translate the cross-backend generation contract to virt-install. An
+  ## explicit loader pair avoids firmware-autodetection gaps on NixOS hosts.
+  let generation = if spec.generation > 0: spec.generation else: 2
+  if generation notin [1, 2]:
+    raise newException(ValueError,
+      "BootMediaSpec.generation must be 1 or 2")
+  if generation == 1:
+    return @[]
+  if (loaderPath.len == 0) != (nvramTemplate.len == 0):
+    raise newException(ValueError,
+      "UEFI boot requires both a loader and an NVRAM template")
+  if loaderPath.len == 0:
+    return @["--boot", "uefi"]
+  let secure = if spec.secureBootEnabled: "yes" else: "no"
+  @["--boot", "loader=" & loaderPath &
+      ",loader.readonly=yes,loader.type=pflash,loader.secure=" & secure &
+      ",nvram.template=" & nvramTemplate]
+
+proc transientBootGraphicsArgs*(spec: BootMediaSpec): seq[string] =
+  ## Graphical consoles listen on loopback only. ``virtio`` is broadly
+  ## supported by modern Linux guests while callers can select another model.
+  let videoModel = if spec.videoModel.len > 0: spec.videoModel else: "virtio"
+  case spec.graphics
+  of bgNone:
+    @["--graphics", "none"]
+  of bgVnc:
+    @["--graphics", "vnc,listen=127.0.0.1", "--video", videoModel]
+  of bgSpice:
+    @["--graphics", "spice,listen=127.0.0.1", "--video", videoModel]
+
+proc resolveTransientOvmf(spec: BootMediaSpec): tuple[loader, nvram: string] =
+  ## Resolve OVMF without assuming that libvirt's firmware descriptor search
+  ## path includes Nix store packages. Explicit CLI flags and environment
+  ## variables take precedence over conventional distro locations.
+  let generation = if spec.generation > 0: spec.generation else: 2
+  if generation != 2:
+    return
+
+  proc acceptPair(loader, nvram: string): bool =
+    if loader.len == 0 and nvram.len == 0:
+      return false
+    if loader.len == 0 or nvram.len == 0:
+      raise newException(ValueError,
+        "UEFI boot requires both a loader and an NVRAM template")
+    if not fileExists(loader):
+      raise newException(IOError, "UEFI loader does not exist: " & loader)
+    if not fileExists(nvram):
+      raise newException(IOError,
+        "UEFI NVRAM template does not exist: " & nvram)
+    result = true
+
+  let explicitLoader = spec.extra.getOrDefault("uefiLoader")
+  let explicitNvram = spec.extra.getOrDefault("uefiNvramTemplate")
+  if acceptPair(explicitLoader, explicitNvram):
+    return (explicitLoader, explicitNvram)
+
+  let envLoader = getEnv("VMH_OVMF_CODE")
+  let envNvram = getEnv("VMH_OVMF_VARS")
+  if acceptPair(envLoader, envNvram):
+    return (envLoader, envNvram)
+
+  const conventionalPairs = [
+    ("/run/libvirt/nix-ovmf/edk2-x86_64-code.fd",
+     "/run/libvirt/nix-ovmf/edk2-i386-vars.fd"),
+    ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
+    ("/usr/share/edk2/ovmf/OVMF_CODE.fd",
+     "/usr/share/edk2/ovmf/OVMF_VARS.fd"),
+    ("/usr/share/edk2/x64/OVMF_CODE.fd",
+     "/usr/share/edk2/x64/OVMF_VARS.fd"),
+  ]
+  for pair in conventionalPairs:
+    if fileExists(pair[0]) and fileExists(pair[1]):
+      return pair
+
+  when defined(linux):
+    var nixLoaders = toSeq(
+      walkPattern("/nix/store/*-OVMF-*-fd/FV/OVMF_CODE.fd"))
+    nixLoaders.sort()
+    for loader in nixLoaders.reversed():
+      let nvram = loader.parentDir / "OVMF_VARS.fd"
+      if fileExists(nvram):
+        return (loader, nvram)
+
+  # Let virt-install try its native firmware descriptors. Its error includes
+  # distro-specific remediation when none are installed.
+  return ("", "")
 
 type
   LibvirtSerialStream* = ref object of SerialStream
     buf*: SerialLineBuffer
-    consoleProc*: Process
-    reader*: PipeReader
+    fileOffset*: int64
+
+proc pumpSerialFile(s: LibvirtSerialStream) =
+  if s == nil or not fileExists(s.logPath):
+    return
+  try:
+    let size = getFileSize(s.logPath)
+    if size < s.fileOffset:
+      s.fileOffset = 0
+    if size <= s.fileOffset:
+      return
+    var f = open(s.logPath, fmRead)
+    defer: f.close()
+    setFilePos(f, s.fileOffset)
+    let bytes = f.readAll()
+    s.fileOffset += bytes.len.int64
+    s.buf.feed(bytes)
+  except CatchableError:
+    discard
 
 method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
   ## *Transient boot from media*
@@ -1653,9 +1753,9 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
   ## ``bmkVhdx``) and the ISO path (``bmkIso``); rootfs tarballs are
   ## WSL-only.
   ##
-  ## *Important*: this method returns a started VmHandle but does NOT
-  ## capture serial output — that is the captureSerial path, deferred
-  ## to M4 Phase B. The handle MUST be passed to ``stopAndCleanup``.
+  ## *Important*: this method returns a started VmHandle but does not begin
+  ## polling its file-backed serial output. Pass the handle to
+  ## ``captureSerial`` and always finish with ``stopAndCleanup``.
   when defined(linux):
     if spec.kind == bmkRootfsTar:
       raise newException(BackendUnavailableError,
@@ -1673,6 +1773,37 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
         "' for safety-sweep coverage (got '" & domainName & "')")
     let mem = if spec.memoryMB > 0: spec.memoryMB else: 2048
     let cpus = if spec.cpus > 0: spec.cpus else: 2
+    let serialLogPath = if spec.serialLogPath.len > 0:
+                          spec.serialLogPath
+                        else:
+                          getTempDir() / "repro-boot-harness" /
+                            (domainName & ".serial.log")
+    let serialLogDir = parentDir(serialLogPath)
+    if serialLogDir.len > 0:
+      createDir(serialLogDir)
+    if fileExists(serialLogPath):
+      removeFile(serialLogPath)
+    writeFile(serialLogPath, "")
+    setFilePermissions(serialLogPath, {
+      fpUserRead, fpUserWrite,
+      fpGroupRead, fpGroupWrite,
+      fpOthersRead, fpOthersWrite})
+
+    let ovmf = resolveTransientOvmf(spec)
+    var attachedMediaPath = spec.mediaPath
+    if spec.kind == bmkQcow2:
+      createDir(b.imagePoolDir)
+      attachedMediaPath = b.domainDiskPath(domainName)
+      if fileExists(attachedMediaPath):
+        removeFile(attachedMediaPath)
+      let overlay = runProcessCapture(@[
+        b.qemuImgCmd, "create", "-f", "qcow2",
+        "-b", absolutePath(spec.mediaPath), "-F", "qcow2",
+        attachedMediaPath], timeoutSec = 120)
+      if overlay.exitCode != 0:
+        raise newVmHarnessError($b.id, lpStartup,
+          "LibvirtBackend.bootFromMedia: qemu-img overlay failed (exit " &
+          $overlay.exitCode & "): " & overlay.stdout)
 
     var argv: seq[string] = @[
       b.virtInstallCmd,
@@ -1680,18 +1811,19 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
       "--name", domainName,
       "--memory", $mem,
       "--vcpus", $cpus,
-      "--cpu", "host",
+      "--cpu", "host-model",
       "--machine", "q35",
       "--network", "none",   # transient boot — no network exposure
-      "--graphics", "none",
-      "--noautoconsole",
-      "--noreboot"]
+      "--noautoconsole"]
+    argv.add(transientBootFirmwareArgs(spec, ovmf.loader, ovmf.nvram))
+    argv.add(transientBootGraphicsArgs(spec))
     argv.add(transientBootCompatibilityArgs())
+    argv.add(transientBootSerialArgs(serialLogPath))
     case spec.kind
     of bmkQcow2, bmkVhdx:
       argv.add("--import")
       argv.add("--disk")
-      argv.add("path=" & spec.mediaPath & ",format=qcow2,bus=virtio")
+      argv.add("path=" & attachedMediaPath & ",format=qcow2,bus=virtio")
     of bmkIso:
       # Empty boot disk; we boot off the CD.
       argv.add("--disk")
@@ -1718,11 +1850,9 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
 
     var extra = initTable[string, string]()
     extra["mediaPath"] = spec.mediaPath
-    extra["serialLogPath"] = if spec.serialLogPath.len > 0:
-                               spec.serialLogPath
-                             else:
-                               getTempDir() / "repro-boot-harness" /
-                                 (domainName & ".serial.log")
+    if attachedMediaPath != spec.mediaPath:
+      extra["transientDiskPath"] = attachedMediaPath
+    extra["serialLogPath"] = serialLogPath
     result = VmHandle(
       backend: b,
       name: domainName,
@@ -1737,25 +1867,15 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
       "LibvirtBackend.bootFromMedia requires a Linux host")
 
 method captureSerial*(b: LibvirtBackend, vm: VmHandle): SerialStream =
-  ## Attach to the transient domain's first serial console. ``virt-install``
-  ## creates the PTY; ``virsh console`` provides a portable duplex stream.
+  ## Poll the file-backed serial device created with the domain. QEMU writes
+  ## it before this method returns, so early firmware failures remain visible.
   when defined(linux):
     let logPath = vm.extra.getOrDefault("serialLogPath")
-    let scriptCmd = findExe("script")
-    if scriptCmd.len == 0:
-      raise newException(BackendUnavailableError,
-        "LibvirtBackend.captureSerial requires util-linux script on PATH")
-    let argv = b.buildConsoleCaptureArgs(vm.name, scriptCmd)
-    let p = startProcess(argv[0], args = argv[1 .. ^1],
-                         options = {poUsePath, poStdErrToStdOut})
-    let buf = newSerialLineBuffer(logPath)
-    let reader = startPipeReader(p, buf)
     result = LibvirtSerialStream(
       vm: vm,
       logPath: logPath,
-      buf: buf,
-      consoleProc: p,
-      reader: reader)
+      buf: newSerialLineBuffer(),
+      fileOffset: 0)
   else:
     raise newException(BackendUnavailableError,
       "LibvirtBackend.captureSerial requires a Linux host")
@@ -1764,24 +1884,16 @@ method expectLine*(b: LibvirtBackend, stream: SerialStream,
                    pattern: string, timeoutSec: int = 60): SerialMatch =
   when defined(linux):
     let s = LibvirtSerialStream(stream)
-    result = expectLineImpl(s.buf, pattern, timeoutSec * 1000, 100, nil)
+    result = expectLineImpl(s.buf, pattern, timeoutSec * 1000, 100,
+      proc() = pumpSerialFile(s))
   else:
     raise newException(BackendUnavailableError,
       "LibvirtBackend.expectLine requires a Linux host")
 
 method serialSend*(b: LibvirtBackend, stream: SerialStream, text: string) =
   when defined(linux):
-    let s = LibvirtSerialStream(stream)
-    if s.consoleProc == nil:
-      raise newException(ValueError, "serialSend: stream not started")
-    try:
-      let input = s.consoleProc.inputStream
-      if input != nil:
-        input.write(text)
-        input.flush()
-    except CatchableError as e:
-      raise newVmHarnessError($b.id, lpExec,
-        "LibvirtBackend.serialSend failed: " & e.msg)
+    raise newException(BackendUnavailableError,
+      "LibvirtBackend.serialSend is unavailable for file-backed capture")
   else:
     raise newException(BackendUnavailableError,
       "LibvirtBackend.serialSend requires a Linux host")
@@ -1789,21 +1901,8 @@ method serialSend*(b: LibvirtBackend, stream: SerialStream, text: string) =
 method closeSerial*(b: LibvirtBackend, stream: SerialStream) =
   when defined(linux):
     let s = LibvirtSerialStream(stream)
-    try:
-      if s.consoleProc != nil and s.consoleProc.running:
-        try: s.consoleProc.terminate()
-        except CatchableError: discard
-        try: discard s.consoleProc.waitForExit(timeout = 3000)
-        except CatchableError: discard
-      if s.reader != nil:
-        try: stopPipeReader(s.reader)
-        except CatchableError: discard
-      if s.consoleProc != nil:
-        try: s.consoleProc.close()
-        except CatchableError: discard
+    if s != nil and s.buf != nil:
       s.buf.close()
-    except CatchableError:
-      discard
   else:
     discard
 
