@@ -202,6 +202,21 @@ type
     memoryMB*: int                  ## defaults to 2048 when zero
     generation*: int                ## Hyper-V: 1 or 2 (UEFI); defaults to 2
     secureBootEnabled*: bool        ## defaults to false (most test ISOs unsigned)
+    tpmEnabled*: bool               ## attach a virtual TPM 2.0 (Gen 2 / UEFI only)
+      ## Windows 11 Setup refuses to install without TPM 2.0 — it fails at the
+      ## "This PC can't run Windows 11" gate long before the autounattend's
+      ## specialize pass runs, so this is not optional for a Win11 guest.
+      ##
+      ## Backends realise it differently and it is NOT free: on Hyper-V the vTPM
+      ## is backed by a key protector that must be created BEFORE the device is
+      ## added (``Set-VMKeyProtector`` then ``Enable-VMTPM``), which is why this
+      ## is a spec field rather than something a caller can bolt on afterwards.
+      ## libvirt/QEMU back it with swtpm instead.
+    diskGB*: int                    ## bmkIso scratch boot disk size; defaults to 8
+      ## Only consulted when the boot disk is created by the backend (bmkIso);
+      ## for bmkVhdx the media IS the disk and this is ignored. The 8 GB default
+      ## suits a Linux install ISO; Windows 11 requires >= 64 GB and Setup's
+      ## partitioning step fails on anything smaller.
     serialPipeName*: string         ## backend may override; otherwise auto-generated
     serialLogPath*: string          ## host-side path where serial bytes are logged
     extra*: Table[string, string]   ## backend-specific scratch (post-import scripts...)
