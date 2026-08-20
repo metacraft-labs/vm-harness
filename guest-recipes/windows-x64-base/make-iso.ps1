@@ -5,7 +5,7 @@
 .DESCRIPTION
   The Linux side of this recipe reaches for genisoimage/mkisofs/xorriso.
   None of those exist on Windows, and the Microsoft-blessed alternative
-  (oscdimg) ships only in the Windows ADK — a separate multi-hundred-MB
+  (oscdimg) ships only in the Windows ADK -- a separate multi-hundred-MB
   install we would then have to declare and converge on every build host.
 
   So: use oscdimg when it happens to be on PATH, and otherwise fall back
@@ -14,7 +14,7 @@
   creation a zero-dependency operation on any Windows host, which is what
   lets `build-golden.ps1` run on a freshly-imaged box.
 
-  This writes a DATA ISO only — no El Torito boot record. That is all the
+  This writes a DATA ISO only -- no El Torito boot record. That is all the
   autounattend seed needs (Windows Setup scans attached media for
   autounattend.xml at the root); do not reuse this to remaster a bootable
   Windows install ISO.
