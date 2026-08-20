@@ -700,6 +700,15 @@ proc applyDefaults(spec: var BaselineSpec, opts: CliOpts) =
   if opts.ephemeralPrefix.len > 0:
     spec.backendOptions["ephemeralPrefix"] = opts.ephemeralPrefix
 
+proc resolveBootOutputDir*(requested: string;
+                           processId = getCurrentProcessId()): string =
+  ## Separate default boot artifacts for concurrent CLI invocations. Explicit
+  ## output directories remain caller-owned and intentionally reusable.
+  if requested.len > 0:
+    absolutePath(requested)
+  else:
+    getTempDir() / ("vm-harness-boot-" & $processId)
+
 proc cmdBoot(opts: CliOpts): int =
   if not opts.keepEphemeral and opts.expectPattern.len == 0 and
       not opts.viewer and opts.screenshotPath.len == 0:
@@ -725,10 +734,7 @@ proc cmdBoot(opts: CliOpts): int =
     raise newException(BackendUnavailableError,
       "boot: backend is not available: " & $id)
 
-  let outputDir = if opts.outputDir.len > 0:
-                    absolutePath(opts.outputDir)
-                  else:
-                    getTempDir() / "vm-harness-boot"
+  let outputDir = resolveBootOutputDir(opts.outputDir)
   createDir(outputDir)
   var extra = initTable[string, string]()
   if opts.uefiLoader.len > 0:

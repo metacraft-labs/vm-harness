@@ -36,6 +36,16 @@ suite "CLI boot media":
     check opts.graphics == "none"
     check opts.videoModel == "virtio"
 
+  test "default boot artifacts are isolated between CLI processes":
+    let first = resolveBootOutputDir("", 101)
+    let second = resolveBootOutputDir("", 202)
+    check first == getTempDir() / "vm-harness-boot-101"
+    check second == getTempDir() / "vm-harness-boot-202"
+    check first != second
+
+    let explicit = getTempDir() / "vm-harness-explicit-output"
+    check resolveBootOutputDir(explicit, 303) == absolutePath(explicit)
+
   test "invalid boot generation and graphics are rejected":
     expect ValueError:
       discard parseCliOpts(@["boot", "--generation", "3"])
