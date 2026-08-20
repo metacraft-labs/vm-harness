@@ -29,14 +29,25 @@ host×guest):
 **Consuming from another repo?** Depend on the Nim library or shell out to the
 `vm-harness` CLI for guest lifecycle, and keep only your task-specific logic on
 top (per the three-tier ownership below). The Rust port is `agent-harbor`
-`crates/ah-vm`. Full surface: `README.md` and `docs/design.md`.
+`crates/ah-vm`.
 
-## Contributor guide
+## Which guide do you want?
 
-`vm-harness` is the Nim library and CLI for cross-platform VM lifecycle
-orchestration. Backend implementations live in `src/vm_harness/backends/`, guest
-bootstrap assets live in `guest-scripts/` and `guest-recipes/`, and tests are
-split across `tests/unit/`, `tests/integration/`, and `tests/e2e/`.
+- **To _use_ vm-harness** (drive VMs from the CLI or from your own harness code,
+  set its parameters, author a guest recipe) → read the **user guide** at
+  [`docs/user-guide/README.md`](docs/user-guide/README.md). Start with
+  [Getting started](docs/user-guide/getting-started.md); the parameter contract
+  consumers depend on is the [Parameters catalog](docs/user-guide/parameters.md).
+
+- **To _enhance / develop_ vm-harness itself** → the developing guide follows
+  below, and the canonical internal architecture reference is
+  [`docs/design.md`](docs/design.md).
+
+## Developing vm-harness
+
+Backend implementations live in `src/vm_harness/backends/`, guest bootstrap
+assets live in `guest-scripts/` and `guest-recipes/`, and tests are split across
+`tests/unit/`, `tests/integration/`, and `tests/e2e/`.
 
 Use the Nix development environment (`direnv allow` or `nix develop`) and the
 repository entrypoints below:

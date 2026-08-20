@@ -1,0 +1,25 @@
+# Nim / nimble
+nimcache/
+nimblecache/
+*.exe
+build/
+public/
+.nimble/
+
+# `nim c -r` writes an extensionless native binary next to the source.
+src/ssr
+src/build
+src/dev
+tests/test_site_builds
+
+# `nim js` writes its output next to the compiled .nim file unless -o: is given.
+src/**/*.js
+tests/**/*.js
+
+# direnv / nix
+.direnv/
+.env
+result
+
+# framework-src symlink created by config.nims for the SSR entry
+src/framework_src

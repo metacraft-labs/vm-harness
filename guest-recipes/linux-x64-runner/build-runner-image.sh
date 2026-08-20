@@ -57,6 +57,9 @@
 #   VMH_CLOUD_BASE      local cloud base alias   (default: im2-debian-cloud)
 #   VMH_CLOUD_REMOTE    remote to copy if base
 #                       absent                   (default: images:debian/12/cloud)
+#   VMH_CLOUD_MAX_AGE_DAYS  refresh the cached cloud base once it is older than
+#                       this many days, so its apt index does not go stale past a
+#                       Debian point release (0 = never refresh) (default: 7)
 #   VMH_RUNNER_VERSION  actions runner version   (default: 2.335.1)
 #   VMH_RUNNER_TARBALL  pre-downloaded tarball    (default: download to /tmp)
 #   VMH_RUNNER_CACHE    in-image runner dir       (default: /home/<user>/actions-runner)
@@ -283,8 +286,24 @@ build_repro_bundle() {
   log "HR-REPRO: built repro-portable at $REPRO_BUNDLE ($(du -h "$REPRO_BUNDLE" | cut -f1))"
 }
 
-# 0. Ensure a local cloud base image exists (cloud-init present). If not,
-#    copy it from the remote (host has network).
+# 0. Ensure a local cloud base image exists (cloud-init present) AND is not
+#    stale. The base is cached across builds, but a cached image whose apt index
+#    predates a Debian point release makes the in-container `apt-get` below fail:
+#    once the pool rotates, the exact package versions the stale index pins are
+#    removed and `apt-get install` 404s (e.g. `libcurl3-gnutls …deb12u14 404`).
+#    So refresh the cache once it is older than VMH_CLOUD_MAX_AGE_DAYS (default 7;
+#    set 0 to disable the age check and always reuse an existing cache). If not
+#    present (or just deleted for age), copy it from the remote (host has network).
+CLOUD_MAX_AGE_DAYS="${VMH_CLOUD_MAX_AGE_DAYS:-7}"
+if [ "$CLOUD_MAX_AGE_DAYS" -gt 0 ] && "${INCUS[@]}" image info "$CLOUD_BASE" >/dev/null 2>&1; then
+  uploaded="$("${INCUS[@]}" image info "$CLOUD_BASE" 2>/dev/null | sed -n 's/.*Uploaded: //p' | head -1)"
+  up_epoch="$(date -d "$uploaded" +%s 2>/dev/null || echo 0)"
+  if [ "$up_epoch" -gt 0 ] && \
+     [ $(( $(date +%s) - up_epoch )) -gt $(( CLOUD_MAX_AGE_DAYS * 86400 )) ]; then
+    log "cloud base '$CLOUD_BASE' is older than ${CLOUD_MAX_AGE_DAYS}d (uploaded ${uploaded}); refreshing to avoid a stale apt index"
+    "${INCUS[@]}" image delete "$CLOUD_BASE" >/dev/null 2>&1 || true
+  fi
+fi
 if ! "${INCUS[@]}" image info "$CLOUD_BASE" >/dev/null 2>&1; then
   log "cloud base '$CLOUD_BASE' absent; copying $CLOUD_REMOTE -> local:$CLOUD_BASE"
   "${INCUS[@]}" image copy "$CLOUD_REMOTE" local: --alias "$CLOUD_BASE"
