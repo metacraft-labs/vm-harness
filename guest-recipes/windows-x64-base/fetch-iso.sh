@@ -28,8 +28,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+LIB_DIR="$(cd -- "${SCRIPT_DIR}/../lib" &>/dev/null && pwd)"
 # shellcheck source=../lib/validate-uefi-iso.sh
-. "${SCRIPT_DIR}/../lib/validate-uefi-iso.sh"
+. "${LIB_DIR}/validate-uefi-iso.sh"
 BUILD_DIR="${SCRIPT_DIR}/build"
 VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
 VIRTIO_OUT="${BUILD_DIR}/virtio-win.iso"
@@ -58,10 +59,34 @@ else
   sha256sum "${VIRTIO_OUT}" | head -1
 fi
 
-# 2. Windows ISO — verify the operator-supplied file exists.
+# 2. Windows ISO — fetch it when absent, falling back to the manual path.
+#
+# This used to refuse outright ("bring your own"), which left a hand-carried
+# artifact in the middle of an otherwise declarative pipeline. ../lib/
+# fetch-windows-iso.sh drives Microsoft's own download API (via Fido) and is
+# safe to call unconditionally: it no-ops when the file is already there.
+#
+# It is best-effort ON PURPOSE. Microsoft rate-limits link generation hard,
+# so a failure here is often transient and must not be mistaken for a broken
+# recipe — we fall through to the manual instructions rather than exiting on
+# its behalf.
+if [[ ! -f "${WIN11_ISO_PATH}" ]]; then
+  if [[ -x "${LIB_DIR}/fetch-windows-iso.sh" ]]; then
+    echo "fetch-iso: ${WIN11_ISO_PATH} absent — attempting automated download"
+    "${LIB_DIR}/fetch-windows-iso.sh" \
+      --win 11 --arch x64 --edition Pro --lang English \
+      --output "${WIN11_ISO_PATH}" || true
+  fi
+fi
+
 if [[ ! -f "${WIN11_ISO_PATH}" ]]; then
   cat >&2 <<EOF
 fetch-iso: Windows 11 x64 ISO not found at ${WIN11_ISO_PATH}.
+
+The automated download (../lib/fetch-windows-iso.sh) did not produce it.
+That is most often Microsoft's rate limiter rather than a defect — it
+clears on its own — so re-running later is worth trying before doing this
+by hand.
 
 Microsoft does not provide a stable no-login direct URL for the
 Win11 x64 install media. The operator must download it manually:
