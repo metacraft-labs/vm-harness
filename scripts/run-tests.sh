@@ -14,6 +14,7 @@ run_nim r --hints:off tests/unit/t_guest_scripts.nim
 run_nim r --hints:off tests/unit/t_cli_probe.nim
 run_nim r --hints:off tests/unit/t_cli_boot.nim
 run_nim r --hints:off tests/unit/t_hyperv_parsers.nim
+run_nim r --hints:off tests/unit/t_hyperv_boot_media.nim
 run_nim r --hints:off tests/unit/t_wsl_parsers.nim
 run_nim r --hints:off tests/unit/t_utm_parsers.nim
 run_nim r --hints:off tests/unit/t_tart_shared_dirs.nim

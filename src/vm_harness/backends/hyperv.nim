@@ -648,6 +648,12 @@ proc buildNewBootVmCommand*(b: HyperVBackend, spec: BootMediaSpec,
   let cpus  = if spec.cpus > 0: spec.cpus else: 2
   let generation = if spec.generation > 0: spec.generation else: 2
   let secureBoot = if spec.secureBootEnabled: "On" else: "Off"
+  # A vTPM is a Gen-2/UEFI device: Hyper-V rejects Enable-VMTPM on Gen 1, so
+  # honour the request only where it can be satisfied rather than emitting a
+  # command that always throws.
+  let wantTpm = spec.tpmEnabled and generation == 2
+  let tpmFlag = if wantTpm: "$true" else: "$false"
+  let diskGB = if spec.diskGB > 0: spec.diskGB else: 8
   let mediaPath = spec.mediaPath
   let seedIsoPath = spec.secondaryIsoPath
   result = &"""$ErrorActionPreference = 'Stop'
@@ -663,6 +669,8 @@ $memMB   = {memMB}
 $cpus    = {cpus}
 $kind    = '{kindStr}'
 $secureBoot = '{secureBoot}'
+$wantTpm = {tpmFlag}
+$diskGB  = {diskGB}
 
 if (-not $vmName.StartsWith('{psQuote(BootVmNamePrefix)}')) {{
   throw "SAFETY: refusing to create boot VM with name $vmName (must start with '{psQuote(BootVmNamePrefix)}')"
@@ -685,7 +693,7 @@ if ($kind -eq 'iso') {{
   # Localize every ISO into the transient VM directory while this process
   # still has access to the caller's source path.
   Copy-Item -LiteralPath $mediaPath -Destination $scratchIso -Force
-  New-VHD -Path $scratchVhdx -SizeBytes 8GB -Dynamic | Out-Null
+  New-VHD -Path $scratchVhdx -SizeBytes ([int64]$diskGB * 1GB) -Dynamic | Out-Null
 }} elseif ($kind -eq 'qcow2') {{
   if (-not (Test-Path -LiteralPath $mediaPath)) {{
     throw "bmkQcow2 requires mediaPath to exist: $mediaPath"
@@ -696,6 +704,8 @@ if ($kind -eq 'iso') {{
   }}
   $dir = Split-Path -Parent $scratchVhdx
   if (-not (Test-Path $dir)) {{ New-Item -ItemType Directory -Force -Path $dir | Out-Null }}
+  # No $diskGB here on purpose: the converted image's size comes from the
+  # source qcow2, so honouring diskGB would mean a separate resize step.
   & $qemuImg.Source convert -f qcow2 -O vhdx -o subformat=dynamic $mediaPath $scratchVhdx
   if ($LASTEXITCODE -ne 0) {{
     throw "qemu-img failed to convert QCOW2 to VHDX (exit $LASTEXITCODE)"
@@ -726,6 +736,25 @@ try {{ Get-VMNetworkAdapter -VMName $vmName -ErrorAction SilentlyContinue | Remo
 if ($gen -eq 2) {{
   try {{ Set-VMFirmware -VMName $vmName -EnableSecureBoot $secureBoot }}
   catch {{ Write-Warning "Set-VMFirmware -EnableSecureBoot $secureBoot failed: $($_.Exception.Message)" }}
+}}
+
+# Virtual TPM 2.0. Required by Windows 11 Setup, which gates on it before any
+# unattend pass runs, so a missing vTPM presents as a hung install at the
+# "This PC can't run Windows 11" dialog rather than as an error we could catch.
+#
+# The two calls are ordered and both are mandatory: Enable-VMTPM fails unless
+# the VM already carries a key protector, so the protector is created first.
+# -NewLocalKeyProtector generates one bound to THIS host's key storage, which
+# needs no Host Guardian Service — the trade-off is that the VM's saved state
+# becomes host-bound. That is fine for the ephemeral-runner clone plan (every
+# Export-VM/Import-VM round-trip stays on one box) but it does mean a vTPM
+# guest cannot be moved to another host without re-keying, so this failure is
+# raised rather than warned past: silently producing a TPM-less VM would only
+# defer the error to the install hang described above.
+if ($wantTpm) {{
+  if ($gen -ne 2) {{ throw "vTPM requires a Generation 2 VM (got generation $gen)" }}
+  Set-VMKeyProtector -VMName $vmName -NewLocalKeyProtector
+  Enable-VMTPM -VMName $vmName
 }}
 
 Set-VMComPort -VMName $vmName -Number 1 -Path $pipe

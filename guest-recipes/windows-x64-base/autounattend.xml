@@ -70,6 +70,32 @@
       <UserLocale>en-US</UserLocale>
     </component>
 
+    <!-- VMH:VIRTIO-DRIVERS:BEGIN
+         Everything between this marker and its matching closing marker
+         below is QEMU/KVM-specific, and is stripped when
+         build-autounattend-iso.sh runs with the hyperv target.
+
+         Two things you cannot write inside this comment:
+           * the closing marker's literal text. The stripper matches
+             line-wise, so naming it here would end the skipped region
+             a few lines in and leave the driver component behind.
+           * a double hyphen (as in a long command-line flag). XML
+             forbids it inside comments, so it makes the whole unattend
+             file unparseable — and the hyperv build would still look
+             fine, because this comment is exactly what gets stripped
+             there. Only the libvirt build would break.
+
+         Hyper-V presents its storage and network adapters over VMBus,
+         and the drivers for those are in-box in every supported Windows
+         image, so Setup sees the boot disk with no injection at all. The
+         D:/E: paths below name a virtio-win CD that a Hyper-V VM has no
+         reason to be carrying — leaving them in would at best log
+         "driver path not found" into setupact.log on every build, and at
+         worst mask a real driver problem behind expected noise.
+
+         Markers rather than a second copy of this 400-line file on
+         purpose: two unattend files drift, and the drift shows up as a
+         silent install hang an hour into a golden build. -->
     <component name="Microsoft-Windows-PnpCustomizationsWinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <!-- Inject virtio storage + network drivers in the WindowsPE
            phase so Setup can see the virtio-blk system disk and the
@@ -112,6 +138,7 @@
         </PathAndCredentials>
       </DriverPaths>
     </component>
+    <!-- VMH:VIRTIO-DRIVERS:END -->
 
     <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <!-- Bypass Win11's system-requirements check. Required when the

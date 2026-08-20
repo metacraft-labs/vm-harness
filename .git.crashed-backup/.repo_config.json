@@ -1,0 +1,32 @@
+{
+  "core.repositoryformatversion": [
+    "1"
+  ],
+  "core.filemode": [
+    "false"
+  ],
+  "core.symlinks": [
+    "false"
+  ],
+  "core.ignorecase": [
+    "true"
+  ],
+  "filter.lfs.smudge": [
+    "git-lfs smudge --skip -- %f"
+  ],
+  "filter.lfs.process": [
+    "git-lfs filter-process --skip"
+  ],
+  "extensions.preciousobjects": [
+    "true"
+  ],
+  "remote.metacraft-labs.url": [
+    "https://github.com/metacraft-labs/vm-harness"
+  ],
+  "remote.metacraft-labs.projectname": [
+    "vm-harness"
+  ],
+  "remote.metacraft-labs.fetch": [
+    "+refs/heads/*:refs/remotes/metacraft-labs/*"
+  ]
+}
