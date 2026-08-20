@@ -76,7 +76,7 @@ package vm_harness:
     when defined(macosx):
       "clang"
     else:
-      "gcc >=12"
+      "gcc"
 
   runtimeDeps:
     when defined(linux):
