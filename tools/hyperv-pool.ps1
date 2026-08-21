@@ -137,6 +137,43 @@ function Wait-GuestSettled {
     Log "[$Vm] WARNING: never went fully quiet in ${TimeoutSec}s; checkpointing anyway"
 }
 
+function Disable-GuestUpdateChurn {
+    param([string]$Vm)
+    # Windows Update is the enemy of a warm baseline, in two distinct ways.
+    #
+    # At construction: the golden had network while installing, so updates
+    # were staged, and every member then applies them on FIRST BOOT --
+    # observed on repro-pool-001, parked on "You are 1% there. Please keep
+    # your computer on." past a 1200s timeout, while member 000 booted
+    # minutes earlier and sailed through. That alone makes construction
+    # non-deterministic.
+    #
+    # At run time it is worse: a member that decides to install updates
+    # DURING a job burns CPU, can reboot the guest mid-run, and does it
+    # differently on each member. An ephemeral CI runner does not want to be
+    # patched; it wants to be identical to its baseline every single time.
+    # Patching belongs to rebuilding the golden -- a deliberate, scheduled
+    # act -- not to a runner mid-build.
+    $cred = Get-GuestCred
+    Invoke-Command -VMName $Vm -Credential $cred -ScriptBlock {
+        $ErrorActionPreference = 'SilentlyContinue'
+        foreach ($svc in 'wuauserv','UsoSvc','WaaSMedicSvc','DoSvc') {
+            Stop-Service -Name $svc -Force
+            Set-Service -Name $svc -StartupType Disabled
+        }
+        # Policy too, so the orchestrator cannot re-enable the services.
+        $k = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+        New-Item -Path $k -Force | Out-Null
+        Set-ItemProperty -Path $k -Name NoAutoUpdate -Value 1 -Type DWord
+        Set-ItemProperty -Path $k -Name AUOptions    -Value 1 -Type DWord
+        foreach ($tp in '\Microsoft\Windows\UpdateOrchestrator\',
+                        '\Microsoft\Windows\WindowsUpdate\') {
+            Get-ScheduledTask -TaskPath $tp | Disable-ScheduledTask | Out-Null
+        }
+    } | Out-Null
+    Log "[$Vm] Windows Update disabled (services + policy + orchestrator tasks)"
+}
+
 function Get-PoolMembers {
     Get-VM | Where-Object { $_.Name -like "$MemberPrefix-*" } | Sort-Object Name
 }
@@ -182,7 +219,8 @@ if ($Rebaseline) {
         $n = $m.Name
         if ((Get-VM -Name $n).State -ne 'Running') { Start-VM -Name $n }
         $readyIn = Wait-GuestReady -Vm $n -TimeoutSec $ReadyTimeoutSec
-        Log "[$n] reachable in ${readyIn}s; waiting for it to settle"
+        Log "[$n] reachable in ${readyIn}s"
+        Disable-GuestUpdateChurn -Vm $n
         Wait-GuestSettled -Vm $n
         $old = Get-VMSnapshot -VMName $n -Name 'baseline' -ErrorAction SilentlyContinue
         if ($old) { Remove-VMSnapshot -VMSnapshot $old }
@@ -298,6 +336,11 @@ for ($i = 0; $i -lt $Size; $i++) {
         $readyIn = Wait-GuestReady -Vm $name -TimeoutSec $ReadyTimeoutSec
         Log "[$name] back up in ${readyIn}s"
     }
+
+    # Silence Windows Update BEFORE settling, or the settle loop simply
+    # waits out one update cycle and the baseline captures a guest that is
+    # about to start another.
+    Disable-GuestUpdateChurn -Vm $name
 
     # Let it settle so the captured state is genuinely warm, then checkpoint
     # THIS member's own baseline. A fixed sleep is not enough -- see
