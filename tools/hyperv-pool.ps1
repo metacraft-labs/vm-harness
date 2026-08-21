@@ -43,6 +43,7 @@ param(
     [switch]$Construct,
     [switch]$Status,
     [switch]$Teardown,
+    [switch]$Rebaseline,
     [string]$SourceVm = 'repro-golden-win11-x64',
     [string]$SourceCheckpoint = 'pool-source',
     [int]$Size = 2,
@@ -97,6 +98,45 @@ function Wait-GuestReady {
     throw "guest '$Vm' was not reachable over PowerShell Direct within ${TimeoutSec}s"
 }
 
+function Wait-GuestSettled {
+    param([string]$Vm, [int]$TimeoutSec = 600)
+    # A baseline is only as good as the state it captures. Checkpointing a
+    # guest that is still churning through post-boot work bakes that churn
+    # into the baseline, so EVERY restore resumes into it and pays the cost
+    # again -- measured: a baseline taken 10s after a reboot recycled to
+    # ready in 40s, against 6.7s for a settled one, and the first PowerShell
+    # Direct session after the restore broke outright.
+    #
+    # So wait for the guest to actually go quiet: host-side CPU low for
+    # several consecutive samples AND a fast PowerShell Direct round trip.
+    # CPU alone is not enough (it dips between bursts) and responsiveness
+    # alone is not enough (it answers slowly while busy).
+    $cred = Get-GuestCred
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $quiet = 0
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        Start-Sleep -Seconds 10
+        $cpu = (Get-VM -Name $Vm).CPUUsage
+        $rt = [Diagnostics.Stopwatch]::StartNew()
+        $responsive = $false
+        try {
+            Invoke-Command -VMName $Vm -Credential $cred -ScriptBlock { 1 } -ErrorAction Stop | Out-Null
+            $responsive = $true
+        } catch { }
+        $rt.Stop()
+        if ($cpu -le 5 -and $responsive -and $rt.Elapsed.TotalSeconds -lt 3) {
+            $quiet++
+            if ($quiet -ge 3) {
+                Log "[$Vm] settled after $([math]::Round($sw.Elapsed.TotalSeconds,1))s (cpu=$cpu%, rtt=$([math]::Round($rt.Elapsed.TotalSeconds,2))s)"
+                return
+            }
+        } else {
+            $quiet = 0
+        }
+    }
+    Log "[$Vm] WARNING: never went fully quiet in ${TimeoutSec}s; checkpointing anyway"
+}
+
 function Get-PoolMembers {
     Get-VM | Where-Object { $_.Name -like "$MemberPrefix-*" } | Sort-Object Name
 }
@@ -128,6 +168,35 @@ if ($Teardown) {
         Remove-Item -LiteralPath $PoolRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
     Log "pool torn down"
+    return
+}
+
+# ------------------------------------------------------------ rebaseline ---
+# Recapture a member's baseline from its CURRENT state, without rebuilding
+# it. Needed because a baseline can be bad without the member being bad --
+# most commonly captured before the guest finished settling, which makes
+# every subsequent restore slow. Rebuilding a member costs ~10 minutes;
+# this costs seconds.
+if ($Rebaseline) {
+    foreach ($m in Get-PoolMembers) {
+        $n = $m.Name
+        if ((Get-VM -Name $n).State -ne 'Running') { Start-VM -Name $n }
+        $readyIn = Wait-GuestReady -Vm $n -TimeoutSec $ReadyTimeoutSec
+        Log "[$n] reachable in ${readyIn}s; waiting for it to settle"
+        Wait-GuestSettled -Vm $n
+        $old = Get-VMSnapshot -VMName $n -Name 'baseline' -ErrorAction SilentlyContinue
+        if ($old) { Remove-VMSnapshot -VMSnapshot $old }
+        $d = (Get-Date).AddMinutes(20)
+        while ((Get-Date) -lt $d) {
+            Start-Sleep -Seconds 5
+            if (-not ((Get-VM -Name $n).Status -match 'Merg') -and
+                -not (Get-VMSnapshot -VMName $n -Name 'baseline' -ErrorAction SilentlyContinue)) { break }
+        }
+        $t = [Diagnostics.Stopwatch]::StartNew()
+        Checkpoint-VM -Name $n -SnapshotName 'baseline'
+        $t.Stop()
+        Log "[$n] baseline recaptured in $([math]::Round($t.Elapsed.TotalSeconds,2))s"
+    }
     return
 }
 
@@ -173,6 +242,15 @@ for ($i = 0; $i -lt $Size; $i++) {
         continue
     }
     $dest = Join-Path $PoolRoot $name
+    # Clear anything a previous failed attempt left behind. Remove-VM deletes
+    # the VM but NOT its disks, so a member that died mid-construction leaves
+    # a vhd/ directory that makes the next Import-VM fail with "the file
+    # ... already exists" -- which reads as a bug in the import rather than
+    # as leftovers, and blocks every subsequent retry.
+    if (Test-Path -LiteralPath $dest) {
+        Log "[$name] clearing stale files from a previous attempt"
+        Remove-Item -LiteralPath $dest -Recurse -Force
+    }
     Log "[$name] importing"
     $t = [Diagnostics.Stopwatch]::StartNew()
     $imp = Import-VM -Path $srcVmcx.FullName -Copy -GenerateNewId `
@@ -222,8 +300,9 @@ for ($i = 0; $i -lt $Size; $i++) {
     }
 
     # Let it settle so the captured state is genuinely warm, then checkpoint
-    # THIS member's own baseline.
-    Start-Sleep -Seconds 10
+    # THIS member's own baseline. A fixed sleep is not enough -- see
+    # Wait-GuestSettled for what a too-early capture costs on every restore.
+    Wait-GuestSettled -Vm $name
     $t = [Diagnostics.Stopwatch]::StartNew()
     Checkpoint-VM -Name $name -SnapshotName 'baseline'
     $t.Stop()
