@@ -1673,7 +1673,8 @@ proc transientBootNetworkArgs*(spec: BootMediaSpec): seq[string] =
   if spec.sshForwardPort notin 1 .. 65535:
     raise newException(ValueError,
       "BootMediaSpec.sshForwardPort must be 0 or a TCP port from 1 to 65535")
-  @["--network", "user,model=virtio,portForward0.proto=tcp," &
+  @["--network", "user,model=virtio,backend.type=passt," &
+    "portForward0.proto=tcp," &
     "portForward0.address=127.0.0.1," &
     "portForward0.range0.start=" & $spec.sshForwardPort & "," &
     "portForward0.range0.to=22"]

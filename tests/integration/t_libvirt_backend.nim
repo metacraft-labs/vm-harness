@@ -225,7 +225,7 @@ suite "LibvirtBackend smoke (no live virsh)":
       sshForwardPort: 22022))
     check forwarded == @[
       "--network",
-      "user,model=virtio,portForward0.proto=tcp," &
+      "user,model=virtio,backend.type=passt,portForward0.proto=tcp," &
         "portForward0.address=127.0.0.1," &
         "portForward0.range0.start=22022,portForward0.range0.to=22"]
     expect ValueError:
