@@ -125,7 +125,7 @@ runs no workload measures the floor rather than the operating point.
 
 | backend | clone/task | recycle/task | selected | basis |
 | ------- | ---------- | ------------ | -------- | ----- |
-| **Hyper-V** | ~50 s (`Export-VM` + `Import-VM`, real copy) | **7-14 s** (restore + resume, carries RAM) | **`recycle-from-pool-per-task`** | measured 2026-08-21, win-ci-bare-001 |
+| **Hyper-V** | ~50 s (`Export-VM` + `Import-VM`, real copy) | **12-19 s** (restore + resume, carries RAM; see the variance section before quoting a lower number) | **`recycle-from-pool-per-task`** | measured 2026-08-21, win-ci-bare-001 |
 | **libvirt** | **O(1)** (`qemu-img create -b <golden>` CoW overlay) + full guest boot | *not implemented* (`snapshot`/`restoreSnapshot` raise; M4 Phase B) | **`clone-per-task`** (forced) | read from `libvirt.nim:652`, `1561-1602` |
 | **incus** | `incus copy` / launch from image | implemented, but cost = f(storage driver) | **undecided** | needs measurement on `dir` vs ZFS |
 
@@ -221,6 +221,36 @@ What IS stable: the resume half. Once the restore completes, the guest is
 reachable again in 4-9s across every measurement, because it resumes from
 RAM rather than booting.
 
+#### A lead: every wild outlier was on a long-uptime host
+
+After an unplanned host reboot the same pool was re-measured, six recycles
+in fifteen minutes, host uptime under 20 minutes throughout:
+
+```
+recycle (restore + resume), seconds
+12.32   13.34   14.25   16.82   19.00   18.03
+of which resume:
+ 1.63    2.35    1.13    2.00    2.15    1.96
+```
+
+So restore alone was 10.7-16.9s, in a 1.6x band — against the 79x spread of
+the earlier series. Every measurement over 50s came from a host that had
+been up for hours and had built and torn down VMs the whole time; none of
+tonight's did.
+
+**This is a correlation with n=1 reboot, not a cause.** It is recorded
+because it is the first variable that tracks the outliers after contention,
+delta size and memory-image size were each checked and ruled out, and it
+suggests where to look: host-side state that accumulates with uptime
+(free-memory fragmentation, the VMMS working set, or Hyper-V's own page
+file), rather than anything about the member being restored. The test that
+would settle it is cheap — recycle on a freshly booted host, then again
+after a day of pool churn, same member, same delta.
+
+Until that is done, plan against the **upper** end. Even 19s beats the 36s
+cold boot, and it beats it off the critical path, so the selection stands
+either way; what is not yet safe is quoting a single-digit figure.
+
 ### Golden hygiene is not optional
 
 Two properties had to be forced into the image before the pool behaved:
@@ -250,6 +280,38 @@ Both succeeded, on distinct guests with distinct identities
 (172.27.90.110 and 172.27.93.235). And member 000 served its second job
 AFTER a recycle -- the state looking clean is not the same as the member
 still working, so the repeat is the property worth proving.
+
+### The daemon, and a false-green it used to hide
+
+`hyperv-scale-set.ps1` with no `-Member` is the multi-member form: it starts
+one worker PROCESS per member and supervises them. Proven 2026-08-21 after a
+host reboot -- two workers, two jobs dispatched 7s apart, served
+concurrently by REPRO-POOL-000 and REPRO-POOL-001, both green, both
+recycled, `all workers exited`.
+
+That run exposed a defect worth recording, because it is the failure mode
+this design is most exposed to. Member 001's runner served its job
+successfully but then exited with `Failed to create a session. The runner
+registration has been deleted from the server`, rather than the clean
+`Removed .runner` / `exit with 0 return code` that 000 printed. The job was
+fine; the runner's exit was not.
+
+The serve loop treated **any** exit of `run.cmd` as "job finished". A
+listener that comes up, fails to create a session and leaves looks exactly
+the same from outside -- so the loop would have recycled, re-registered, and
+spun through registration tokens indefinitely while logging finished jobs
+and serving nothing. The loop now requires the runner's own
+`completed with result: <x>` line as proof a job ran, and treats its absence
+as a failed cycle. A job that ran and FAILED is still a success for this
+purpose: that is somebody's workflow failing, not a sick member, and it must
+not count toward parking.
+
+Verified by reproducing 001's exact transcript through the real script: the
+guard raised, the recovery restore ran (erasing the stub, which is how the
+restore proved itself real), and a second consecutive failure parked the
+member with the console-capture and rebaseline commands printed. Then a live
+job confirmed the success path still reports
+`job completed with result: Succeeded (runner exit 0)`.
 
 Construction from the HARDENED golden is roughly an order of magnitude
 faster than from the unhardened one, because members no longer spend their

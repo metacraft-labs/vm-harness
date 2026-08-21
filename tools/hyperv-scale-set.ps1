@@ -30,8 +30,10 @@
 
   WHERE THE RECYCLE COST SITS. Step 4 runs after the job finishes, not
   before the next one starts, so a member is already warm when work arrives.
-  Measured on this host: restore + resume is 7-14 s, against a 36 s cold
-  boot -- but only if it happens off the critical path.
+  Measured on this host: restore + resume is 12-19 s, against a 36 s cold
+  boot -- but only if it happens off the critical path. That figure is
+  variable and has been seen far higher on a long-uptime host; see
+  docs/pool-algorithms.md before planning against a smaller one.
 
 .PARAMETER Org
   GitHub org the runners register with.
@@ -143,16 +145,39 @@ function Invoke-OneJobCycle {
 
     Log "[$Vm] runner online, waiting for a job (timeout ${JobTimeoutSec}s)"
     # run.cmd blocks until the single job completes, then exits. Its exit is
-    # the signal that the task is done -- no polling of GitHub required.
-    $out = Invoke-Command -VMName $Vm -Credential $cred -ScriptBlock {
+    # the signal that the task is done -- but it is NOT proof that a job ever
+    # ran. A runner whose registration is rejected exits just as promptly, so
+    # both the exit code and the transcript are checked below.
+    $r = Invoke-Command -VMName $Vm -Credential $cred -ScriptBlock {
         param($dir)
         Set-Location $dir
-        & "$dir\run.cmd" 2>&1 | Out-String
+        $text = & "$dir\run.cmd" 2>&1 | Out-String
+        [pscustomobject]@{ Out = $text; ExitCode = $LASTEXITCODE }
     } -ArgumentList $RunnerDir
-    Log "[$Vm] runner exited; job finished"
+    Log "[$Vm] runner exited"
+    $out = $r.Out
     if ($out) {
         ($out -split "`n" | Select-Object -Last 6) | ForEach-Object { Log "[$Vm]   $($_.Trim())" }
     }
+
+    # DID A JOB ACTUALLY RUN? The runner prints this line exactly once per job
+    # it executes, carrying that job's own conclusion. Treating "run.cmd
+    # exited" as "job finished" was wrong: a listener that comes up, fails to
+    # create a session and leaves looks identical, so the loop would recycle
+    # and immediately re-register -- spinning through registration tokens
+    # while the log reported finished jobs and the pool served nothing. That
+    # is precisely the false-green this campaign keeps hitting, so an
+    # unserved cycle must raise and count toward the parking threshold.
+    $m = [regex]::Match($out, 'completed with result:\s*(\w+)')
+    if (-not $m.Success) {
+        $tail = ($out -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 1) -replace '\s+', ' '
+        throw "runner exited WITHOUT serving a job (exit code $($r.ExitCode)); last line: $tail"
+    }
+
+    # A job that FAILED is a legitimate outcome of somebody's workflow, not a
+    # sick member -- it must not count toward parking. Only "no job at all"
+    # indicts the member.
+    Log "[$Vm] job completed with result: $($m.Groups[1].Value) (runner exit $($r.ExitCode))"
 }
 
 # ------------------------------------------------------------------ main ---
@@ -245,6 +270,13 @@ try {
         foreach ($x in $procs) {
             if ($x.Process.HasExited -and -not $x.PSObject.Properties['Reported']) {
                 Add-Member -InputObject $x -NotePropertyName Reported -NotePropertyValue $true
+                # WaitForExit() returns immediately (the process is already
+                # gone), but it is what makes ExitCode readable: with
+                # Start-Process -PassThru the property stays empty until the
+                # handle is reaped, so this line used to log "code )" and tell
+                # an operator nothing about whether the worker finished its
+                # -Once cycle or died.
+                $x.Process.WaitForExit()
                 Log "[$($x.Member)] worker exited (code $($x.Process.ExitCode)) -- that member is no longer serving"
             }
         }
