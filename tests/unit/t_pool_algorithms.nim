@@ -23,8 +23,18 @@ proc mkPool(alg: PoolAlgorithm, size: int = 2): Pool =
   let b = newNoopBackend()
   var spec = BaselineSpec(name: "golden", guestOs: goLinux, guestArch: gaX86_64)
   b.provisionBaseline(spec)
-  newPool(PoolConfig(backend: b, baseline: "golden", algorithm: alg,
-                     size: size, readyTimeoutSec: 5))
+  var cfg = PoolConfig(backend: b, baseline: "golden", algorithm: alg,
+                       size: size, readyTimeoutSec: 5)
+  if alg == paRecycleFromPool:
+    # Supply distinct members explicitly, the way a real recycle-capable
+    # backend does. Without this the helper leans on noop's revertToBaseline,
+    # which names instances from epochTime() and so returns colliding names
+    # inside one fractional second -- which construct() then (correctly)
+    # rejects as aliasing. Testing the algorithm should not depend on the
+    # fake backend's clock resolution.
+    cfg.createMember = proc(idx: int): VmHandle =
+      VmHandle(backend: b, name: "pool-member-" & $idx, baseline: "golden")
+  newPool(cfg)
 
 suite "pool: the development-time backend selection":
   test "Hyper-V recycles; measured clone is no better than a cold boot":
@@ -165,3 +175,38 @@ suite "pool: describe is legible enough to log":
     let d = p.describe()
     check "recycle-from-pool-per-task" in d
     check "free=2" in d
+
+suite "pool: a backend that cannot create members fails loudly":
+  test "aliased members are refused rather than silently pooled":
+    # Reproduces the Hyper-V shape: revertToBaseline resets ONE long-lived
+    # guest, so every call returns the same instance. Without the guard the
+    # pool would report N members that all alias one VM, and releasing one
+    # would reset another's running task.
+    let b = newNoopBackend()
+    var spec = BaselineSpec(name: "golden", guestOs: goLinux, guestArch: gaX86_64)
+    b.provisionBaseline(spec)
+    let shared = VmHandle(backend: b, name: "the-one-and-only-vm",
+                          baseline: "golden")
+    let p = newPool(PoolConfig(
+      backend: b, baseline: "golden", algorithm: paRecycleFromPool,
+      size: 3, readyTimeoutSec: 5,
+      createMember: proc(idx: int): VmHandle = shared))
+    expect PoolError:
+      p.construct()
+
+  test "createMember is used when supplied, and distinct members pass":
+    let b = newNoopBackend()
+    var spec = BaselineSpec(name: "golden", guestOs: goLinux, guestArch: gaX86_64)
+    b.provisionBaseline(spec)
+    var made = 0
+    let p = newPool(PoolConfig(
+      backend: b, baseline: "golden", algorithm: paRecycleFromPool,
+      size: 3, readyTimeoutSec: 5,
+      createMember: proc(idx: int): VmHandle =
+        inc made
+        VmHandle(backend: b, name: "member-" & $idx, baseline: "golden")))
+    p.construct()
+    check made == 3
+    check p.members.len == 3
+    check p.members[0].name == "member-0"
+    check p.members[2].name == "member-2"

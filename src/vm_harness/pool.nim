@@ -75,6 +75,27 @@ type
     readyTimeoutSec*: int
     memberBaselinePrefix*: string
       ## Prefix for per-member checkpoint names. Defaults to `pool-baseline`.
+    createMember*: proc(idx: int): VmHandle {.closure.}
+      ## How to bring a NEW pool member into existence. Optional; when nil,
+      ## construction falls back to ``backend.revertToBaseline(baseline)``.
+      ##
+      ## It exists because `revertToBaseline` does not mean the same thing on
+      ## every backend, and the difference is fatal here rather than
+      ## cosmetic:
+      ##
+      ##   * libvirt / incus -- CREATE an instance (a fresh qcow2 CoW overlay
+      ##     over the golden, or a launched container). Calling it N times
+      ##     yields N guests, so the fallback is correct.
+      ##   * Hyper-V -- RESTORES a checkpoint on ONE fixed VM (`b.vmName`).
+      ##     Calling it N times yields the SAME guest N times, so the
+      ##     fallback would build a pool of N members that are all one VM:
+      ##     leases would alias, and releasing one would reset another's
+      ##     running task. Hyper-V must supply this, creating each member
+      ##     with Export-VM / Import-VM.
+      ##
+      ## ``construct`` verifies distinctness regardless, so a backend that
+      ## gets this wrong fails loudly instead of producing a pool that looks
+      ## full and silently corrupts tasks.
 
   Pool* = ref object
     cfg*: PoolConfig
@@ -154,7 +175,23 @@ proc construct*(p: Pool) =
     p.constructed = true
   of paRecycleFromPool:
     for i in 0 ..< p.cfg.size:
-      let vm = p.cfg.backend.revertToBaseline(p.cfg.baseline)
+      let vm =
+        if p.cfg.createMember != nil: p.cfg.createMember(i)
+        else: p.cfg.backend.revertToBaseline(p.cfg.baseline)
+
+      # Distinctness is checked, not trusted. A backend whose
+      # revertToBaseline RESETS one long-lived VM (Hyper-V) hands back the
+      # same guest every time; without this the pool would report N members,
+      # hand out N leases that all alias one guest, and releasing one would
+      # reset another's running task. Failing here beats corrupting tasks.
+      for prior in p.members:
+        if prior.name == vm.name:
+          raise newException(PoolError,
+            "pool member " & $i & " is the SAME instance as an earlier " &
+            "member (" & vm.name & "). This backend's revertToBaseline " &
+            "resets one long-lived guest rather than creating new ones, so " &
+            "it cannot build a pool -- supply PoolConfig.createMember.")
+
       p.cfg.backend.startAndAwaitReady(vm, timeoutSec = p.cfg.readyTimeoutSec)
       let snapName = p.memberBaselineName(i)
       # snapshotRunning, not snapshot: capturing the RUNNING state is what
