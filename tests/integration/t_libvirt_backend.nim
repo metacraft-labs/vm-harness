@@ -224,10 +224,10 @@ suite "LibvirtBackend smoke (no live virsh)":
     let forwarded = transientBootNetworkArgs(BootMediaSpec(
       sshForwardPort: 22022))
     check forwarded == @[
-      "--network",
-      "user,model=virtio,backend.type=passt,portForward0.proto=tcp," &
-        "portForward0.address=127.0.0.1," &
-        "portForward0.range0.start=22022,portForward0.range0.to=22"]
+      "--network", "none",
+      "--qemu-commandline=-netdev user,id=repro_user_net," &
+        "hostfwd=tcp:127.0.0.1:22022-:22 " &
+        "-device virtio-net-pci,netdev=repro_user_net"]
     expect ValueError:
       discard transientBootNetworkArgs(BootMediaSpec(sshForwardPort: -1))
 
