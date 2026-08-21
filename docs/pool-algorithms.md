@@ -1,0 +1,176 @@
+# Pool algorithms: `clone-per-task` and `recycle-from-pool-per-task`
+
+An ephemeral-runner host can serve tasks one of two ways. They are not
+interchangeable, they are not tunable at runtime, and which one is right is
+**a property of the backend's storage** rather than of the workload.
+
+This page defines both, lists the primitives each requires, states the rule
+for choosing between them, and records the per-backend selection.
+
+**The selection is made at development time, from measurement, and then
+fixed in code.** It is deliberately NOT a runtime probe: the cost of the
+primitives is a stable property of a backend plus its storage driver, so
+paying to rediscover it on every host start would be waste, and a
+backend that silently switched algorithms would make latency
+irreproducible.
+
+## The two algorithms
+
+### `clone-per-task`
+
+```
+per task:
+  create instance from golden      <- the whole cost lives here
+  start + await ready
+  ... run the task ...
+  destroy instance
+```
+
+Every task gets an instance that has never existed before. Isolation is
+absolute and free: there is no prior state to leak, because there is no
+prior state.
+
+Required primitives:
+
+| primitive | why |
+| --------- | --- |
+| create-from-golden | the per-task cost |
+| start + await-ready | the guest must reach a usable state |
+| destroy | reclaim |
+
+### `recycle-from-pool-per-task`
+
+```
+once, at pool construction:
+  for each of N members:
+    create instance from golden
+    boot it so it acquires its OWN identity
+    checkpoint it as that member's baseline
+
+per task:
+  claim an already-warm member
+  ... run the task ...
+  restore member to its baseline    <- the whole cost lives here
+```
+
+Members are long-lived; only their *state* is ephemeral.
+
+Required primitives:
+
+| primitive | why |
+| --------- | --- |
+| checkpoint (ideally capturing RAM) | defines the baseline |
+| restore-to-checkpoint | the per-task cost |
+| resume/start + await-ready | back to usable |
+| create-from-golden | still needed, but only to change CAPACITY |
+
+Two properties are easy to miss and both matter:
+
+- **The recycle can happen when a task FINISHES, not when the next one
+  starts.** A member is already warm and waiting when work arrives, so the
+  restore cost sits *between* tasks rather than in front of them, and
+  per-task start latency approaches zero.
+- **Each member must be checkpointed with its own identity.** A checkpoint
+  that captures RAM captures the machine name and DHCP lease with it, so N
+  members restored from ONE shared checkpoint collide. The pool is N
+  distinct baselines, not N copies of one. Measured, not assumed — see the
+  identity-collision section of
+  [`per-backend-notes/hyperv-snapshot-benchmarks.md`](per-backend-notes/hyperv-snapshot-benchmarks.md).
+
+## The decision rule
+
+> **Recycle when restoring is cheaper than creating. Clone when it is not.**
+
+Compare, per task:
+
+```
+clone-per-task    = create_from_golden + start_to_ready
+recycle-per-task  = restore_to_baseline + resume_to_ready
+```
+
+Pool construction (N x create) is excluded from the comparison on purpose:
+it is amortised over the host's lifetime and nobody waits on it.
+
+Three secondary considerations, applied only when the primary comparison is
+close:
+
+- **Disk.** `recycle` holds N instances resident; `clone` holds one golden
+  plus whatever is in flight. On copy-on-write storage this difference
+  mostly disappears.
+- **Isolation confidence.** `clone` is isolated by construction. `recycle`
+  is isolated only as far as the restore is complete — it must be verified,
+  not assumed, that a restore actually discards task residue.
+- **Blast radius of a stuck member.** A `recycle` pool can wedge a member
+  and lose capacity until something notices; `clone` has no such state.
+
+## Measurement protocol
+
+Both numbers come from `tools/bench/`, which drives the library API and
+emits JSON so results are comparable across hosts:
+
+- `snapshot_revert_bench.nim` measures the **recycle** loop
+  (`restoreSnapshot` + `startAndAwaitReady`, N iterations, median reported).
+- `clone_per_task_bench.nim` measures the **clone** loop
+  (`revertToBaseline` producing a fresh instance + `startAndAwaitReady` +
+  `stopAndCleanup(deleteVm = true)`).
+
+Report the **median**, not the mean: both loops have occasional multi-second
+outliers from host I/O, and a mean lets one outlier decide an architecture.
+
+Measure with a realistic guest. Recycle cost scales with how much the task
+wrote — restoring discards the checkpoint's delta — so a benchmark that
+runs no workload measures the floor rather than the operating point.
+
+## Per-backend selection
+
+| backend | clone/task | recycle/task | selected | basis |
+| ------- | ---------- | ------------ | -------- | ----- |
+| **Hyper-V** | ~50 s (`Export-VM` + `Import-VM`, real copy) | **7-14 s** (restore + resume, carries RAM) | **`recycle-from-pool-per-task`** | measured 2026-08-21, win-ci-bare-001 |
+| **libvirt** | **O(1)** (`qemu-img create -b <golden>` CoW overlay) + full guest boot | *not implemented* (`snapshot`/`restoreSnapshot` raise; M4 Phase B) | **`clone-per-task`** (forced) | read from `libvirt.nim:652`, `1561-1602` |
+| **incus** | `incus copy` / launch from image | implemented, but cost = f(storage driver) | **undecided** | needs measurement on `dir` vs ZFS |
+
+### Hyper-V — `recycle`, and the margin is large
+
+Cloning is a real file copy: `Import-VM` alone is 28.67 s, making
+clone-per-task 35.9 s — no better than the 36 s cold boot it was supposed
+to avoid. Recycling restores a checkpoint carrying RAM, so a member resumes
+in ~5 s. Selection is not marginal.
+
+### libvirt — `clone`, but only because `recycle` does not exist
+
+Here the premise inverts: cloning is already O(1), a qcow2 CoW overlay over
+the golden with no bytes copied. But `snapshot`, `snapshotRunning`,
+`restoreSnapshot`, `listSnapshots` and `removeSnapshot` are unimplemented
+stubs that raise, so `recycle` cannot be selected at all.
+
+This makes the selection **forced rather than reasoned**, and the
+consequence is specific: a libvirt guest always pays a full boot. For Linux
+guests that is minor. For the **Windows** guest on `eph-win-x64` it is the
+same image Hyper-V takes from 36 s to 5 s, so the unclaimed win is large.
+Implementing M4 Phase B (`virsh snapshot-create-as --live`, or
+`virsh save`/`restore`) would make libvirt a genuine choice rather than a
+default, and it should be re-measured then.
+
+### incus — undecided, and blocked on storage
+
+The primitives exist (`incus.nim:598-665`). Two things stop a selection:
+
+1. **A container has no boot to skip.** It starts in about a second, so
+   there is no 36 s -> 5 s prize; recycling buys *isolation*, not speed.
+   `snapshotRunning` already takes a filesystem rather than a CRIU stateful
+   snapshot for exactly this reason.
+2. **The default pool is `driver = "dir"`**
+   (`per-backend-notes/incus.md:36`), where an instance is a plain
+   directory tree — so `incus snapshot create` and `restore` are full
+   recursive copies whose cost scales with rootfs size. On ZFS the same
+   commands are metadata-only (snapshot / rollback), and `incus copy`
+   becomes a `zfs clone`, so BOTH sides of the comparison change at once.
+
+So incus is the one backend where the answer genuinely flips with
+configuration. The comparison to beat there is **delete-and-relaunch**, not
+cold boot — on `dir`, restoring a rootfs can plausibly cost more than
+launching a fresh container from the image, which would make `recycle` a
+pessimisation.
+
+Re-measure when the ZFS storage driver lands, on both drivers, and record
+the result here.

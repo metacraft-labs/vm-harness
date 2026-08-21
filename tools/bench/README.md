@@ -50,3 +50,31 @@ median per-iteration totals around 5.4 s.
   `importBaseline` and times the import + resume cycle on the
   receiving host. See `docs/per-backend-notes/hyperv-snapshot-benchmarks.md`
   for the cold-boot artifact-caching model the bench measures.
+
+### `clone_per_task_bench.nim`
+
+The counterpart to `snapshot_revert_bench.nim`. That one measures the inner
+loop of `recycle-from-pool-per-task`; this measures the inner loop of
+`clone-per-task` (`revertToBaseline` -> `startAndAwaitReady` ->
+`stopAndCleanup(deleteVm = true)`). Emits the same JSON shape and the same
+median so the two are directly comparable.
+
+Running both against a backend is what decides which algorithm that backend
+should use. The rule, and the recorded per-backend selections, are in
+[`docs/pool-algorithms.md`](../../docs/pool-algorithms.md).
+
+```
+nim c -r tools/bench/clone_per_task_bench.nim \
+  --backend libvirt --baseline golden-win11 --iterations 5
+```
+
+Two flags worth knowing:
+
+- `--assert-creates-instance` fails the run unless each iteration produced a
+  DISTINCT instance. `revertToBaseline` means "produce a task-ready guest",
+  which some backends satisfy by creating one (libvirt, incus) and others by
+  resetting a long-lived one (Hyper-V). Only the former is clone-per-task,
+  and without this flag the difference is invisible in the output.
+- `--provision-baseline` provisions before measuring, so the program can be
+  smoke-tested against `--backend noop` with no hypervisor. Real backends
+  already have their baseline and should not pass it.
