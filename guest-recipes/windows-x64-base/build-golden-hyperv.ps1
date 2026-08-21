@@ -266,6 +266,62 @@ if ((Get-VM -Name $VmName).State -ne 'Off') {
     Stop-VM -Name $VmName -TurnOff -Force
 }
 
+# --- harden the image before capture ----------------------------------------
+#
+# Two properties that are part of the ALGORITHM, not setup taste. Both were
+# learned by shipping a golden without them.
+#
+# 1. WINDOWS UPDATE OFF. The install has network for ~an hour, so updates get
+#    staged into the image. Every guest cloned from it then applies them on
+#    FIRST BOOT -- one pool member sat at "You're 1% there. Please keep your
+#    computer on." for over an hour -- and, worse, would apply them MID-JOB,
+#    burning CPU and potentially rebooting under a build. An ephemeral runner
+#    wants to be identical to its baseline every cycle; patching belongs to
+#    rebuilding this image, which is a deliberate scheduled act.
+#    Measured effect on a pool member: settle time 280s -> 33s, checkpoint
+#    92.78s -> 7.9s.
+#
+# 2. POWERSHELL 7. The first real job dispatched at this pool failed with
+#    "pwsh: command not found" -- the image shipped Windows PowerShell 5.1
+#    only, and a great many workflows use `shell: pwsh`. A registration-only
+#    smoke test would have gone green on a runner that fails every real job.
+$pwHard = ConvertTo-SecureString $GuestPassword -AsPlainText -Force
+$credHard = New-Object System.Management.Automation.PSCredential($GuestUser, $pwHard)
+
+Log "disabling Windows Update in the image"
+Invoke-Command -VMName $VmName -Credential $credHard -ScriptBlock {
+    $ErrorActionPreference = 'SilentlyContinue'
+    foreach ($s in 'wuauserv','UsoSvc','WaaSMedicSvc','DoSvc') {
+        Stop-Service -Name $s -Force
+        Set-Service -Name $s -StartupType Disabled
+    }
+    $k = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+    New-Item -Path $k -Force | Out-Null
+    Set-ItemProperty -Path $k -Name NoAutoUpdate -Value 1 -Type DWord
+    Set-ItemProperty -Path $k -Name AUOptions    -Value 1 -Type DWord
+    foreach ($tp in '\Microsoft\Windows\UpdateOrchestrator\',
+                    '\Microsoft\Windows\WindowsUpdate\') {
+        Get-ScheduledTask -TaskPath $tp | Disable-ScheduledTask | Out-Null
+    }
+} | Out-Null
+
+$pwshProvisioner = Join-Path $PSScriptRoot '..\lib\provision-pwsh.ps1'
+if (Test-Path -LiteralPath $pwshProvisioner) {
+    Log "installing PowerShell 7 (pinned by ../lib/provision-pwsh.ps1)"
+    $body = Get-Content -Raw -LiteralPath $pwshProvisioner
+    Invoke-Command -VMName $VmName -Credential $credHard -ScriptBlock {
+        param($b)
+        Set-Content -LiteralPath 'C:\Windows\Temp\provision-pwsh.ps1' -Value $b -Encoding UTF8
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\Windows\Temp\provision-pwsh.ps1' 2>&1 | Out-String
+    } -ArgumentList $body | Out-Null
+    $hasPwsh = Invoke-Command -VMName $VmName -Credential $credHard -ScriptBlock { Test-Path 'C:\pwsh\pwsh.exe' }
+    if (-not $hasPwsh) { throw "PowerShell 7 provisioning did not produce C:\pwsh\pwsh.exe" }
+    Log "PowerShell 7 present"
+} else {
+    Log "WARNING: ../lib/provision-pwsh.ps1 not found; image will ship WITHOUT pwsh"
+    Log "         and any workflow using 'shell: pwsh' will fail on it."
+}
+
 # --- capture ---------------------------------------------------------------
 Log "detaching install media"
 Get-VMDvdDrive -VMName $VmName | Remove-VMDvdDrive
