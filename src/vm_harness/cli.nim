@@ -56,6 +56,9 @@ type
     viewer*: bool
     screenshotPath*: string
     screenshotDelaySec*: int
+    sshForwardPort*: int
+    sshUser*: string
+    sshPasswordEnv*: string
     cpus*: int
     memoryMB*: int
     diskGB*: int
@@ -230,6 +233,11 @@ Common flags:
                                   --expect succeeds, then clean up by default.
   --screenshot-delay-sec <int>   `boot`: settle time after --expect before
                                   capture (default: 0).
+  --ssh-forward-port <port|auto> `boot`: forward a loopback host port to
+                                  guest TCP 22 (`auto` selects a free port).
+  --ssh-user <name>              `boot`: SSH user for a command after `--`.
+  --ssh-password-env <name>      `boot`: environment variable containing the
+                                  SSH password; the value is never put in argv.
   --cpus <int>                    Backend default applies when omitted.
   --vcpu <int>                    Alias for --cpus (canonical libvirt M4 shape).
   --memory-mb <int>
@@ -419,6 +427,20 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
         raise newException(ValueError,
           "--screenshot-delay-sec expects a non-negative integer")
       inc i
+    of "--ssh-forward-port":
+      inc i
+      if args[i] == "auto":
+        result.sshForwardPort = -1
+      else:
+        result.sshForwardPort = parseInt(args[i])
+        if result.sshForwardPort notin 1 .. 65535:
+          raise newException(ValueError,
+            "--ssh-forward-port expects auto or a TCP port from 1 to 65535")
+      inc i
+    of "--ssh-user":
+      inc i; result.sshUser = args[i]; inc i
+    of "--ssh-password-env":
+      inc i; result.sshPasswordEnv = args[i]; inc i
     of "--cpus", "--vcpu":
       # ``--vcpu`` is the canonical libvirt M4 spelling; ``--cpus`` is
       # the historical vm-harness spelling. Both produce the same
@@ -711,11 +733,12 @@ proc resolveBootOutputDir*(requested: string;
 
 proc cmdBoot(opts: CliOpts): int =
   if not opts.keepEphemeral and opts.expectPattern.len == 0 and
-      not opts.viewer and opts.screenshotPath.len == 0:
+      not opts.viewer and opts.screenshotPath.len == 0 and opts.cmd.len == 0:
     raise newException(ValueError,
       "boot: pass --keep to leave the VM running, --viewer for manual " &
       "inspection, --expect <regex> for a self-cleaning assertion, or " &
-      "--screenshot <path> for a self-cleaning graphical capture")
+      "--screenshot <path> or an SSH command after -- for a self-cleaning " &
+      "assertion")
   if opts.screenshotPath.len > 0 and opts.expectPattern.len == 0:
     raise newException(ValueError,
       "boot --screenshot requires --expect so capture has a readiness gate")
@@ -733,6 +756,35 @@ proc cmdBoot(opts: CliOpts): int =
   if not backend.probeAvailability():
     raise newException(BackendUnavailableError,
       "boot: backend is not available: " & $id)
+
+  var sshForwardPort = opts.sshForwardPort
+  if sshForwardPort == -1:
+    sshForwardPort = pickTcpPort(0)
+  if sshForwardPort != 0 and id != biLibvirt:
+    raise newException(BackendUnavailableError,
+      "boot: --ssh-forward-port is currently supported by libvirt")
+  if opts.cmd.len > 0:
+    if id != biLibvirt:
+      raise newException(BackendUnavailableError,
+        "boot: an SSH guest command is currently supported by libvirt")
+    if sshForwardPort == 0:
+      raise newException(ValueError,
+        "boot: a guest command requires --ssh-forward-port")
+    if opts.sshUser.len == 0:
+      raise newException(ValueError,
+        "boot: a guest command requires --ssh-user")
+    if opts.sshPasswordEnv.len == 0:
+      raise newException(ValueError,
+        "boot: a guest command requires --ssh-password-env")
+    let password = getEnv(opts.sshPasswordEnv)
+    if password.len == 0:
+      raise newException(ValueError,
+        "boot: SSH password environment variable is unset or empty: " &
+        opts.sshPasswordEnv)
+    let lb = LibvirtBackend(backend)
+    lb.sshPort = sshForwardPort
+    lb.sshUser = opts.sshUser
+    lb.sshPassword = password
 
   let outputDir = resolveBootOutputDir(opts.outputDir)
   createDir(outputDir)
@@ -758,6 +810,7 @@ proc cmdBoot(opts: CliOpts): int =
     secureBootEnabled: false,
     graphics: graphics,
     videoModel: opts.videoModel,
+    sshForwardPort: sshForwardPort,
     serialPipeName: "",
     serialLogPath: outputDir / "boot.serial.log",
     extra: extra)
@@ -798,6 +851,18 @@ proc cmdBoot(opts: CliOpts): int =
       logEvent(opts.logFormat, "info", "graphical console captured",
                {"backend": $id, "vm": vm.name,
                 "screenshot": screenshotPath})
+
+    if opts.cmd.len > 0:
+      let timeout = if opts.timeoutSec > 0: opts.timeoutSec else: 180
+      backend.startAndAwaitReady(vm, timeout)
+      let execution = backend.execInGuest(
+        vm, opts.envPairs, opts.cmd, timeoutSec = timeout)
+      if execution.stdout.len > 0:
+        stdout.write(execution.stdout)
+      if execution.stderr.len > 0:
+        stderr.write(execution.stderr)
+      if execution.exitCode != 0:
+        return execution.exitCode
 
     if opts.viewer:
       if id != biLibvirt:

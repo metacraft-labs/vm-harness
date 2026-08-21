@@ -48,6 +48,25 @@ proc applyDefaultsForTest(opts: CliOpts): BaselineSpec =
 
 suite "CLI libvirt M4 canonical-command flag plumbing":
 
+  test "boot SSH flags keep the password in an environment variable":
+    let opts = parseCliOpts(@[
+      "boot",
+      "--backend", "libvirt",
+      "--source-image", "reproos.qcow2",
+      "--ssh-forward-port", "auto",
+      "--ssh-user", "repro",
+      "--ssh-password-env", "REPROOS_SSH_PASSWORD",
+      "--", "hostname"])
+    check opts.sshForwardPort == -1
+    check opts.sshUser == "repro"
+    check opts.sshPasswordEnv == "REPROOS_SSH_PASSWORD"
+    check opts.cmd == @["hostname"]
+
+  test "boot rejects an invalid SSH forwarding port":
+    expect ValueError:
+      discard parseCliOpts(@[
+        "boot", "--ssh-forward-port", "65536"])
+
   test "resolveRecipeDir locates an in-tree guest-recipes/<id>/ directory":
     # Run from the repo root (nimble test always invokes nim from the
     # package's srcDir-adjacent root). The windows-x64-base recipe is

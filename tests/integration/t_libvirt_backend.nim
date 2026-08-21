@@ -218,6 +218,19 @@ suite "LibvirtBackend smoke (no live virsh)":
     let headless = transientBootGraphicsArgs(BootMediaSpec())
     check headless == @["--graphics", "none"]
 
+  test "transient SSH forwarding is explicit and loopback-only":
+    check transientBootNetworkArgs(BootMediaSpec()) ==
+      @["--network", "none"]
+    let forwarded = transientBootNetworkArgs(BootMediaSpec(
+      sshForwardPort: 22022))
+    check forwarded == @[
+      "--network",
+      "user,model=virtio,portForward0.proto=tcp," &
+        "portForward0.address=127.0.0.1," &
+        "portForward0.range0.start=22022,portForward0.range0.to=22"]
+    expect ValueError:
+      discard transientBootNetworkArgs(BootMediaSpec(sshForwardPort: -1))
+
   test "captureScreenshot writes a non-empty console frame":
     when defined(linux):
       let root = createTempDir("vmh-libvirt-screenshot", "")

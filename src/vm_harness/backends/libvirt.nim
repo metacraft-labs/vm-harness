@@ -1665,6 +1665,19 @@ proc transientBootGraphicsArgs*(spec: BootMediaSpec): seq[string] =
   of bgSpice:
     @["--graphics", "spice,listen=127.0.0.1", "--video", videoModel]
 
+proc transientBootNetworkArgs*(spec: BootMediaSpec): seq[string] =
+  ## Direct boots are network-isolated unless a caller explicitly requests an
+  ## SSH forward. The user-mode NIC remains reachable only through loopback.
+  if spec.sshForwardPort == 0:
+    return @["--network", "none"]
+  if spec.sshForwardPort notin 1 .. 65535:
+    raise newException(ValueError,
+      "BootMediaSpec.sshForwardPort must be 0 or a TCP port from 1 to 65535")
+  @["--network", "user,model=virtio,portForward0.proto=tcp," &
+    "portForward0.address=127.0.0.1," &
+    "portForward0.range0.start=" & $spec.sshForwardPort & "," &
+    "portForward0.range0.to=22"]
+
 proc resolveTransientOvmf(spec: BootMediaSpec): tuple[loader, nvram: string] =
   ## Resolve OVMF without assuming that libvirt's firmware descriptor search
   ## path includes Nix store packages. Explicit CLI flags and environment
@@ -1812,9 +1825,9 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
       "--memory", $mem,
       "--vcpus", $cpus,
       "--cpu", "host-model",
-      "--machine", "q35",
-      "--network", "none",   # transient boot — no network exposure
-      "--noautoconsole"]
+      "--machine", "q35"]
+    argv.add(transientBootNetworkArgs(spec))
+    argv.add("--noautoconsole")
     argv.add(transientBootFirmwareArgs(spec, ovmf.loader, ovmf.nvram))
     argv.add(transientBootGraphicsArgs(spec))
     argv.add(transientBootCompatibilityArgs())
@@ -1857,10 +1870,16 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
       backend: b,
       name: domainName,
       baseline: "<boot-from-media>",
-      ipAddress: none(string),
-      sshPort: 0,
-      sshUser: "",
-      sshAuth: SshAuth(kind: saNone),
+      ipAddress: (if spec.sshForwardPort > 0:
+                    some("127.0.0.1")
+                  else:
+                    none(string)),
+      sshPort: spec.sshForwardPort,
+      sshUser: (if spec.sshForwardPort > 0: b.sshUser else: ""),
+      sshAuth: (if spec.sshForwardPort > 0 and b.sshPassword.len > 0:
+                  SshAuth(kind: saPassword, password: b.sshPassword)
+                else:
+                  SshAuth(kind: saNone)),
       extra: extra)
   else:
     raise newException(BackendUnavailableError,

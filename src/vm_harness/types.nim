@@ -209,6 +209,7 @@ type
     secureBootEnabled*: bool        ## defaults to false (most test ISOs unsigned)
     graphics*: BootGraphicsKind     ## graphical console; defaults to none
     videoModel*: string             ## backend video model; defaults to virtio
+    sshForwardPort*: int            ## loopback host port forwarded to guest SSH
     tpmEnabled*: bool               ## attach a virtual TPM 2.0 (Gen 2 / UEFI only)
       ## Windows 11 Setup refuses to install without TPM 2.0 — it fails at the
       ## "This PC can't run Windows 11" gate long before the autounattend's
