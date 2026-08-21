@@ -17,6 +17,7 @@
 ## per-backend implementation notes.
 
 import ./vm_harness/types
+import ./vm_harness/pool
 import ./vm_harness/output
 import ./vm_harness/auto
 import ./vm_harness/orchestrator
@@ -35,6 +36,7 @@ import ./vm_harness/backends/libvirt
 import ./vm_harness/backends/incus
 
 export types
+export pool
 export output
 export auto
 export orchestrator

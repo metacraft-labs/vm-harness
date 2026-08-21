@@ -1,0 +1,235 @@
+## Pool algorithms: `clone-per-task` and `recycle-from-pool-per-task`.
+##
+## Two ways to serve a stream of tasks from one host. They are not
+## interchangeable and the right one is a property of the BACKEND'S STORAGE,
+## not of the workload -- see ``docs/pool-algorithms.md`` for the rule, the
+## measurements behind it, and the recorded per-backend selections.
+##
+## The selection is fixed at development time (``defaultAlgorithmFor``) and
+## deliberately not probed at runtime: these costs are stable per backend +
+## storage driver, so rediscovering them on every host start is waste, and a
+## pool that silently changed algorithm would make latency irreproducible.
+##
+## Both algorithms present the SAME interface -- ``acquire`` gives you a
+## task-ready guest, ``release`` returns it -- so a consumer does not branch
+## on which is in use:
+##
+## ```nim
+## var pool = newPool(PoolConfig(backend: b, baseline: "golden", size: 4))
+## pool.construct()
+## let lease = pool.acquire()
+## try:
+##   discard b.execInGuest(lease.vm, @["build.sh"])
+## finally:
+##   pool.release(lease)
+## ```
+##
+## WHERE THE COST SITS, which is the whole point of the recycle variant:
+## ``release`` does the resetting, not ``acquire``. A member is restored the
+## moment its task finishes, so it is already warm when the next task
+## arrives and per-task start latency approaches zero. Putting the reset in
+## ``acquire`` would move that cost back onto the critical path and give up
+## most of the benefit.
+
+import std/[strformat, strutils, times]
+import ./types
+
+type
+  PoolAlgorithm* = enum
+    paClonePerTask = "clone-per-task"
+      ## Every task gets an instance that has never existed before.
+      ## Isolation is free: there is no prior state to leak.
+    paRecycleFromPool = "recycle-from-pool-per-task"
+      ## N long-lived members, each restored to ITS OWN baseline between
+      ## tasks. Only the state is ephemeral.
+
+  PoolMember* = ref object
+    ## One pool slot. Only meaningful under `paRecycleFromPool`.
+    name*: string
+      ## The backend-level instance name; stable for the member's lifetime.
+    baselineSnapshot*: string
+      ## This member's OWN baseline checkpoint.
+      ##
+      ## Per-member, NOT shared, and that is load-bearing rather than
+      ## tidiness. A checkpoint that captures RAM captures the machine name
+      ## and DHCP lease with it, so N members restored from ONE shared
+      ## checkpoint come up as N guests with identical identities --
+      ## measured, see the identity-collision section of
+      ## ``docs/per-backend-notes/hyperv-snapshot-benchmarks.md``. The pool
+      ## is N distinct baselines, not N copies of one.
+    vm*: VmHandle
+    inUse*: bool
+
+  PoolLease* = ref object
+    ## What a consumer holds between ``acquire`` and ``release``.
+    vm*: VmHandle
+    member*: PoolMember   ## nil under `paClonePerTask` -- nothing to return
+
+  PoolConfig* = object
+    backend*: VmBackend
+    baseline*: string
+      ## The golden every member/instance derives from.
+    algorithm*: PoolAlgorithm
+    size*: int
+      ## Member count. `paRecycleFromPool` only; ignored when cloning.
+    readyTimeoutSec*: int
+    memberBaselinePrefix*: string
+      ## Prefix for per-member checkpoint names. Defaults to `pool-baseline`.
+
+  Pool* = ref object
+    cfg*: PoolConfig
+    members*: seq[PoolMember]
+    constructed*: bool
+
+  PoolError* = object of CatchableError
+
+const
+  DefaultReadyTimeoutSec* = 300
+  DefaultMemberBaselinePrefix* = "pool-baseline"
+
+proc defaultAlgorithmFor*(backend: BackendId): PoolAlgorithm =
+  ## The development-time selection, from measurement. Changing an entry
+  ## here is an architectural decision and wants numbers behind it --
+  ## ``tools/bench/clone_per_task_bench.nim`` and
+  ## ``tools/bench/snapshot_revert_bench.nim`` produce the comparable pair.
+  case backend
+  of biHyperv:
+    # Measured 2026-08-21 on win-ci-bare-001: clone is a real file copy
+    # (Export+Import ~50 s, so clone-per-task 35.9 s is no better than the
+    # 36 s cold boot it replaces), while restoring a checkpoint that carries
+    # RAM resumes in ~5 s. Not a marginal call.
+    paRecycleFromPool
+  of biLibvirt:
+    # FORCED, not reasoned. Cloning here is already O(1) -- a qcow2 CoW
+    # overlay over the golden -- but snapshot/restoreSnapshot are
+    # unimplemented stubs that raise (M4 Phase B), so recycling cannot be
+    # selected at all. The cost is that every task pays a full guest boot;
+    # for the Windows guest that is the same ~36 s Hyper-V reduces to ~5 s.
+    # Re-measure and revisit if Phase B lands.
+    paClonePerTask
+  of biIncus:
+    # UNDECIDED upstream, defaulted conservatively. A container has no boot
+    # to skip (~1 s to start), so recycling buys isolation rather than
+    # speed; and the default storage pool is the `dir` driver, where
+    # snapshot/restore are FULL RECURSIVE COPIES whose cost scales with
+    # rootfs size -- plausibly worse than delete-and-relaunch. On ZFS both
+    # become metadata-only and the answer may flip. Re-measure when the ZFS
+    # driver lands; the bar to beat is delete-and-relaunch, not cold boot.
+    paClonePerTask
+  else:
+    # Anything without measured numbers gets the algorithm that cannot be
+    # wrong about isolation, only about speed.
+    paClonePerTask
+
+proc newPool*(cfg: PoolConfig): Pool =
+  ## Build a pool descriptor. Does no I/O -- call ``construct`` for that.
+  var c = cfg
+  if c.readyTimeoutSec <= 0: c.readyTimeoutSec = DefaultReadyTimeoutSec
+  if c.memberBaselinePrefix.len == 0:
+    c.memberBaselinePrefix = DefaultMemberBaselinePrefix
+  if c.baseline.len == 0:
+    raise newException(PoolError, "PoolConfig.baseline is required")
+  if c.backend.isNil:
+    raise newException(PoolError, "PoolConfig.backend is required")
+  if c.algorithm == paRecycleFromPool and c.size < 1:
+    raise newException(PoolError,
+      "recycle-from-pool-per-task needs size >= 1 (got " & $c.size & ")")
+  Pool(cfg: c, members: @[], constructed: false)
+
+proc memberBaselineName(p: Pool, idx: int): string =
+  &"{p.cfg.memberBaselinePrefix}-{idx}"
+
+proc construct*(p: Pool) =
+  ## Pay the pool-construction cost.
+  ##
+  ## `paClonePerTask`: nothing to do; instances are made per task.
+  ##
+  ## `paRecycleFromPool`: for each member, derive an instance from the
+  ## golden, bring it up so it acquires its OWN identity, and checkpoint
+  ## that as the member's baseline. This is the expensive part and it is
+  ## paid once -- nobody is waiting on it.
+  if p.constructed: return
+  case p.cfg.algorithm
+  of paClonePerTask:
+    p.constructed = true
+  of paRecycleFromPool:
+    for i in 0 ..< p.cfg.size:
+      let vm = p.cfg.backend.revertToBaseline(p.cfg.baseline)
+      p.cfg.backend.startAndAwaitReady(vm, timeoutSec = p.cfg.readyTimeoutSec)
+      let snapName = p.memberBaselineName(i)
+      # snapshotRunning, not snapshot: capturing the RUNNING state is what
+      # lets a restore resume instead of boot, and that difference is the
+      # entire reason to prefer this algorithm. A backend without it raises
+      # here, at construction, rather than silently degrading to a slow
+      # cold-boot pool that looks like it is working.
+      discard p.cfg.backend.snapshotRunning(vm.name, snapName)
+      p.members.add(PoolMember(name: vm.name, baselineSnapshot: snapName,
+                               vm: vm, inUse: false))
+    p.constructed = true
+
+proc acquire*(p: Pool): PoolLease =
+  ## Obtain a task-ready guest.
+  if not p.constructed:
+    raise newException(PoolError, "pool.construct() has not been called")
+  case p.cfg.algorithm
+  of paClonePerTask:
+    let vm = p.cfg.backend.revertToBaseline(p.cfg.baseline)
+    p.cfg.backend.startAndAwaitReady(vm, timeoutSec = p.cfg.readyTimeoutSec)
+    PoolLease(vm: vm, member: nil)
+  of paRecycleFromPool:
+    for m in p.members:
+      if not m.inUse:
+        m.inUse = true
+        # No reset here on purpose -- release() already restored this member
+        # when its previous task finished, so it is warm and ready NOW. That
+        # is what keeps the recycle cost off the critical path.
+        return PoolLease(vm: m.vm, member: m)
+    raise newException(PoolError,
+      "no free pool member (size=" & $p.cfg.size & ", all in use)")
+
+proc release*(p: Pool, lease: PoolLease) =
+  ## Return a guest.
+  ##
+  ## `paClonePerTask`: destroy it. Isolation comes from the instance ceasing
+  ## to exist.
+  ##
+  ## `paRecycleFromPool`: restore the member to its own baseline and bring it
+  ## back up, so it is warm before the next task asks for it. Isolation comes
+  ## from the restore discarding everything the task wrote -- verified rather
+  ## than assumed; see the residue check in the hyperv benchmarks note.
+  if lease.isNil: return
+  case p.cfg.algorithm
+  of paClonePerTask:
+    p.cfg.backend.stopAndCleanup(lease.vm, deleteVm = true)
+  of paRecycleFromPool:
+    let m = lease.member
+    if m.isNil:
+      raise newException(PoolError,
+        "recycle pool released a lease with no member")
+    p.cfg.backend.restoreSnapshot(m.name, m.baselineSnapshot)
+    p.cfg.backend.startAndAwaitReady(m.vm, timeoutSec = p.cfg.readyTimeoutSec)
+    m.inUse = false
+
+proc teardown*(p: Pool) =
+  ## Release pool-held resources. Idempotent; best-effort per member so one
+  ## wedged instance cannot strand the rest.
+  if p.cfg.algorithm == paRecycleFromPool:
+    for m in p.members:
+      try:
+        p.cfg.backend.removeSnapshot(m.name, m.baselineSnapshot)
+      except CatchableError: discard
+      try:
+        p.cfg.backend.stopAndCleanup(m.vm, deleteVm = true)
+      except CatchableError: discard
+  p.members = @[]
+  p.constructed = false
+
+proc freeCount*(p: Pool): int =
+  ## Members not currently leased. Always 0 for `paClonePerTask`, which has
+  ## no members and is bounded by the host instead.
+  for m in p.members:
+    if not m.inUse: inc result
+
+proc describe*(p: Pool): string =
+  &"{p.cfg.algorithm} baseline={p.cfg.baseline} " &
+  &"members={p.members.len} free={p.freeCount()}"
