@@ -52,7 +52,13 @@ param(
     [string]$GuestUser = 'admin',
     [string]$GuestPassword = 'repro-windows-x64',
     [string]$SwitchName = 'Default Switch',
-    [int]$ReadyTimeoutSec = 300
+    # First boot after an import is FAR slower than a normal cold boot:
+    # Windows re-detects devices behind a new VM id and a new MAC. Measured
+    # on this host: 293s for the first member, against a 36s cold boot. A
+    # 300s default put the second member 7s outside the window and failed
+    # the whole construction, so this is deliberately generous -- it is paid
+    # once per member, at capacity-change time, with nobody waiting.
+    [int]$ReadyTimeoutSec = 1200
 )
 
 # PSModulePath hygiene, FIRST, before any cmdlet that is not an autoloaded
@@ -186,14 +192,14 @@ for ($i = 0; $i -lt $Size; $i++) {
     Get-VMNetworkAdapter -VMName $name | Set-VMNetworkAdapter -StaticMacAddress $mac
     Connect-VMNetworkAdapter -VMName $name -SwitchName $SwitchName -ErrorAction SilentlyContinue
 
-    # Drop the inherited checkpoint: it is the SOURCE's warm state, carrying
-    # the source's machine name and lease. Keeping it would make every member
-    # restorable to one shared identity, which is the collision this design
-    # exists to avoid.
-    foreach ($s in Get-VMSnapshot -VMName $name) { Remove-VMSnapshot -VMSnapshot $s }
-    $d = (Get-Date).AddMinutes(10)
-    while ((Get-VM -Name $name).Status -match 'Merg' -and (Get-Date) -lt $d) { Start-Sleep -Seconds 5 }
-
+    # The inherited checkpoint (the SOURCE's warm state, carrying the
+    # source's name and lease) is dropped LATER -- after this member has its
+    # own baseline. Deleting it here and booting immediately is a race:
+    # Remove-VMSnapshot returns before the .avhdx merge begins, so a
+    # `Status -match 'Merg'` poll sees "Operating normally", exits at once,
+    # and the VM is started while its disk chain is still being rewritten.
+    # Observed exactly that: the guest hung on the Hyper-V boot splash at 0%
+    # CPU for seven minutes.
     Log "[$name] booting to give it its own identity"
     Start-VM -Name $name
     $readyIn = Wait-GuestReady -Vm $name -TimeoutSec $ReadyTimeoutSec
@@ -228,6 +234,27 @@ for ($i = 0; $i -lt $Size; $i++) {
                                  Select-Object -First 1 -Expand IPAddress) }
     }
     Log "[$name] baseline checkpointed in $([math]::Round($t.Elapsed.TotalSeconds,2))s (name=$($ident.CN) ip=$($ident.IP))"
+
+    # NOW drop the inherited source checkpoint -- this member has its own
+    # baseline, so the source's warm state is dead weight that would also
+    # leave the member restorable to a shared identity. Merging online is
+    # safe here because nothing boots until it completes, and the wait polls
+    # for the .avhdx to actually disappear rather than trusting VM Status.
+    $inherited = Get-VMSnapshot -VMName $name | Where-Object { $_.Name -ne 'baseline' }
+    foreach ($s in $inherited) {
+        Log "[$name] dropping inherited checkpoint '$($s.Name)'"
+        Remove-VMSnapshot -VMSnapshot $s
+    }
+    if ($inherited) {
+        $d = (Get-Date).AddMinutes(20)
+        while ((Get-Date) -lt $d) {
+            Start-Sleep -Seconds 5
+            $merging = (Get-VM -Name $name).Status -match 'Merg'
+            $snapsLeft = @(Get-VMSnapshot -VMName $name | Where-Object { $_.Name -ne 'baseline' }).Count
+            if (-not $merging -and $snapsLeft -eq 0) { break }
+        }
+        Log "[$name] merge complete"
+    }
     $made += [pscustomobject]@{ Member = $name; Name = $ident.CN; IP = $ident.IP }
 }
 
