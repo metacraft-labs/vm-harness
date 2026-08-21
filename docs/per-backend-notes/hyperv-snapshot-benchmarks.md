@@ -207,3 +207,72 @@ dependencies; it requires only:
 
 Adapting the scripts to a different baseline VM is a matter of
 changing the VM and snapshot names; the timing structure is unchanged.
+
+---
+
+## win-ci-bare-001, 2026-08-21 — a real Windows 11 golden, and what it settles
+
+The numbers above were taken on a Quick Create gallery image. These were
+taken on the actual artifact the ephemeral-runner pool will use: a Windows
+11 Pro 25H2 (build 26200) golden built by
+`guest-recipes/windows-x64-base/build-golden-hyperv.ps1`, 20.25 GB
+installed, 4 vCPU / 8 GB, on an i9-12900K with NVMe.
+
+| operation | time | what it is |
+| --------- | ---- | ---------- |
+| cold boot to PSDirect-ready | **36 s** | the baseline to beat |
+| `Checkpoint-VM` (cold, VM off) | 0.46 s | |
+| `Checkpoint-VM` (hot, VM running) | 5.38 s | captures RAM + CPU + device state |
+| `Export-VM` (live) | 21.07 s | 3,395 MB `.VMRS` memory image |
+| `Import-VM -Copy -GenerateNewId` | 28.67 s | |
+| `Restore-VMCheckpoint` | 2.16 s | leaves the VM in `Saved` |
+| `Start-VM` from `Saved` → ready | **5.08 s** | resumes; does not boot |
+
+The clone reported `Uptime 00:02:41` immediately on resume — it inherited
+the golden's uptime, which is the proof that it resumed from captured RAM
+rather than booting.
+
+### The win is restore-in-place, NOT clone-per-job
+
+Adding the columns up decides the architecture:
+
+```
+A) clone per job : Import 28.67 + Restore 2.16 + Resume 5.08 = 35.9 s
+B) warm pool     :                Restore 2.16 + Resume 5.08 =  7.2 s
+```
+
+**A is no better than just cold-booting a VM (36 s).** The ~8 s figure in the
+portable-path section above is the restore+resume tail only; it is not the
+cost of producing a fresh guest from an export. Import dominates, and it is
+pool-CONSTRUCTION cost — pay it once per pool member, never per job.
+
+### A hot checkpoint captures network identity, and that is load-bearing
+
+Two guests restored from the SAME warm checkpoint, running concurrently:
+
+```
+repro-golden-win11-x64   name=WIN-EDC8DG9PTDT  ip=172.27.94.244
+repro-hot-001            name=WIN-EDC8DG9PTDT  ip=172.27.94.244
+```
+
+Identical computer name AND identical IP. RAM state includes the DHCP lease
+and the machine name, so cloning one warm state N times yields N colliding
+guests — NetBIOS conflicts and two VMs claiming one lease, which breaks the
+outbound reachability a CI runner exists to use.
+
+This is not an argument for sysprep. Sysprep `/generalize` forces OOBE on
+first boot, which destroys the entire benefit — a generalized golden can
+only ever be cold-booted.
+
+It is an argument for the same design the timings already point at:
+**pre-create N pool members, boot each so it acquires its OWN name and
+lease, then hot-checkpoint each individually.** Restoring member *n* returns
+it to *its own* identity, so there is nothing to collide. The pool is N
+distinct warm states, not N copies of one.
+
+### Consequences for pool sizing
+
+Per-member cost is one 20 GB VHDX plus a ~3.4 GB memory image. The
+`Import-VM` step is where cheap block copies would pay off (this host's C:
+is NTFS, D: is ReFS) — but only at pool construction, which is the one time
+nobody is waiting.
