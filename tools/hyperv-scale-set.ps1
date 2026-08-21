@@ -1,0 +1,187 @@
+<#
+.SYNOPSIS
+  Run a GitHub Actions scale set on a Hyper-V warm pool.
+
+.DESCRIPTION
+  Drives the recycle-from-pool-per-task algorithm against the members built
+  by hyperv-pool.ps1. Per member, forever:
+
+    1. mint a fresh runner registration token on the HOST
+    2. configure an --ephemeral runner inside the member (PowerShell Direct)
+    3. run it; it accepts exactly ONE job and exits
+    4. restore the member to ITS baseline and resume  <- the recycle
+    5. repeat
+
+  WHY THE RUNNER IS EPHEMERAL AND THE VM IS NOT.
+
+  `--ephemeral` makes the runner process exit after a single job, which is
+  what gives GitHub-side isolation (the registration is consumed, so no
+  second job can land on dirty state). The VM is then restored, which gives
+  filesystem isolation. Neither alone is enough: an ephemeral runner in a
+  reused VM leaks the filesystem, and a restored VM with a long-lived runner
+  can be handed a second job mid-restore.
+
+  WHY THE TOKEN IS MINTED PER CYCLE.
+
+  Registration tokens are single-use and short-lived, so one cannot be baked
+  into the baseline checkpoint -- which is also why the baseline is captured
+  with the runner INSTALLED BUT UNCONFIGURED. Every cycle configures from
+  clean.
+
+  WHERE THE RECYCLE COST SITS. Step 4 runs after the job finishes, not
+  before the next one starts, so a member is already warm when work arrives.
+  Measured on this host: restore + resume is 7-14 s, against a 36 s cold
+  boot -- but only if it happens off the critical path.
+
+.PARAMETER Org
+  GitHub org the runners register with.
+
+.PARAMETER Labels
+  Comma-separated runner labels. These decide which `runs-on` reaches this
+  pool.
+
+.PARAMETER Once
+  Run a single job per member and stop, instead of looping. For proving the
+  mechanism without leaving a daemon behind.
+#>
+[CmdletBinding()]
+param(
+    [string]$Org = 'metacraft-labs',
+    [string]$Labels = 'self-hosted,Windows,X64,eph-win-x64-hv',
+    [string]$MemberPrefix = 'repro-pool',
+    [string]$GuestUser = 'admin',
+    [string]$GuestPassword = 'repro-windows-x64',
+    [string]$RunnerDir = 'C:\actions-runner',
+    [int]$ReadyTimeoutSec = 300,
+    [int]$JobTimeoutSec = 3600,
+    [switch]$Once
+)
+
+# PSModulePath hygiene, FIRST, before any cmdlet that is not an autoloaded
+# core builtin. A launcher -- Git Bash, a pwsh 7 shell, a scheduled task --
+# can leak a PSModulePath that makes Windows PowerShell 5.1 resolve core
+# modules to pwsh 7's copies, or fail to find them at all. Observed here as
+# "The 'ConvertTo-SecureString' command was found in the module
+# 'Microsoft.PowerShell.Security', but the module could not be loaded",
+# mid-way through building a pool. Resetting to the machine value makes the
+# script independent of however it was invoked.
+$env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath','Machine')
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+function Log { param($m) Write-Host ("[{0:HH:mm:ss}] scale-set: {1}" -f (Get-Date), $m) }
+
+function Get-GuestCred {
+    $pw = ConvertTo-SecureString $GuestPassword -AsPlainText -Force
+    New-Object System.Management.Automation.PSCredential($GuestUser, $pw)
+}
+
+function Wait-GuestReady {
+    param([string]$Vm, [int]$TimeoutSec)
+    $cred = Get-GuestCred
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        try {
+            Invoke-Command -VMName $Vm -Credential $cred -ScriptBlock { 1 } -ErrorAction Stop | Out-Null
+            return [math]::Round($sw.Elapsed.TotalSeconds, 2)
+        } catch { Start-Sleep -Seconds 2 }
+    }
+    throw "guest '$Vm' not reachable within ${TimeoutSec}s"
+}
+
+function New-RegistrationToken {
+    # Minted on the HOST: the guest has no credentials and should not. The
+    # token is short-lived and single-use, so it is fetched per cycle.
+    $t = (& gh api -X POST "/orgs/$Org/actions/runners/registration-token" --jq '.token' 2>&1)
+    if ($LASTEXITCODE -ne 0 -or -not $t -or $t.Length -lt 20) {
+        throw "could not mint a registration token: $t"
+    }
+    "$t".Trim()
+}
+
+function Restore-Member {
+    param([string]$Vm)
+    # THE RECYCLE. Everything the job wrote is discarded here, and the member
+    # comes back as itself -- its own computer name and its own DHCP lease --
+    # because the baseline was captured per member.
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $snap = Get-VMSnapshot -VMName $Vm -Name 'baseline' -ErrorAction Stop
+    Restore-VMCheckpoint -VMSnapshot $snap -Confirm:$false
+    if ((Get-VM -Name $Vm).State -ne 'Running') { Start-VM -Name $Vm }
+    $readyIn = Wait-GuestReady -Vm $Vm -TimeoutSec $ReadyTimeoutSec
+    $sw.Stop()
+    Log "[$Vm] recycled in $([math]::Round($sw.Elapsed.TotalSeconds,2))s (ready $readyIn s)"
+}
+
+function Invoke-OneJobCycle {
+    param([string]$Vm)
+    $cred = Get-GuestCred
+    $token = New-RegistrationToken
+    $runnerName = "$Vm-$((Get-Date).ToString('HHmmss'))"
+
+    Log "[$Vm] configuring ephemeral runner '$runnerName'"
+    Invoke-Command -VMName $Vm -Credential $cred -ScriptBlock {
+        param($dir, $url, $tok, $name, $labels)
+        $ErrorActionPreference = 'Stop'
+        Set-Location $dir
+        # --ephemeral: accept exactly one job then exit. --replace so a
+        # stale registration with the same name cannot block config.
+        & "$dir\config.cmd" --unattended --ephemeral --replace `
+            --url $url --token $tok --name $name --labels $labels `
+            --work '_work' 2>&1 | Out-String
+    } -ArgumentList $RunnerDir, "https://github.com/$Org", $token, $runnerName, $Labels | Out-Null
+
+    Log "[$Vm] runner online, waiting for a job (timeout ${JobTimeoutSec}s)"
+    # run.cmd blocks until the single job completes, then exits. Its exit is
+    # the signal that the task is done -- no polling of GitHub required.
+    $out = Invoke-Command -VMName $Vm -Credential $cred -ScriptBlock {
+        param($dir)
+        Set-Location $dir
+        & "$dir\run.cmd" 2>&1 | Out-String
+    } -ArgumentList $RunnerDir
+    Log "[$Vm] runner exited; job finished"
+    if ($out) {
+        ($out -split "`n" | Select-Object -Last 6) | ForEach-Object { Log "[$Vm]   $($_.Trim())" }
+    }
+}
+
+# ------------------------------------------------------------------ main ---
+$members = @(Get-VM | Where-Object { $_.Name -like "$MemberPrefix-*" } | Sort-Object Name)
+if ($members.Count -eq 0) { throw "no pool members found (prefix '$MemberPrefix-'); run hyperv-pool.ps1 -Construct" }
+Log "pool has $($members.Count) member(s): $(($members | Select-Object -Expand Name) -join ', ')"
+Log "labels: $Labels"
+
+foreach ($m in $members) {
+    if (-not (Get-VMSnapshot -VMName $m.Name -Name 'baseline' -ErrorAction SilentlyContinue)) {
+        throw "member '$($m.Name)' has no 'baseline' checkpoint; run hyperv-pool.ps1 -Construct"
+    }
+}
+
+# One background job per member so they serve concurrently -- N members is N
+# runners, which is the entire point of a scale set.
+$jobs = @()
+foreach ($m in $members) {
+    $jobs += Start-Job -Name "pool-$($m.Name)" -ScriptBlock {
+        param($vm, $scriptPath, $org, $labels, $prefix, $user, $pass, $rdir, $rt, $jt, $once)
+        # Re-enter this same script in single-member mode inside the job.
+        & $scriptPath -Org $org -Labels $labels -MemberPrefix $prefix `
+            -GuestUser $user -GuestPassword $pass -RunnerDir $rdir `
+            -ReadyTimeoutSec $rt -JobTimeoutSec $jt @(if ($once) { '-Once' })
+    } -ArgumentList $m.Name, $PSCommandPath, $Org, $Labels, $MemberPrefix,
+                    $GuestUser, $GuestPassword, $RunnerDir, $ReadyTimeoutSec,
+                    $JobTimeoutSec, $Once.IsPresent
+}
+
+Log "started $($jobs.Count) member worker(s); Ctrl-C or Stop-Job to end"
+try {
+    while ($true) {
+        Receive-Job -Job $jobs -ErrorAction SilentlyContinue
+        if (@($jobs | Where-Object { $_.State -eq 'Running' }).Count -eq 0) { break }
+        Start-Sleep -Seconds 5
+    }
+} finally {
+    Receive-Job -Job $jobs -ErrorAction SilentlyContinue
+    $jobs | Stop-Job -ErrorAction SilentlyContinue
+    $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
+}

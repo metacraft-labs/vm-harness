@@ -1,0 +1,247 @@
+<#
+.SYNOPSIS
+  Construct and manage a Hyper-V warm pool (recycle-from-pool-per-task).
+
+.DESCRIPTION
+  The Hyper-V implementation of the algorithm selected for this backend in
+  docs/pool-algorithms.md. Measured on win-ci-bare-001, 2026-08-21:
+
+    clone-per-task    Import 28.67 + Restore 2.16 + Resume 5.08 = 35.9 s
+    recycle-per-task              Restore 2.16 + Resume 5.08 =  7.2 s
+    cold boot, for reference                                 = 36   s
+
+  so cloning per task buys nothing over a cold boot, while recycling a warm
+  member is ~5x better. Cloning is still needed -- but only to change
+  CAPACITY, which is what -Construct does, once, with nobody waiting.
+
+  WHY EACH MEMBER IS RENAMED AND CHECKPOINTED SEPARATELY.
+
+  A hot checkpoint captures RAM, and RAM contains the machine name and the
+  DHCP lease. Two guests restored from ONE shared checkpoint therefore come
+  up identical -- measured: both answered to WIN-EDC8DG9PTDT on
+  172.27.94.244, which breaks the outbound reachability a CI runner exists
+  to use. So the pool is N DISTINCT warm states, not N copies of one: each
+  member is renamed, rebooted so the rename takes, and only then
+  checkpointed as its own baseline.
+
+  Sysprep is deliberately NOT used. /generalize forces OOBE on first boot,
+  so a generalized image can only ever be cold-booted -- which throws away
+  the 36 s -> 5 s the warm path exists for.
+
+.PARAMETER Construct
+  Build the pool: export the source VM once, then import, rename and
+  checkpoint each member.
+
+.PARAMETER Status
+  Show members, their baselines and their current state.
+
+.PARAMETER Teardown
+  Remove every member VM and its files. Leaves the source VM alone.
+#>
+[CmdletBinding()]
+param(
+    [switch]$Construct,
+    [switch]$Status,
+    [switch]$Teardown,
+    [string]$SourceVm = 'repro-golden-win11-x64',
+    [string]$SourceCheckpoint = 'pool-source',
+    [int]$Size = 2,
+    [string]$MemberPrefix = 'repro-pool',
+    [string]$PoolRoot = 'C:\hyperv\pool',
+    [string]$ExportRoot = 'C:\hyperv\pool-export',
+    [string]$GuestUser = 'admin',
+    [string]$GuestPassword = 'repro-windows-x64',
+    [string]$SwitchName = 'Default Switch',
+    [int]$ReadyTimeoutSec = 300
+)
+
+# PSModulePath hygiene, FIRST, before any cmdlet that is not an autoloaded
+# core builtin. A launcher -- Git Bash, a pwsh 7 shell, a scheduled task --
+# can leak a PSModulePath that makes Windows PowerShell 5.1 resolve core
+# modules to pwsh 7's copies, or fail to find them at all. Observed here as
+# "The 'ConvertTo-SecureString' command was found in the module
+# 'Microsoft.PowerShell.Security', but the module could not be loaded",
+# mid-way through building a pool. Resetting to the machine value makes the
+# script independent of however it was invoked.
+$env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath','Machine')
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+function Log { param($m) Write-Host "hyperv-pool: $m" }
+
+function Get-GuestCred {
+    $pw = ConvertTo-SecureString $GuestPassword -AsPlainText -Force
+    New-Object System.Management.Automation.PSCredential($GuestUser, $pw)
+}
+
+function Wait-GuestReady {
+    param([string]$Vm, [int]$TimeoutSec)
+    # PowerShell Direct, not SSH or a network probe: it reaches the guest
+    # over VMBus, so readiness does not depend on the very DHCP lease that
+    # member renaming is about to churn.
+    $cred = Get-GuestCred
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        try {
+            Invoke-Command -VMName $Vm -Credential $cred -ScriptBlock { 1 } -ErrorAction Stop | Out-Null
+            return [math]::Round($sw.Elapsed.TotalSeconds, 2)
+        } catch { Start-Sleep -Seconds 2 }
+    }
+    throw "guest '$Vm' was not reachable over PowerShell Direct within ${TimeoutSec}s"
+}
+
+function Get-PoolMembers {
+    Get-VM | Where-Object { $_.Name -like "$MemberPrefix-*" } | Sort-Object Name
+}
+
+# ---------------------------------------------------------------- status ---
+if ($Status) {
+    $members = @(Get-PoolMembers)
+    if ($members.Count -eq 0) { Log "no members (prefix '$MemberPrefix-')"; return }
+    $members | ForEach-Object {
+        $snaps = (Get-VMSnapshot -VMName $_.Name | Select-Object -Expand Name) -join ','
+        [pscustomobject]@{
+            Member    = $_.Name
+            State     = $_.State
+            Uptime    = $_.Uptime
+            Baselines = $snaps
+        }
+    } | Format-Table -AutoSize
+    return
+}
+
+# -------------------------------------------------------------- teardown ---
+if ($Teardown) {
+    foreach ($m in Get-PoolMembers) {
+        Log "removing $($m.Name)"
+        Stop-VM -Name $m.Name -TurnOff -Force -ErrorAction SilentlyContinue
+        Remove-VM -Name $m.Name -Force
+    }
+    if (Test-Path -LiteralPath $PoolRoot) {
+        Remove-Item -LiteralPath $PoolRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Log "pool torn down"
+    return
+}
+
+if (-not $Construct) { Log "nothing to do; pass -Construct, -Status or -Teardown"; return }
+
+# ------------------------------------------------------------- construct ---
+if (-not (Get-VM -Name $SourceVm -ErrorAction SilentlyContinue)) {
+    throw "source VM '$SourceVm' not found"
+}
+if (-not (Get-VMSnapshot -VMName $SourceVm -Name $SourceCheckpoint -ErrorAction SilentlyContinue)) {
+    throw "source checkpoint '$SourceCheckpoint' not found on '$SourceVm'"
+}
+
+# Export once and import N times, rather than exporting per member: the
+# export is the expensive half and its result is identical for every member.
+Log "exporting '$SourceVm' once as the member source"
+if (Test-Path -LiteralPath $ExportRoot) {
+    Remove-Item -LiteralPath $ExportRoot -Recurse -Force
+}
+$null = New-Item -ItemType Directory -Force -Path $ExportRoot
+$sw = [Diagnostics.Stopwatch]::StartNew()
+Stop-VM -Name $SourceVm -TurnOff -Force -ErrorAction SilentlyContinue
+Export-VM -Name $SourceVm -Path $ExportRoot
+$sw.Stop()
+Log "export took $([math]::Round($sw.Elapsed.TotalSeconds,1))s"
+
+# The VM config lives under 'Virtual Machines'. Picking the first *.vmcx
+# found by a recursive search grabs the one under 'Snapshots' instead, which
+# imports a VM frozen at that checkpoint WITH NO SNAPSHOT TREE -- the very
+# thing the recycle path needs. Cost an hour the first time.
+$srcVmcx = Get-ChildItem -Path $ExportRoot -Recurse -Filter *.vmcx |
+           Where-Object { $_.Directory.Name -eq 'Virtual Machines' } |
+           Select-Object -First 1
+if (-not $srcVmcx) { throw "no VM config found under $ExportRoot" }
+
+$null = New-Item -ItemType Directory -Force -Path $PoolRoot
+$made = @()
+
+for ($i = 0; $i -lt $Size; $i++) {
+    $name = "$MemberPrefix-{0:d3}" -f $i
+    if (Get-VM -Name $name -ErrorAction SilentlyContinue) {
+        Log "$name already exists; skipping"
+        continue
+    }
+    $dest = Join-Path $PoolRoot $name
+    Log "[$name] importing"
+    $t = [Diagnostics.Stopwatch]::StartNew()
+    $imp = Import-VM -Path $srcVmcx.FullName -Copy -GenerateNewId `
+             -VhdDestinationPath   (Join-Path $dest 'vhd') `
+             -VirtualMachinePath   (Join-Path $dest 'vm') `
+             -SnapshotFilePath     (Join-Path $dest 'snap') `
+             -SmartPagingFilePath  (Join-Path $dest 'sp')
+    Rename-VM -VM $imp -NewName $name
+    $t.Stop()
+    Log "[$name] imported in $([math]::Round($t.Elapsed.TotalSeconds,1))s"
+
+    # A distinct MAC per member. Two members sharing one would collide on the
+    # switch; and the dynamic pool is unreliable on a freshly enabled host
+    # ("No available MAC address" with a healthy-looking range), so assign
+    # explicitly out of the host's own range.
+    $mac = '00155D64F1{0:X2}' -f (0xB0 + $i)
+    Get-VMNetworkAdapter -VMName $name | Set-VMNetworkAdapter -StaticMacAddress $mac
+    Connect-VMNetworkAdapter -VMName $name -SwitchName $SwitchName -ErrorAction SilentlyContinue
+
+    # Drop the inherited checkpoint: it is the SOURCE's warm state, carrying
+    # the source's machine name and lease. Keeping it would make every member
+    # restorable to one shared identity, which is the collision this design
+    # exists to avoid.
+    foreach ($s in Get-VMSnapshot -VMName $name) { Remove-VMSnapshot -VMSnapshot $s }
+    $d = (Get-Date).AddMinutes(10)
+    while ((Get-VM -Name $name).Status -match 'Merg' -and (Get-Date) -lt $d) { Start-Sleep -Seconds 5 }
+
+    Log "[$name] booting to give it its own identity"
+    Start-VM -Name $name
+    $readyIn = Wait-GuestReady -Vm $name -TimeoutSec $ReadyTimeoutSec
+    Log "[$name] reachable in ${readyIn}s"
+
+    $cred = Get-GuestCred
+    $current = Invoke-Command -VMName $name -Credential $cred -ScriptBlock { $env:COMPUTERNAME }
+    if ($current -ne $name.ToUpper()) {
+        Log "[$name] renaming guest ($current -> $name) and rebooting"
+        Invoke-Command -VMName $name -Credential $cred -ScriptBlock {
+            param($n)
+            Rename-Computer -NewName $n -Force -ErrorAction Stop
+        } -ArgumentList $name
+        # A rename only takes at boot; without this the member would keep the
+        # source's NetBIOS name and collide with its siblings.
+        Restart-VM -Name $name -Force
+        Start-Sleep -Seconds 5
+        $readyIn = Wait-GuestReady -Vm $name -TimeoutSec $ReadyTimeoutSec
+        Log "[$name] back up in ${readyIn}s"
+    }
+
+    # Let it settle so the captured state is genuinely warm, then checkpoint
+    # THIS member's own baseline.
+    Start-Sleep -Seconds 10
+    $t = [Diagnostics.Stopwatch]::StartNew()
+    Checkpoint-VM -Name $name -SnapshotName 'baseline'
+    $t.Stop()
+    $ident = Invoke-Command -VMName $name -Credential $cred -ScriptBlock {
+        [pscustomobject]@{ CN = $env:COMPUTERNAME
+                           IP = (Get-NetIPAddress -AddressFamily IPv4 |
+                                 Where-Object { $_.IPAddress -notlike '127.*' } |
+                                 Select-Object -First 1 -Expand IPAddress) }
+    }
+    Log "[$name] baseline checkpointed in $([math]::Round($t.Elapsed.TotalSeconds,2))s (name=$($ident.CN) ip=$($ident.IP))"
+    $made += [pscustomobject]@{ Member = $name; Name = $ident.CN; IP = $ident.IP }
+}
+
+Log "pool constructed:"
+$made | Format-Table -AutoSize
+
+# Identity distinctness is the property the whole design rests on, so assert
+# it rather than trusting the rename to have worked.
+$names = @($made | Select-Object -Expand Name)
+$ips   = @($made | Select-Object -Expand IP)
+if ($names.Count -ne ($names | Select-Object -Unique).Count) {
+    throw "members share a computer name: $($names -join ', ') -- renaming failed, and restoring these would collide"
+}
+if ($ips.Count -ne ($ips | Select-Object -Unique).Count) {
+    throw "members share an IP: $($ips -join ', ') -- the DHCP leases did not diverge"
+}
+Log "verified: every member has a distinct computer name and IP"
