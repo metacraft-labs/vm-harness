@@ -39,6 +39,9 @@ A `qemu:///system` libvirt domain configured for:
   `C:\PortableGit`, with `C:\PortableGit\bin` on the **machine** PATH.
   This is what supplies `bash.exe`; see
   [§Git for Windows](#git-for-windows-and-why-the-machine-path-matters).
+- **PowerShell 7** (standalone ZIP, pinned + checksummed) at `C:\pwsh`,
+  with `C:\pwsh` on the **machine** PATH. This is what supplies
+  `pwsh.exe`; see [§PowerShell 7](#powershell-7-and-why-shell-powershell-is-not-a-substitute).
 - WinRM disabled (we use SSH, not PSRemoting, to mirror the cross-
   backend transport contract).
 - virtio-win guest tools installed (qemu-guest-agent + paravirt
@@ -95,6 +98,53 @@ The version and both SHA-256 checksums are pinned in
 [`../lib/provision-git.ps1`](../lib/provision-git.ps1), which is the
 single source of truth; `../lib/fetch-portable-git.sh` parses the pin out
 of it rather than repeating it.
+
+## PowerShell 7, and why `shell: powershell` is not a substitute
+
+GitHub's hosted Windows images bundle PowerShell 7, so workflows written
+against the ecosystem's defaults assume `pwsh` exists. These goldens shipped
+only Windows PowerShell 5.1 (`5.1.22621.x`), and nothing ever installed
+PowerShell 7 — so every ephemeral runner cloned from them failed the moment a
+job reached a PowerShell 7 step:
+
+```
+##[error]pwsh: command not found
+```
+
+The obvious alternative — rewrite the workflows to `shell: powershell` — does
+not remove the dependency:
+
+1. The Actions runner dispatches a step's shell **by executable name**. A step
+   that says `shell: pwsh` is resolved with a PATH lookup for `pwsh`; how
+   5.1-compatible the body happens to be is irrelevant.
+2. Several things invoke `pwsh.exe` as a plain program regardless of any
+   step's `shell:` — the `dev-exec.cmd` trampoline that
+   `metacraft-github-actions/setup-dev-env` generates, the `pwsh -File ...`
+   calls inside codetracer's `windows-bootstrap-smoke` job, and
+   `just` on Windows (`set windows-shell := ["pwsh.exe", ...]`). No amount of
+   editing `shell:` keys reaches any of those.
+3. 5.1 differs from 7 in ways that have already cost this repo time: it does
+   not escape double quotes embedded in an argument when it builds a native
+   command line (see the probe notes in `../lib/provision-pwsh.ps1`), and its
+   `>>` operator writes UTF-16LE where the runner parses `GITHUB_ENV` and
+   `GITHUB_OUTPUT` as UTF-8.
+
+So the binary has to be in the image. The persistent (non-GARM) Windows runner
+already installs the same pinned ZIP to the same `C:\pwsh`, so both halves of
+the fleet now resolve `pwsh` identically.
+
+The machine-PATH argument is exactly the one in
+[§Git for Windows](#git-for-windows-and-why-the-machine-path-matters): the
+runner is a **service**, `services.exe` builds one environment block at boot
+from `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`,
+and a user- or process-scoped PATH is invisible to it forever.
+
+The pin and the install live in
+[`../lib/provision-pwsh.ps1`](../lib/provision-pwsh.ps1); the gate that
+refuses to ship an image without it is
+[`../lib/assert-pwsh-provisioned.ps1`](../lib/assert-pwsh-provisioned.ps1).
+`../lib/fetch-powershell.sh` stages the archive host-side, parsing the pin out
+of the `.ps1` rather than duplicating it.
 
 ## When to (re-)run this recipe
 
@@ -195,8 +245,10 @@ whose guest has to reach github.com at first logon. Drop the flag if you
 intend the guest to download it.
 
 This wraps `autounattend.xml` (the SysPrep answer file in this
-directory), `../lib/provision-git.ps1`, the pinned PortableGit archive
-(under `git/`) and the supplied first-boot.ps1 as an ISO9660+Joliet ISO
+directory), `../lib/provision-git.ps1` and `../lib/provision-pwsh.ps1`
+(plus their gates), the pinned PortableGit archive (under `git/`), the pinned
+PowerShell 7 ZIP (under `pwsh/`) and the supplied first-boot.ps1 as an
+ISO9660+Joliet ISO
 that libvirt attaches as a CD. Windows Setup looks for
 `autounattend.xml` on every attached removable medium at first
 boot and applies it automatically.
@@ -208,12 +260,12 @@ with three significant differences:
 2. A `<DriverPaths>` block in the WindowsPE pass that pulls
    virtio-blk + virtio-net drivers from the virtio-win driver disk
    so Setup can see the qcow2-backed system disk on the q35 board.
-3. A new FirstLogonCommand (#13/#14) that stages and runs the
+3. A new FirstLogonCommand (#15/#16) that stages and runs the
    operator-supplied first-boot.ps1.
 
 Both recipes share FirstLogonCommands that stage and run
-`provision-git.ps1` (x64 steps #11/#12), and the credential/power
-hardening in steps #1/#2.
+`provision-git.ps1` (x64 steps #11/#12) and `provision-pwsh.ps1`
+(x64 steps #13/#14), and the credential/power hardening in steps #1/#2.
 
 ### 4. Run virt-install (or `vm-harness provision`)
 
@@ -287,6 +339,37 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 `VMH_SKIP_GIT_GATE=1` bypasses the gate in `build-sysprep-golden.sh`. It
 logs three `WARNING` lines and exists only for bisecting an unrelated
 SysPrep failure — never for producing a golden that will be shipped.
+
+`provision-pwsh.ps1` has the same exit-0-on-failure contract and the same
+enforcement:
+[`../lib/assert-pwsh-provisioned.ps1`](../lib/assert-pwsh-provisioned.ps1)
+runs as a second **hard gate before SysPrep**, immediately after the Git one.
+It exits non-zero on any of:
+
+- `C:\Windows\Temp\vmh-pwsh-provision-failed` exists (dumps the log tail);
+- `C:\pwsh\pwsh.exe` is missing;
+- the **raw** machine `PATH` registry value does not contain `C:\pwsh`;
+- that value is no longer `REG_EXPAND_SZ`;
+- `pwsh.exe` is present but does not run, or reports a major version below 7
+  — the last one is what stops a `pwsh` that somehow resolved to the built-in
+  Windows PowerShell 5.1 from passing the gate while leaving every
+  `shell: pwsh` step broken.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+    -File C:\Windows\Temp\assert-pwsh-provisioned.ps1
+# exit 0 = fit to capture; exit 1 = do not capture
+```
+
+`VMH_SKIP_PWSH_GATE=1` bypasses it, on the same terms as the Git one.
+
+What neither gate can prove is the property the fleet ultimately depends on:
+that `pwsh` resolves for `NT AUTHORITY\SYSTEM` in **session 0**, because that
+depends on `services.exe` rebuilding its environment block at the *next* boot,
+which by definition has not happened in the image being captured. Asserting the
+exact registry value `services.exe` will read is the strongest static proxy.
+The service-context proof has to be taken on a booted clone of the promoted
+artifact — see the retrofit status note below for how that was done.
 
 Note that a **freshly logged-on interactive SSH session may not show the
 new PATH** even when the registry is correct, because the sshd service

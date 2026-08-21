@@ -105,6 +105,7 @@ DISM_TIMEOUT="${VMH_DISM_TIMEOUT:-2700}"
 SYSPREP_TIMEOUT="${VMH_SYSPREP_TIMEOUT:-1800}"
 REARM_UNATTEND="${VMH_REARM_UNATTEND:-$SCRIPT_DIR/rearm-unattend.xml}"
 GIT_GATE_PS1="${VMH_GIT_GATE_PS1:-$SCRIPT_DIR/../lib/assert-git-provisioned.ps1}"
+PWSH_GATE_PS1="${VMH_PWSH_GATE_PS1:-$SCRIPT_DIR/../lib/assert-pwsh-provisioned.ps1}"
 DRY_RUN="${VMH_SYSPREP_DRY_RUN:-}"
 
 # shellcheck disable=SC2206
@@ -157,6 +158,9 @@ if [[ -n "$DRY_RUN" ]]; then
   log "  2b) GATE: assert-git-provisioned.ps1 in the guest — abort unless Git for"
   log "      Windows is on the MACHINE PATH and the MSYS toolchain resolves"
   log "      through bin\\bash.exe (VMH_SKIP_GIT_GATE=1 to override, loudly)"
+  log "  2c) GATE: assert-pwsh-provisioned.ps1 in the guest — abort unless"
+  log "      PowerShell 7 is on the MACHINE PATH and the interpreter runs"
+  log "      (VMH_SKIP_PWSH_GATE=1 to override, loudly)"
   log "  3) guest: DISM /Online /Cleanup-Image /StartComponentCleanup /ResetBase; reboot"
   log "     guest: clear ReserveManager scenario + Set-ReservedStorageState Disabled"
   log "     guest: sysprep /generalize /oobe /shutdown /quiet /unattend:<rearm>"
@@ -282,6 +286,45 @@ else
     fail "Git for Windows gate FAILED — refusing to build a golden whose clones cannot run 'shell: bash' steps (see [git-gate] output above; re-run guest-recipes/lib/provision-git.ps1 in the guest, then retry)"
   fi
   log "gate passed: Git for Windows is usable by services on clones of this golden"
+fi
+
+# ── gate: refuse to build a golden whose clones have no usable pwsh ──────────
+#
+# The layer directly under the Git gate, and it was found the same way. Once
+# `shell: bash` steps started working, every Windows CI job died one step later
+# with "##[error]pwsh: command not found": these goldens ship only Windows
+# PowerShell 5.1, GitHub's hosted images bundle PowerShell 7, and nothing in
+# this recipe ever installed it.
+#
+# guest-recipes/lib/provision-pwsh.ps1 exits 0 even when it fails, for the same
+# FirstLogonCommands reason as the Git helper, so the same argument applies:
+# that trade-off is only defensible because of this gate. Without it a
+# pwsh-less image sails through and the first symptom is CI failing again.
+#
+# Placed next to the Git gate and BEFORE the ~45-minute DISM /ResetBase so a
+# bad image fails in seconds rather than after the long leg. Nothing in steps
+# 3a/3b touches C:\pwsh or the machine PATH -- /ResetBase drops superseded
+# component-store payloads, which this is not -- so asserting here is
+# equivalent to asserting immediately before sysprep.
+#
+# Set VMH_SKIP_PWSH_GATE=1 only to build a deliberately pwsh-less image. It is
+# loud on purpose.
+if [[ -n "${VMH_SKIP_PWSH_GATE:-}" ]]; then
+  log "WARNING: VMH_SKIP_PWSH_GATE set — NOT verifying PowerShell 7."
+  log "WARNING: clones of the resulting golden may have no pwsh.exe and will"
+  log "WARNING: fail every GitHub Actions 'shell: pwsh' step. Do not ship this."
+else
+  [[ -f "$PWSH_GATE_PS1" ]] || fail "pwsh gate script not found: $PWSH_GATE_PS1"
+  log "gate: verifying PowerShell 7 is on the guest's MACHINE PATH and the interpreter runs"
+  sshpass -p "$GUEST_PASSWORD" scp -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+    -o PreferredAuthentications=password "$PWSH_GATE_PS1" \
+    "admin@$IP:C:/Windows/Temp/assert-pwsh-provisioned.ps1" \
+    || fail "could not scp the pwsh gate script into the guest"
+  if ! ssh_guest "$IP" 'powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Temp\assert-pwsh-provisioned.ps1' 2>&1 | sed 's/^/  [pwsh-gate] /'; then
+    fail "PowerShell 7 gate FAILED — refusing to build a golden whose clones cannot run 'shell: pwsh' steps (see [pwsh-gate] output above; re-run guest-recipes/lib/provision-pwsh.ps1 in the guest, then retry)"
+  fi
+  log "gate passed: PowerShell 7 is usable by services on clones of this golden"
 fi
 
 # ── step 3a: component-store repair — DISM /ResetBase (THE UNBLOCK) ──────────

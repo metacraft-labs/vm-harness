@@ -171,6 +171,28 @@ if [[ ! -f "${LIB_DIR}/assert-git-provisioned.ps1" ]]; then
   echo "build-autounattend-iso: missing assert-git-provisioned.ps1 in ${LIB_DIR}" >&2
   exit 1
 fi
+if [[ ! -f "${LIB_DIR}/provision-pwsh.ps1" ]]; then
+  echo "build-autounattend-iso: missing provision-pwsh.ps1 in ${LIB_DIR}" >&2
+  exit 1
+fi
+if [[ ! -f "${LIB_DIR}/assert-pwsh-provisioned.ps1" ]]; then
+  echo "build-autounattend-iso: missing assert-pwsh-provisioned.ps1 in ${LIB_DIR}" >&2
+  exit 1
+fi
+# Default the PowerShell 7 ZIP to whatever ../lib/fetch-powershell.sh left in
+# ./build. Resolved by glob so the recipe does not have to repeat the pinned
+# version (provision-pwsh.ps1 owns it).
+PWSH_ZIP_SRC="${VMH_PWSH_ZIP:-}"
+if [[ -z "${PWSH_ZIP_SRC}" ]]; then
+  for candidate in "${BUILD_DIR}"/PowerShell-*-win-arm64.zip; do
+    [[ -f "${candidate}" ]] && PWSH_ZIP_SRC="${candidate}" && break
+  done
+fi
+if [[ -n "${PWSH_ZIP_SRC}" && ! -f "${PWSH_ZIP_SRC}" ]]; then
+  echo "build-autounattend-iso: PowerShell ZIP not found: ${PWSH_ZIP_SRC}" >&2
+  exit 1
+fi
+
 if [[ -n "${PORTABLE_GIT_SRC}" && ! -f "${PORTABLE_GIT_SRC}" ]]; then
   echo "build-autounattend-iso: PortableGit archive not found: ${PORTABLE_GIT_SRC}" >&2
   exit 1
@@ -191,6 +213,10 @@ cp "${LIB_DIR}/provision-git.ps1" "${STAGE_DIR}/provision-git.ps1"
 # The gate that makes provision-git.ps1's exit-0-on-failure safe. This golden
 # is captured by a MANUAL SysPrep, so the gate must ride along in the image.
 cp "${LIB_DIR}/assert-git-provisioned.ps1" "${STAGE_DIR}/assert-git-provisioned.ps1"
+cp "${LIB_DIR}/provision-pwsh.ps1" "${STAGE_DIR}/provision-pwsh.ps1"
+# The gate that makes provision-pwsh.ps1's exit-0-on-failure safe, carried for
+# the same reason as the Git one above.
+cp "${LIB_DIR}/assert-pwsh-provisioned.ps1" "${STAGE_DIR}/assert-pwsh-provisioned.ps1"
 if [[ -n "${OPENSSH_ZIP_SRC}" ]]; then
   mkdir -p "${STAGE_DIR}/openssh"
   cp "${OPENSSH_ZIP_SRC}" "${STAGE_DIR}/openssh/OpenSSH-ARM64.zip"
@@ -223,6 +249,17 @@ if [[ -n "${PORTABLE_GIT_SRC}" ]]; then
   echo "build-autounattend-iso: embedded PortableGit archive: ${PORTABLE_GIT_SRC}"
 else
   echo "build-autounattend-iso: PortableGit archive not embedded; the guest will download it from the pinned URL (still checksum-verified)" >&2
+fi
+
+if [[ -n "${PWSH_ZIP_SRC}" ]]; then
+  mkdir -p "${STAGE_DIR}/pwsh"
+  cp "${PWSH_ZIP_SRC}" "${STAGE_DIR}/pwsh/$(basename -- "${PWSH_ZIP_SRC}")"
+  if [[ -f "${PWSH_ZIP_SRC}.sha256" ]]; then
+    cp "${PWSH_ZIP_SRC}.sha256" "${STAGE_DIR}/pwsh/$(basename -- "${PWSH_ZIP_SRC}").sha256"
+  fi
+  echo "build-autounattend-iso: embedded PowerShell 7 ZIP: ${PWSH_ZIP_SRC}"
+else
+  echo "build-autounattend-iso: PowerShell 7 ZIP not embedded; the guest will download it from the pinned URL (still checksum-verified)" >&2
 fi
 
 rm -f "${ISO_PATH}"

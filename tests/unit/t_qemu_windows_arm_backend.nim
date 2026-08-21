@@ -126,6 +126,23 @@ proc specializeDeploymentCommands(xml: XmlNode): seq[XmlNode] =
         if runSync != nil:
           return runSync.elements("RunSynchronousCommand")
 
+## Windows applies RunSynchronousCommand in `Order` sequence; a gap or a
+## repeat makes Setup skip or re-run a step. THAT is the property worth
+## asserting. Pinning the exact count instead just breaks every time a step is
+## legitimately added -- which is what happened when PowerShell 7 provisioning
+## was staged here, and it says nothing about correctness either way.
+proc ordersAreContiguousFrom1(commands: seq[XmlNode]): bool =
+  commands.mapIt(it.elementText("Order")) == toSeq(1 .. commands.len).mapIt($it)
+
+## Locate by Description, not by index, for the reason spelled out on the
+## install-done test below: inserting a command shifts every later position,
+## and an index-pinned lookup then asserts against the WRONG command while
+## still passing or failing for reasons unrelated to its name.
+proc commandDescribed(commands: seq[XmlNode], description: string): XmlNode =
+  for command in commands:
+    if command.elementText("Description") == description:
+      return command
+
 suite "QemuWindowsArmBackend pure behavior":
   test "windows-arm autounattend has exact LabConfig bypasses in windowsPE":
     let xml = windowsArmAutounattend()
@@ -152,11 +169,13 @@ suite "QemuWindowsArmBackend pure behavior":
 
   test "windows-arm specialize stages OpenSSH provisioning script locally":
     let commands = windowsArmAutounattend().specializeDeploymentCommands()
-    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3", "4", "5", "6"]
+    check commands.ordersAreContiguousFrom1()
 
-    let stage = commands[0].elementText("Path")
-    check commands[0].elementText("Description") ==
-      "Stage OpenSSH provisioning script locally"
+    let command = commands.commandDescribed("Stage OpenSSH provisioning script locally")
+    check command != nil
+    # A nil here would crash the binary and hide the rest of the verdict; the
+    # content checks below then fail on their own terms instead.
+    let stage = if command == nil: "" else: command.elementText("Path")
     check stage.len < 260
     check "for %i in (D E F G H)" in stage
     check "if exist %i:\\provision-openssh.ps1" in stage
@@ -165,11 +184,13 @@ suite "QemuWindowsArmBackend pure behavior":
 
   test "windows-arm specialize stages offline OpenSSH ARM64 zip locally when present":
     let commands = windowsArmAutounattend().specializeDeploymentCommands()
-    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3", "4", "5", "6"]
+    check commands.ordersAreContiguousFrom1()
 
-    let stage = commands[1].elementText("Path")
-    check commands[1].elementText("Description") ==
-      "Stage OpenSSH ARM64 portable zip locally when present"
+    let command = commands.commandDescribed("Stage OpenSSH ARM64 portable zip locally when present")
+    check command != nil
+    # A nil here would crash the binary and hide the rest of the verdict; the
+    # content checks below then fail on their own terms instead.
+    let stage = if command == nil: "" else: command.elementText("Path")
     check stage.len < 260
     check "for %i in (D E F G H)" in stage
     check "if exist %i:\\openssh\\OpenSSH-ARM64.zip" in stage
@@ -178,11 +199,13 @@ suite "QemuWindowsArmBackend pure behavior":
 
   test "windows-arm specialize stages offline VirtIO NetKVM ARM64 driver locally when present":
     let commands = windowsArmAutounattend().specializeDeploymentCommands()
-    check commands.mapIt(it.elementText("Order")) == @["1", "2", "3", "4", "5", "6"]
+    check commands.ordersAreContiguousFrom1()
 
-    let stage = commands[2].elementText("Path")
-    check commands[2].elementText("Description") ==
-      "Stage VirtIO NetKVM ARM64 driver locally when present"
+    let command = commands.commandDescribed("Stage VirtIO NetKVM ARM64 driver locally when present")
+    check command != nil
+    # A nil here would crash the binary and hide the rest of the verdict; the
+    # content checks below then fail on their own terms instead.
+    let stage = if command == nil: "" else: command.elementText("Path")
     check stage.len < 260
     check "for %i in (D E F G H)" in stage
     check "if exist %i:\\virtio\\NetKVM\\w11\\ARM64\\netkvm.inf" in stage

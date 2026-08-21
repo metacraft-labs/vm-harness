@@ -530,42 +530,94 @@
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 13. Stage the harness's first-boot bootstrap script onto C:\.
+        <!-- 13. Stage the PowerShell 7 provisioning helper onto C:\.
+             Same removable-drive scan and the same reason as step 11:
+             build-autounattend-iso.sh always places
+             guest-recipes/lib/provision-pwsh.ps1 at the ISO root (and
+             the pinned PowerShell ZIP under pwsh\ when the operator
+             ran ../lib/fetch-powershell.sh). -->
+        <SynchronousCommand wcm:action="add">
+          <Order>13</Order>
+          <CommandLine>cmd.exe /c "for %i in (D E F G H) do if exist %i:\provision-pwsh.ps1 copy /Y %i:\provision-pwsh.ps1 C:\Windows\Temp\provision-pwsh.ps1"</CommandLine>
+          <Description>Stage provision-pwsh.ps1 on C:\Windows\Temp</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 14. Install PowerShell 7 (pwsh) and put C:\pwsh on the
+             MACHINE PATH.
+
+             This is the fix for the layer under the Git defect above.
+             Once `shell: bash` steps started working, every Windows CI
+             job in the fleet died one step later with
+             "##[error]pwsh: command not found": these goldens ship only
+             Windows PowerShell 5.1, GitHub's hosted images bundle
+             PowerShell 7, and nothing here ever installed it.
+
+             Rewriting workflows to `shell: powershell` would not have
+             fixed it. The Actions runner resolves a step's shell by
+             EXECUTABLE NAME, and several things invoke pwsh.exe as a
+             plain program regardless of any step's `shell:` — the
+             dev-exec.cmd trampoline setup-dev-env generates, the
+             `pwsh -File ...` calls inside codetracer's bootstrap smoke
+             job, and `just` on Windows. The binary has to be here.
+
+             MACHINE PATH is the load-bearing detail for exactly the
+             reason spelled out in step 12, and the persistent
+             (non-GARM) Windows runner already installs this same
+             pinned ZIP to this same C:\pwsh — so both halves of the
+             fleet now resolve `pwsh` identically.
+
+             The helper is idempotent, pins the PowerShell version and
+             SHA-256, verifies the checksum before extracting, proves
+             the interpreter runs, and writes
+             C:\Windows\Temp\vmh-pwsh-provision-failed on failure. It
+             deliberately exits 0 either way so a failure cannot wedge
+             the rest of this chain; build-sysprep-golden.sh runs
+             ../lib/assert-pwsh-provisioned.ps1 as a hard gate before
+             sysprep, which is what makes that safe. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>14</Order>
+          <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$p='C:\Windows\Temp\provision-pwsh.ps1'; if (Test-Path -LiteralPath $p) { &amp; $p -Arch x64 } else { Set-Content -LiteralPath 'C:\Windows\Temp\vmh-pwsh-provision-failed' -Value 'provision-pwsh.ps1 not found on the autounattend ISO' -Encoding UTF8 -Force }; exit 0"</CommandLine>
+          <Description>Install PowerShell 7 on the machine PATH</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- 15. Stage the harness's first-boot bootstrap script onto C:\.
              The autounattend ISO carries first-boot.ps1 (when the
              operator supplied the first-boot-script flag to
              build-autounattend-iso.sh). The CMD-side `for` loop
              searches removable drives for it because drive letters
              under OOBE depend on the device attach order. -->
         <SynchronousCommand wcm:action="add">
-          <Order>13</Order>
+          <Order>15</Order>
           <CommandLine>cmd.exe /c "for %i in (D E F G H) do if exist %i:\first-boot.ps1 copy /Y %i:\first-boot.ps1 C:\first-boot.ps1"</CommandLine>
           <Description>Stage first-boot.ps1 on C:\</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 14. Run the first-boot script if present (idempotent —
+        <!-- 16. Run the first-boot script if present (idempotent —
              the script itself is responsible for not re-running
              work on subsequent boots). -->
         <SynchronousCommand wcm:action="add">
-          <Order>14</Order>
+          <Order>16</Order>
           <CommandLine>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "if (Test-Path C:\first-boot.ps1) { &amp; C:\first-boot.ps1 *&gt; C:\Windows\Temp\first-boot.log }"</CommandLine>
           <Description>Run first-boot.ps1 if present</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 15. Marker file the recipe scripts (and the libvirt
+        <!-- 17. Marker file the recipe scripts (and the libvirt
              backend's startAndAwaitReady) poll for. Written before
              shutdown so the controller can confirm via SSH after the
              VM is restarted that the install finished without
              aborting partway through. -->
         <SynchronousCommand wcm:action="add">
-          <Order>15</Order>
+          <Order>17</Order>
           <CommandLine>cmd.exe /c "echo install-done > C:\Windows\Temp\repro-install-done"</CommandLine>
           <Description>Write install-done sentinel</Description>
           <RequiresUserInput>false</RequiresUserInput>
         </SynchronousCommand>
 
-        <!-- 16. Shut the guest down so the libvirt backend's
+        <!-- 18. Shut the guest down so the libvirt backend's
              virt-install wait flag sees the domain transition to
              "shut off" and treats that as install-complete. Without
              this, virt-install waits the full bootTimeoutSec (90
@@ -574,7 +626,7 @@
              controller restarts the VM in the next step
              (startAndAwaitReady) once provision returns. -->
         <SynchronousCommand wcm:action="add">
-          <Order>16</Order>
+          <Order>18</Order>
           <CommandLine>cmd.exe /c "shutdown /s /t 5 /c \"vm-harness FirstLogonCommands complete; signalling install-done to virt-install\""</CommandLine>
           <Description>Shut down to signal install-complete to virt-install wait</Description>
           <RequiresUserInput>false</RequiresUserInput>
