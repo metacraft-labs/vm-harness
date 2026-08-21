@@ -1673,10 +1673,9 @@ proc transientBootNetworkArgs*(spec: BootMediaSpec): seq[string] =
   if spec.sshForwardPort notin 1 .. 65535:
     raise newException(ValueError,
       "BootMediaSpec.sshForwardPort must be 0 or a TCP port from 1 to 65535")
-  @["--network", "none",
-    "--qemu-commandline=-netdev user,id=repro_user_net," &
-      "hostfwd=tcp:127.0.0.1:" & $spec.sshForwardPort &
-      "-:22 -device virtio-net-pci,netdev=repro_user_net"]
+  @["--network", "user,model=virtio",
+    "--qemu-commandline=-set netdev.hostnet0.hostfwd=" &
+      "tcp:127.0.0.1:" & $spec.sshForwardPort & "-:22"]
 
 proc resolveTransientOvmf(spec: BootMediaSpec): tuple[loader, nvram: string] =
   ## Resolve OVMF without assuming that libvirt's firmware descriptor search
