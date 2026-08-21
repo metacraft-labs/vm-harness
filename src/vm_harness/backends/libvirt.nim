@@ -1673,9 +1673,18 @@ proc transientBootNetworkArgs*(spec: BootMediaSpec): seq[string] =
   if spec.sshForwardPort notin 1 .. 65535:
     raise newException(ValueError,
       "BootMediaSpec.sshForwardPort must be 0 or a TCP port from 1 to 65535")
-  @["--network", "user,model=virtio",
-    "--qemu-commandline=-set netdev.hostnet0.hostfwd=" &
-      "tcp:127.0.0.1:" & $spec.sshForwardPort & "-:22"]
+  @["--network", "user,model=virtio"]
+
+proc transientBootHostForwardHmp*(spec: BootMediaSpec): string =
+  ## Add the loopback forward after libvirt has created its user-mode netdev.
+  ## QEMU processes command-line property overrides before netdev creation, so
+  ## the monitor command is the first point where ``hostnet0`` exists.
+  if spec.sshForwardPort == 0:
+    return ""
+  if spec.sshForwardPort notin 1 .. 65535:
+    raise newException(ValueError,
+      "BootMediaSpec.sshForwardPort must be 0 or a TCP port from 1 to 65535")
+  "hostfwd_add hostnet0 tcp:127.0.0.1:" & $spec.sshForwardPort & "-:22"
 
 proc resolveTransientOvmf(spec: BootMediaSpec): tuple[loader, nvram: string] =
   ## Resolve OVMF without assuming that libvirt's firmware descriptor search
@@ -1859,6 +1868,19 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
       raise newVmHarnessError($b.id, lpStartup,
         "LibvirtBackend.bootFromMedia: virt-install failed (exit " &
         $r.exitCode & "): " & r.stdout)
+
+    if spec.sshForwardPort > 0:
+      let forward = b.runVirsh(@["qemu-monitor-command", domainName,
+        "--hmp", transientBootHostForwardHmp(spec)], timeoutSec = 30)
+      if forward.exitCode != 0:
+        try:
+          b.destroyDomain(domainName)
+          b.undefineDomain(domainName)
+          b.deleteDomainDisk(domainName)
+        except CatchableError: discard
+        raise newVmHarnessError($b.id, lpStartup,
+          "LibvirtBackend.bootFromMedia: SSH port forward failed (exit " &
+          $forward.exitCode & "): " & forward.stdout)
 
     var extra = initTable[string, string]()
     extra["mediaPath"] = spec.mediaPath

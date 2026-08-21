@@ -223,10 +223,11 @@ suite "LibvirtBackend smoke (no live virsh)":
       @["--network", "none"]
     let forwarded = transientBootNetworkArgs(BootMediaSpec(
       sshForwardPort: 22022))
-    check forwarded == @[
-      "--network", "user,model=virtio",
-      "--qemu-commandline=-set netdev.hostnet0.hostfwd=" &
-        "tcp:127.0.0.1:22022-:22"]
+    check forwarded == @["--network", "user,model=virtio"]
+    check transientBootHostForwardHmp(BootMediaSpec()) == ""
+    check transientBootHostForwardHmp(BootMediaSpec(
+      sshForwardPort: 22022)) ==
+        "hostfwd_add hostnet0 tcp:127.0.0.1:22022-:22"
     expect ValueError:
       discard transientBootNetworkArgs(BootMediaSpec(sshForwardPort: -1))
 
