@@ -276,3 +276,38 @@ Per-member cost is one 20 GB VHDX plus a ~3.4 GB memory image. The
 `Import-VM` step is where cheap block copies would pay off (this host's C:
 is NTFS, D: is ReFS) — but only at pool construction, which is the one time
 nobody is waiting.
+
+### Recycling: restore-to-baseline is the per-job path, cloning is not
+
+Cloning and restoring answer different questions, and conflating them is
+what made clone-per-job look attractive:
+
+* **Clone (`Export-VM` + `Import-VM`, ~50 s)** changes POOL CAPACITY. It
+  adds a member. Nobody is waiting on it.
+* **Restore (`Restore-VMCheckpoint` + resume, 7-14 s)** RECYCLES a member
+  between jobs. It happens constantly.
+
+And because a member can be restored the moment its job FINISHES rather than
+when the next one arrives, the recycle cost sits between jobs instead of in
+front of them: a pool member is already warm and waiting when work is
+dispatched, so per-job start latency approaches zero.
+
+Verified on the 25H2 golden, 2026-08-21:
+
+| step | time |
+| ---- | ---- |
+| restore to `warm` + resume, from a clean member | 6.67 s |
+| restore to `warm` + resume, after a job wrote to disk | 13.59 s |
+
+**Recycle cost scales with how much the job wrote**, because restoring
+discards the checkpoint's `.avhdx` delta and a busy job makes a bigger one.
+6.67 s is the floor, not the number to plan capacity against; budget the
+higher figure for real workloads.
+
+The isolation guarantee was checked rather than assumed. A simulated job
+created `C:\_work\job-42\artifact.txt`; after the restore both the file and
+its directory were gone, while the member kept its own computer name, its
+own DHCP lease, and an uptime of 00:33:39 — i.e. it resumed into its warm
+state rather than rebooting, and did not acquire a new identity. That is
+exactly the property the N-distinct-warm-states design needs: recycling
+returns a member to ITS baseline, so nothing ever collides.
