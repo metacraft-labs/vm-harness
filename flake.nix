@@ -2,7 +2,10 @@
   description = "vm-harness — cross-platform VM lifecycle orchestration library";
 
   inputs = {
-    nixos-modules.url = "github:metacraft-labs/nixos-modules";
+    # nixos-modules is this repo's only upstream flake: nixpkgs, flake-parts and
+    # git-hooks all come through it, and so does the org's single reprobuild
+    # pin. Keep the lock fresh rather than adding a reprobuild input here.
+    nixos-modules.url = "github:metacraft-labs/nixos-modules/dev";
     nixpkgs.follows = "nixos-modules/nixpkgs-unstable";
     flake-parts.follows = "nixos-modules/flake-parts";
     git-hooks.follows = "nixos-modules/git-hooks-nix";
