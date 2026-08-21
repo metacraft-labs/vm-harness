@@ -54,6 +54,15 @@ param(
     [string]$RunnerDir = 'C:\actions-runner',
     [int]$ReadyTimeoutSec = 300,
     [int]$JobTimeoutSec = 3600,
+    # Serve ONE member. The parent invocation spawns one child process per
+    # member with this set; without it the parent would enumerate members and
+    # spawn children forever.
+    [string]$Member = '',
+    # A member that fails this many cycles in a row is parked rather than
+    # retried forever. A wedged member that keeps re-registering looks like
+    # capacity to GitHub while accepting jobs it cannot run, which is worse
+    # than being one member short.
+    [int]$MaxConsecutiveFailures = 3,
     [switch]$Once
 )
 
@@ -147,41 +156,104 @@ function Invoke-OneJobCycle {
 }
 
 # ------------------------------------------------------------------ main ---
-$members = @(Get-VM | Where-Object { $_.Name -like "$MemberPrefix-*" } | Sort-Object Name)
-if ($members.Count -eq 0) { throw "no pool members found (prefix '$MemberPrefix-'); run hyperv-pool.ps1 -Construct" }
-Log "pool has $($members.Count) member(s): $(($members | Select-Object -Expand Name) -join ', ')"
-Log "labels: $Labels"
 
+function Invoke-ServeLoop {
+    param([string]$Vm)
+    # The per-member loop. Each pass serves exactly one job and then recycles,
+    # so isolation holds at both layers: --ephemeral consumes the GitHub-side
+    # registration, and the restore discards everything written to disk.
+    if (-not (Get-VMSnapshot -VMName $Vm -Name 'baseline' -ErrorAction SilentlyContinue)) {
+        throw "member '$Vm' has no 'baseline' checkpoint; run hyperv-pool.ps1 -Construct"
+    }
+    $fails = 0
+    $cycle = 0
+    while ($true) {
+        $cycle++
+        try {
+            if ((Get-VM -Name $Vm).State -ne 'Running') { Start-VM -Name $Vm }
+            Wait-GuestReady -Vm $Vm -TimeoutSec $ReadyTimeoutSec | Out-Null
+            Invoke-OneJobCycle -Vm $Vm
+            Restore-Member -Vm $Vm
+            $fails = 0
+        } catch {
+            $fails++
+            Log "[$Vm] cycle $cycle failed ($fails/$MaxConsecutiveFailures): $($_.Exception.Message)"
+            if ($fails -ge $MaxConsecutiveFailures) {
+                Log "[$Vm] PARKED after $fails consecutive failures. It is NOT serving."
+                Log "[$Vm] capture the console before assuming it is slow:"
+                Log "[$Vm]   tools/hyperv-console-shot.ps1 -VmName $Vm"
+                Log "[$Vm] then rebuild it: tools/hyperv-pool.ps1 -Rebaseline -Member $Vm"
+                return
+            }
+            # Try to get back to a known state before the next attempt. A
+            # member left mid-cycle has a half-configured runner, which makes
+            # the next config.cmd fail too and turns one bad cycle into a
+            # permanent one.
+            try { Restore-Member -Vm $Vm } catch { Log "[$Vm] recovery restore also failed: $($_.Exception.Message)" }
+        }
+        if ($Once) { Log "[$Vm] -Once: stopping after one cycle"; return }
+    }
+}
+
+if ($Member) {
+    Log "serving member $Member (labels: $Labels)"
+    Invoke-ServeLoop -Vm $Member
+    return
+}
+
+$members = @(Get-VM | Where-Object { $_.Name -like "$MemberPrefix-*" } | Sort-Object Name)
+if ($members.Count -eq 0) {
+    throw "no pool members found (prefix '$MemberPrefix-'); run hyperv-pool.ps1 -Construct"
+}
 foreach ($m in $members) {
     if (-not (Get-VMSnapshot -VMName $m.Name -Name 'baseline' -ErrorAction SilentlyContinue)) {
         throw "member '$($m.Name)' has no 'baseline' checkpoint; run hyperv-pool.ps1 -Construct"
     }
 }
+Log "pool has $($members.Count) member(s): $(($members | Select-Object -Expand Name) -join ', ')"
+Log "labels: $Labels"
 
-# One background job per member so they serve concurrently -- N members is N
-# runners, which is the entire point of a scale set.
-$jobs = @()
+# One CHILD PROCESS per member, each with -Member so it serves exactly one.
+# Separate processes rather than Start-Job: a job shares the parent runspace,
+# and PowerShell Direct sessions from inside a job are unreliable, which
+# matters because every guest interaction here goes through one.
+$procs = @()
 foreach ($m in $members) {
-    $jobs += Start-Job -Name "pool-$($m.Name)" -ScriptBlock {
-        param($vm, $scriptPath, $org, $labels, $prefix, $user, $pass, $rdir, $rt, $jt, $once)
-        # Re-enter this same script in single-member mode inside the job.
-        & $scriptPath -Org $org -Labels $labels -MemberPrefix $prefix `
-            -GuestUser $user -GuestPassword $pass -RunnerDir $rdir `
-            -ReadyTimeoutSec $rt -JobTimeoutSec $jt @(if ($once) { '-Once' })
-    } -ArgumentList $m.Name, $PSCommandPath, $Org, $Labels, $MemberPrefix,
-                    $GuestUser, $GuestPassword, $RunnerDir, $ReadyTimeoutSec,
-                    $JobTimeoutSec, $Once.IsPresent
+    $args = @(
+        '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+        '-File', $PSCommandPath,
+        '-Member', $m.Name,
+        '-Org', $Org, '-Labels', $Labels,
+        '-GuestUser', $GuestUser, '-GuestPassword', $GuestPassword,
+        '-RunnerDir', $RunnerDir,
+        '-ReadyTimeoutSec', $ReadyTimeoutSec,
+        '-JobTimeoutSec', $JobTimeoutSec,
+        '-MaxConsecutiveFailures', $MaxConsecutiveFailures
+    )
+    if ($Once) { $args += '-Once' }
+    $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $args -PassThru -NoNewWindow
+    $procs += [pscustomobject]@{ Member = $m.Name; Process = $p }
+    Log "[$($m.Name)] worker pid $($p.Id)"
 }
 
-Log "started $($jobs.Count) member worker(s); Ctrl-C or Stop-Job to end"
+Log "started $($procs.Count) worker(s); Ctrl-C to stop"
 try {
     while ($true) {
-        Receive-Job -Job $jobs -ErrorAction SilentlyContinue
-        if (@($jobs | Where-Object { $_.State -eq 'Running' }).Count -eq 0) { break }
-        Start-Sleep -Seconds 5
+        Start-Sleep -Seconds 15
+        $alive = @($procs | Where-Object { -not $_.Process.HasExited })
+        if ($alive.Count -eq 0) { Log "all workers exited"; break }
+        foreach ($x in $procs) {
+            if ($x.Process.HasExited -and -not $x.PSObject.Properties['Reported']) {
+                Add-Member -InputObject $x -NotePropertyName Reported -NotePropertyValue $true
+                Log "[$($x.Member)] worker exited (code $($x.Process.ExitCode)) -- that member is no longer serving"
+            }
+        }
     }
 } finally {
-    Receive-Job -Job $jobs -ErrorAction SilentlyContinue
-    $jobs | Stop-Job -ErrorAction SilentlyContinue
-    $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
+    foreach ($x in $procs) {
+        if (-not $x.Process.HasExited) {
+            Log "[$($x.Member)] stopping worker pid $($x.Process.Id)"
+            Stop-Process -Id $x.Process.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
