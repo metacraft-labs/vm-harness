@@ -401,6 +401,20 @@ proc codeOnly(script: string): string =
     kept.add rawLine
   kept.join("\n")
 
+## Non-comment lines containing `needle`. Several assertions below care about
+## the line that DOES a thing, not merely that the file mentions it somewhere:
+## a mutation-test run found that `MachineEnvKey`, `DoNotExpandEnvironmentNames`
+## and `RegistryValueKind]::ExpandString` each appear more than once (in prose,
+## and in a later read-back check), so a whole-file `contains` stayed green with
+## the actual write mutated.
+proc codeLinesWith(script, needle: string): seq[string] =
+  for rawLine in script.splitLines():
+    let line = rawLine.strip()
+    if line.startsWith("#"):
+      continue
+    if needle in line:
+      result.add line
+
 ## Non-comment lines that invoke the named PowerShell variable as a native
 ## command. Comments are skipped deliberately: these recipes explain the
 ## quoting traps at length, and quoting a forbidden form in prose is fine.
@@ -466,16 +480,19 @@ suite "Windows goldens put PowerShell 7 on the machine PATH":
   test "provision-pwsh.ps1 verifies the checksum before it extracts":
     # Ordering is the whole point: a hash computed after extraction proves
     # nothing, because the untrusted bytes are already on disk by then.
-    let script = readLib("provision-pwsh.ps1")
-    let hashAt = script.find("Get-FileHash")
-    let extractAt = script.find("ExtractToDirectory")
+    let script = readLib("provision-pwsh.ps1").codeOnly()
+    # The `throw`, not just the hashing: what has to precede extraction is the
+    # point where a bad archive STOPS, and it is the throw that stops it.
+    let hashAt = script.find("(Get-FileHash -LiteralPath $archive")
+    let throwAt = script.find("throw \"SHA-256 mismatch")
+    let extractAt = script.find("]::ExtractToDirectory(")
     checkpoint "provision-pwsh.ps1: Get-FileHash at " & $hashAt &
-      ", ExtractToDirectory at " & $extractAt
+      ", mismatch throw at " & $throwAt & ", ExtractToDirectory at " & $extractAt
     check hashAt >= 0
+    check throwAt >= 0
     check extractAt >= 0
     check hashAt < extractAt
-    # And a mismatch has to be fatal, not merely logged.
-    script.mustContain("SHA-256 mismatch", "provision-pwsh.ps1")
+    check throwAt < extractAt
 
   test "provision-pwsh.ps1 writes the MACHINE PATH as raw REG_EXPAND_SZ":
     # The Actions runner is a SERVICE. services.exe builds one environment
@@ -485,10 +502,40 @@ suite "Windows goldens put PowerShell 7 on the machine PATH":
     # %SystemRoot% is baked into every clone's PATH.
     let script = readLib("provision-pwsh.ps1")
     const label = "provision-pwsh.ps1"
-    script.mustContain(MachineEnvKey, label)
-    script.mustContain("DoNotExpandEnvironmentNames", label)
-    script.mustContain("RegistryValueKind]::ExpandString", label)
-    script.mustContain(PwshInstallDir, label)
+    script.codeOnly().mustContain(MachineEnvKey, label & " (code)")
+    script.codeOnly().mustContain(PwshInstallDir, label & " (code)")
+
+    # The WRITE itself must name ExpandString. Asserting only that the token
+    # appears somewhere is satisfied by the read-back check further down, which
+    # leaves the write free to demote the value to REG_SZ.
+    let writes = script.codeLinesWith("SetValue(\'Path\'")
+    checkpoint label & ": found " & $writes.len & " machine-PATH writes"
+    check writes.len > 0
+    for w in writes:
+      w.mustContain("RegistryValueKind]::ExpandString", label & " PATH write")
+
+    # Likewise EVERY read of the value must suppress expansion, not just one of
+    # them: a single expanding read is enough to bake this build host's
+    # %SystemRoot% into the value that gets written back.
+    # Likewise EVERY read of the value must suppress expansion, not just one of
+    # them: a single expanding read is enough to bake this build host's
+    # %SystemRoot% into the value that gets written back. These calls wrap
+    # across two lines, so scan each call's text up to its closing paren
+    # rather than line by line.
+    let code = script.codeOnly()
+    var readIdx = 0
+    var expandingReads = 0
+    while true:
+      let at = code.find("GetValue(", readIdx)
+      if at < 0: break
+      let close = code.find(')', start = at)
+      let call = if close > at: code[at .. close] else: code[at .. ^1]
+      if "\'Path\'" in call and "DoNotExpandEnvironmentNames" notin call:
+        expandingReads.inc
+        checkpoint label & ": expanding read of the machine PATH: " & call
+      readIdx = at + 1
+    checkpoint label & ": machine-PATH reads that would expand tokens"
+    check expandingReads == 0
 
     # setx.exe truncates a PATH past 2047 chars, which would brick the image
     # for every process on it, so the write goes through the registry API.
@@ -534,13 +581,17 @@ suite "Windows goldens put PowerShell 7 on the machine PATH":
     let gate = readLib("assert-pwsh-provisioned.ps1")
     const label = "assert-pwsh-provisioned.ps1"
 
-    gate.mustContain("vmh-pwsh-provision-failed", label)
-    gate.mustContain(MachineEnvKey, label)
-    gate.mustContain("DoNotExpandEnvironmentNames", label)
-    gate.mustContain("RegistryValueKind]::ExpandString", label)
-    gate.mustContain(PwshInstallDir, label)
+    # All of these run against CODE, not prose: this gate's header explains the
+    # mechanism at length and quotes the same registry key, so a whole-file
+    # `contains` stays green even with the check itself removed.
+    let gateCode = gate.codeOnly()
+    gateCode.mustContain("vmh-pwsh-provision-failed", label & " (code)")
+    gateCode.mustContain(MachineEnvKey, label & " (code)")
+    gateCode.mustContain("DoNotExpandEnvironmentNames", label & " (code)")
+    gateCode.mustContain("RegistryValueKind]::ExpandString", label & " (code)")
+    gateCode.mustContain(PwshInstallDir, label & " (code)")
     # A gate that cannot fail is documentation.
-    gate.mustContain("exit 1", label)
+    gateCode.mustContain("exit 1", label & " (code)")
 
     # Same 5.1 trap: the gate is run by powershell.exe too, and a gate that
     # fails for a quoting reason says nothing about its subject.
@@ -622,26 +673,34 @@ suite "Windows goldens put PowerShell 7 on the machine PATH":
     # provision-pwsh.ps1 exits 0 on failure. This is what makes that safe.
     let build = readRecipe("windows-x64-base", "build-sysprep-golden.sh")
     const label = "build-sysprep-golden.sh"
-    build.mustContain("assert-pwsh-provisioned.ps1", label)
-    build.mustContain("VMH_SKIP_PWSH_GATE", label)
+    let buildCode = build.codeOnly()
+    buildCode.mustContain("assert-pwsh-provisioned.ps1", label & " (code)")
+    buildCode.mustContain("VMH_SKIP_PWSH_GATE", label & " (code)")
 
-    # The gate's failure must ABORT the build, not warn and continue.
-    var abortsOnFailure = false
-    for rawLine in build.splitLines():
-      let line = rawLine.strip()
-      if line.startsWith("#"):
-        continue
-      if "PWSH_GATE" in line and "fail " in line:
-        abortsOnFailure = true
-    checkpoint label & ": a failing pwsh gate must call `fail`"
-    check abortsOnFailure
+    # The gate's failure must ABORT the build, not warn and continue -- and the
+    # abort must be the one guarding the GATE RUN, not the incidental
+    # "gate script not found" guard. Anchor on the message so a mutation that
+    # swaps `fail` for `log` there cannot hide behind the other line.
+    let aborts = buildCode.codeLinesWith("PowerShell 7 gate FAILED")
+    checkpoint label & ": found " & $aborts.len &
+      " lines reporting a failed pwsh gate"
+    check aborts.len == 1
+    for a in aborts:
+      a.mustContain("fail \"", label & " pwsh-gate abort")
 
   test "both ISO builders stage provision-pwsh.ps1 and its gate":
+    # Assert the COPY, not a mention. Both names also appear in these scripts'
+    # existence preflight, so a whole-file `contains` stays green with the
+    # staging removed -- which would ship an ISO whose guest has nothing to run.
     for recipe in ["windows-x64-base", "windows-arm-base"]:
-      let iso = readRecipe(recipe, "build-autounattend-iso.sh")
-      iso.mustContain("provision-pwsh.ps1", recipe & "/build-autounattend-iso.sh")
-      iso.mustContain(
-        "assert-pwsh-provisioned.ps1", recipe & "/build-autounattend-iso.sh")
+      let iso = readRecipe(recipe, "build-autounattend-iso.sh").codeOnly()
+      let label = recipe & "/build-autounattend-iso.sh"
+      for script in ["provision-pwsh.ps1", "assert-pwsh-provisioned.ps1"]:
+        let staging = iso.codeLinesWith("${STAGE_DIR}/" & script)
+        checkpoint label & ": staging lines for " & script & ": " & $staging.len
+        check staging.len > 0
+        for line in staging:
+          line.mustContain("cp \"${LIB_DIR}/" & script & "\"", label)
 
   test "fetch-powershell.sh reads the pin instead of duplicating it":
     # Two copies of a checksum is one copy too many: the day they diverge the
