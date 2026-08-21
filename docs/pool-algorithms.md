@@ -235,3 +235,31 @@ Two properties had to be forced into the image before the pool behaved:
   only. `guest-recipes/lib/provision-pwsh.ps1` pins 7.4.6, matching the
   persistent Windows runner, so both halves of the fleet stay on one
   version.
+
+### Two members, concurrent jobs, 2026-08-21
+
+The pool serves in parallel, which is what makes it a scale set rather than
+a runner:
+
+```
+run 32507593960  nonce par-a  ->  runner hv-pool001  on  REPRO-POOL-001
+run 32507601122  nonce par-b  ->  runner hv-pool000  on  REPRO-POOL-000
+```
+
+Both succeeded, on distinct guests with distinct identities
+(172.27.90.110 and 172.27.93.235). And member 000 served its second job
+AFTER a recycle -- the state looking clean is not the same as the member
+still working, so the repeat is the property worth proving.
+
+Construction from the HARDENED golden is roughly an order of magnitude
+faster than from the unhardened one, because members no longer spend their
+first boot applying staged Windows updates:
+
+| step | unhardened | hardened |
+| ---- | ---------- | -------- |
+| import | 350-490 s | **24.4 s** |
+| first boot to reachable | 293 s | **32.9 s** |
+| settle | 280 s | **32.3 s** |
+| baseline checkpoint | 92.8 s | **4.5 s** |
+
+Capacity changes went from ~10 minutes per member to well under two.

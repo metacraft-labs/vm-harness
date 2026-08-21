@@ -391,12 +391,38 @@ $made | Format-Table -AutoSize
 
 # Identity distinctness is the property the whole design rests on, so assert
 # it rather than trusting the rename to have worked.
-$names = @($made | Select-Object -Expand Name)
-$ips   = @($made | Select-Object -Expand IP)
-if ($names.Count -ne ($names | Select-Object -Unique).Count) {
+#
+# Checked across EVERY member, not just the ones this run created. A run that
+# adds one member to an existing pool would otherwise "verify" a set of one
+# and prove nothing -- and a collision between a new member and an existing
+# one is exactly the case worth catching.
+#
+# Every count is wrapped in @(). Under Set-StrictMode, Select-Object -Unique
+# over a single item returns a bare string, and .Count on it throws
+# "The property 'Count' cannot be found on this object" -- which is how this
+# assertion failed on the run that added member 001 to a pool of one.
+$all = @()
+foreach ($m in Get-PoolMembers) {
+    if ((Get-VM -Name $m.Name).State -ne 'Running') { continue }
+    try {
+        $id = Invoke-Command -VMName $m.Name -Credential (Get-GuestCred) -ErrorAction Stop -ScriptBlock {
+            [pscustomobject]@{ CN = $env:COMPUTERNAME
+                               IP = (Get-NetIPAddress -AddressFamily IPv4 |
+                                     Where-Object { $_.IPAddress -notlike '127.*' } |
+                                     Select-Object -First 1 -Expand IPAddress) }
+        }
+        $all += [pscustomobject]@{ Member = $m.Name; Name = $id.CN; IP = $id.IP }
+    } catch {
+        Log "WARNING: could not read identity of $($m.Name); excluded from the distinctness check"
+    }
+}
+$all | Format-Table -AutoSize
+$names = @($all | Select-Object -Expand Name)
+$ips   = @($all | Select-Object -Expand IP)
+if ($names.Count -ne @($names | Select-Object -Unique).Count) {
     throw "members share a computer name: $($names -join ', ') -- renaming failed, and restoring these would collide"
 }
-if ($ips.Count -ne ($ips | Select-Object -Unique).Count) {
+if ($ips.Count -ne @($ips | Select-Object -Unique).Count) {
     throw "members share an IP: $($ips -join ', ') -- the DHCP leases did not diverge"
 }
-Log "verified: every member has a distinct computer name and IP"
+Log "verified: all $($all.Count) member(s) have distinct computer names and IPs"
