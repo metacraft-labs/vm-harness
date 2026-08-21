@@ -23,10 +23,22 @@
 
   WHY THE TOKEN IS MINTED PER CYCLE.
 
-  Registration tokens are single-use and short-lived, so one cannot be baked
-  into the baseline checkpoint -- which is also why the baseline is captured
-  with the runner INSTALLED BUT UNCONFIGURED. Every cycle configures from
-  clean.
+  Because it EXPIRES (one hour), not because it is consumed. Registration
+  tokens are reusable within their TTL -- verified on 2026-08-21 by
+  registering two runners with one token, both succeeding -- so an earlier
+  comment here claiming they are single-use was wrong.
+
+  The distinction matters for how this daemon gets its token. Minting per
+  cycle via `gh` needs an interactive login, which SYSTEM does not have at
+  boot; but win-ci-bare-001 already receives a freshly minted token every 10
+  minutes through the deploy-agent's sealed section, and one such token can
+  register EVERY member of the pool for the hour it lives. That makes the
+  existing channel sufficient for an unattended daemon, with no new secret
+  on the box.
+
+  What the TTL does rule out is baking a token into the baseline checkpoint,
+  which is why the baseline is captured with the runner INSTALLED BUT
+  UNCONFIGURED. Every cycle configures from clean.
 
   WHERE THE RECYCLE COST SITS. Step 4 runs after the job finishes, not
   before the next one starts, so a member is already warm when work arrives.
@@ -102,8 +114,9 @@ function Wait-GuestReady {
 }
 
 function New-RegistrationToken {
-    # Minted on the HOST: the guest has no credentials and should not. The
-    # token is short-lived and single-use, so it is fetched per cycle.
+    # Minted on the HOST: the guest has no credentials and should not. Fetched
+    # per cycle because the token expires in an hour -- not because it is
+    # consumed; it is reusable within that hour (see the header).
     $t = (& gh api -X POST "/orgs/$Org/actions/runners/registration-token" --jq '.token' 2>&1)
     if ($LASTEXITCODE -ne 0 -or -not $t -or $t.Length -lt 20) {
         throw "could not mint a registration token: $t"
