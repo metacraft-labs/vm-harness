@@ -442,6 +442,49 @@ proved service-visible), and the pre-retrofit image is preserved at
 rollback. Re-running `build-sysprep-golden.sh` against that golden now
 inherits Git without any extra step.
 
+## Retrofitting PowerShell 7 onto an already-built golden
+
+Identical shape to the Git retrofit above, substituting
+`../lib/provision-pwsh.ps1` and `../lib/assert-pwsh-provisioned.ps1`:
+
+1. `qemu-img convert -O qcow2 <golden> /storage/scratch/pwsh-work.qcow2` — a
+   full standalone copy. **Never mutate the live golden**: running GARM
+   instances are CoW overlays whose backing file it is.
+2. Boot a throwaway UEFI/OVMF domain off the copy (same XML as
+   `build-sysprep-golden.sh` writes) and SSH in as `admin`.
+3. `scp ../lib/provision-pwsh.ps1 admin@<ip>:C:/Windows/Temp/`, then
+   `powershell -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Temp\provision-pwsh.ps1 -Arch x64`.
+   With nothing staged it downloads the pinned asset and enforces the pinned
+   checksum before extracting.
+4. Run `assert-pwsh-provisioned.ps1` in the guest; exit 0 is the go/no-go.
+5. `shutdown /s`, wait for `shut off`, then capture cold:
+   `qemu-img convert -O qcow2 /storage/scratch/pwsh-work.qcow2 <new-golden>`.
+6. **Prove it on a clone of the promoted artifact, not on the work VM.** The
+   work VM's `services.exe` predates the PATH edit, so nothing on it can
+   demonstrate the property the fleet depends on. Create a CoW overlay off the
+   new golden, boot it fresh, and probe from a **service** context — the runner
+   is a service. A SYSTEM scheduled task is the least ceremony:
+
+   ```
+   schtasks /create /tn probe /ru SYSTEM /sc once /st 00:00 /tr "C:\path\probe.cmd" /f
+   schtasks /run /tn probe
+   ```
+
+   with a `probe.cmd` that records `whoami`, `%PATH%`, `where pwsh` and
+   `pwsh -v`. `pwsh -v` answering for `NT AUTHORITY\SYSTEM` in session 0 is
+   the bar.
+7. Drain the scale set (`garm-cli scaleset update <id> --max-runners 0`), wait
+   for in-flight jobs to **finish on their own**, then swap by `mv` so rollback
+   is a single `mv` back, and restore `--max-runners`.
+
+**Status (2026-08-21):** applied on `high-mem-server`.
+`/storage/iso/golden-win11-cloudbase.qcow2` now carries PowerShell 7.4.6 at
+`C:\pwsh` with `C:\pwsh` on the machine PATH, proved service-visible on a CoW
+clone of the promoted image (`pwsh -v` -> `PowerShell 7.4.6` for
+`NT AUTHORITY\SYSTEM` in session 0). The pre-retrofit image is preserved at
+`/storage/iso/golden-win11-cloudbase-pre-pwsh-20260821.qcow2` for a one-move
+rollback.
+
 ### Defects found in the field, and where they are fixed
 
 Two problems surfaced during that rollout. Neither was caused by the Git
