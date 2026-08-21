@@ -174,3 +174,64 @@ pessimisation.
 
 Re-measure when the ZFS storage driver lands, on both drivers, and record
 the result here.
+
+## Proven end to end on Hyper-V, 2026-08-21
+
+`recycle-from-pool-per-task` now serves real GitHub Actions jobs on
+`win-ci-bare-001`, via `tools/hyperv-pool.ps1` (capacity) and
+`tools/hyperv-scale-set.ps1` (jobs). The proving workflow is
+`infra/.github/workflows/pm6-hyperv-pool-selftest.yml`.
+
+One full cycle, measured:
+
+```
+job dispatched   -> run 32505536668, conclusion: success
+served by        -> runner hv-pool-000 on guest REPRO-POOL-000
+                    Windows 11 Pro build 26200, 4 vCPU
+                    (NOT the bare-metal host -- the workflow fails if it is)
+job wrote        -> C:\_pm6\residue.txt
+recycle          -> restore 17.41s, ready at 22.88s
+after recycle    -> residue gone, directory gone, runner UNCONFIGURED,
+                    runner + pwsh still installed,
+                    identity intact: REPRO-POOL-000 / 172.27.93.235
+```
+
+That last line is the property the design exists for: the member came back
+as ITSELF, not as a copy of some shared state, with everything the task did
+erased and everything the baseline provides still present.
+
+### Restore cost is NOT the 2.16s the earlier benchmark suggested
+
+Every `Restore-VMCheckpoint` measured on this host, in order taken:
+
+```
+2.16   12.63   20.89   26.80   56.29   80.07   169.96   17.41   (seconds)
+```
+
+Two orders of magnitude, including 169.96s on a completely idle host with
+the disk queue at zero, on a member whose delta from its baseline was only
+0.50 GB. **The 7.2s per-task figure quoted earlier came from a favourable
+sample and should not be planned against.** Whatever drives the variance is
+not explained by contention, delta size or memory image size -- all three
+were checked -- and it is the open question this design most needs answered,
+because it decides whether recycling beats the 36s cold boot reliably or
+only sometimes.
+
+What IS stable: the resume half. Once the restore completes, the guest is
+reachable again in 4-9s across every measurement, because it resumes from
+RAM rather than booting.
+
+### Golden hygiene is not optional
+
+Two properties had to be forced into the image before the pool behaved:
+
+* **Windows Update disabled.** The golden had network during its install,
+  so updates were staged; members then applied them on FIRST BOOT (one sat
+  at "You're 1% there" for over an hour) and would otherwise apply them
+  mid-job. Disabling it took a member's settle time from 280s to 33s and
+  its checkpoint from 92.78s to 7.9s.
+* **The declared tool surface actually present.** The first PM6 run failed
+  with `pwsh: command not found` -- the golden had Windows PowerShell 5.1
+  only. `guest-recipes/lib/provision-pwsh.ps1` pins 7.4.6, matching the
+  persistent Windows runner, so both halves of the fleet stay on one
+  version.
