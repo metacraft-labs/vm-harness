@@ -44,6 +44,11 @@ param(
     [switch]$Status,
     [switch]$Teardown,
     [switch]$Rebaseline,
+    # Operate on ONE member instead of all of them. Needed because members
+    # fail independently: one can be mid-Windows-Update while another is
+    # healthy, and a whole-pool operation would either block on the sick one
+    # or refuse to touch the healthy one.
+    [string]$Member = '',
     [string]$SourceVm = 'repro-golden-win11-x64',
     [string]$SourceCheckpoint = 'pool-source',
     [int]$Size = 2,
@@ -175,6 +180,7 @@ function Disable-GuestUpdateChurn {
 }
 
 function Get-PoolMembers {
+    if ($Member) { return @(Get-VM -Name $Member -ErrorAction SilentlyContinue) }
     Get-VM | Where-Object { $_.Name -like "$MemberPrefix-*" } | Sort-Object Name
 }
 
