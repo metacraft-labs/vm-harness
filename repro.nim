@@ -83,6 +83,7 @@ package vm_harness:
       "vmHarnessVirsh"
       "vmHarnessVirtInstall"
       "vmHarnessQemuImg"
+      "vmHarnessPasst"
       "vmHarnessSsh"
       "vmHarnessSshpass"
 
@@ -164,6 +165,15 @@ when defined(linux):
 
     executable qemuImg:
       name: "qemu-img"
+
+  package vmHarnessPasst:
+    provisioning:
+      nixPackage "nixpkgs#passt", executablePath = "bin/passt",
+        nixpkgsRev = CanonicalNixpkgsRev,
+        nixpkgsNarHash = CanonicalNixpkgsNarHash
+
+    executable passt:
+      name: "passt"
 
   package vmHarnessSsh:
     provisioning:
