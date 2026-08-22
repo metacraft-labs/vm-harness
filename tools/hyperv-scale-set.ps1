@@ -66,6 +66,13 @@ param(
     [string]$GuestUser = 'admin',
     [string]$GuestPassword = 'repro-windows-x64',
     [string]$RunnerDir = 'C:\actions-runner',
+    # Read the registration token from a FILE instead of minting one with
+    # `gh`. This is what lets the daemon run unattended: `gh` needs an
+    # interactive login, which SYSTEM does not have at boot, whereas
+    # win-ci-bare-001 already receives a freshly minted token every 10 minutes
+    # through the deploy-agent's sealed section. Re-read every cycle, never
+    # cached, so a refreshed file is picked up without a restart.
+    [string]$TokenPath = '',
     [int]$ReadyTimeoutSec = 300,
     [int]$JobTimeoutSec = 3600,
     # Serve ONE member. The parent invocation spawns one child process per
@@ -114,9 +121,31 @@ function Wait-GuestReady {
 }
 
 function New-RegistrationToken {
-    # Minted on the HOST: the guest has no credentials and should not. Fetched
-    # per cycle because the token expires in an hour -- not because it is
-    # consumed; it is reusable within that hour (see the header).
+    # Obtained on the HOST: the guest has no credentials and should not.
+    # Re-obtained per cycle because the token expires in an hour -- not
+    # because it is consumed; it is reusable within that hour (see header).
+    if ($TokenPath) {
+        if (-not (Test-Path -LiteralPath $TokenPath)) {
+            throw "token file not found: $TokenPath (the deploy-agent materialises it from the sealed section; check that a tick has run)"
+        }
+        # Trim hard: the sealed section round-trips through file writes, and a
+        # trailing newline reaches config.cmd as part of the token, which
+        # fails with an auth error that names nothing useful.
+        $t = (Get-Content -LiteralPath $TokenPath -Raw).Trim()
+        if ($t.Length -lt 20) {
+            # Deliberately not echoed -- it is a credential. Length alone
+            # distinguishes "file is empty/truncated" from "token rejected".
+            throw "token file $TokenPath holds $($t.Length) chars; expected a registration token"
+        }
+        # Age is worth logging: a stale file is the failure mode here, and it
+        # looks exactly like a bad token from config.cmd's error message.
+        $age = [int]((Get-Date) - (Get-Item -LiteralPath $TokenPath).LastWriteTime).TotalMinutes
+        if ($age -ge 60) {
+            throw "token file $TokenPath is ${age}m old; registration tokens live 60m, so this one has expired (is the deploy-agent tick still running?)"
+        }
+        if ($age -ge 45) { Log "WARNING: token file is ${age}m old, close to its 60m expiry" }
+        return $t
+    }
     $t = (& gh api -X POST "/orgs/$Org/actions/runners/registration-token" --jq '.token' 2>&1)
     if ($LASTEXITCODE -ne 0 -or -not $t -or $t.Length -lt 20) {
         throw "could not mint a registration token: $t"
