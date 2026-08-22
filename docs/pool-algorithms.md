@@ -313,6 +313,36 @@ member with the console-capture and rebaseline commands printed. Then a live
 job confirmed the success path still reports
 `job completed with result: Succeeded (runner exit 0)`.
 
+### Running it unattended: the token must come from a file
+
+The daemon minted tokens with `gh`, which needs an interactive login. SYSTEM
+has none at boot, so that alone would have kept the pool operator-launched.
+`-TokenPath` removes the dependency, and the channel it consumes already
+exists on `win-ci-bare-001`: the deploy-agent materialises a freshly minted
+registration token every 10 minutes from the manifest's sealed section, and
+one token registers EVERY member for the hour it lives.
+
+Verified 2026-08-22, all four branches:
+
+| branch | result |
+| ------ | ------ |
+| missing file | raises, and names the deploy-agent as the thing to check |
+| short/truncated file | raises, reporting LENGTH — never the token |
+| stale file (90m) | raises, reporting AGE against the 60m TTL |
+| fresh real token | job served, `result: Succeeded (runner exit 0)`, recycled 15.5s |
+
+The stale-file branch matters most. An expired token is rejected by
+`config.cmd` with an error naming nothing useful, so age is checked first
+and reported as age.
+
+**The daemon must run as SYSTEM, not as an admin user.** The sealed token is
+ACL'd to `NT AUTHORITY\SYSTEM` and `NT SERVICE\Schedule` only; an
+Administrator shell gets access-denied. Confirmed by reading it from a
+transient SYSTEM scheduled task (132 chars) while the same read failed from
+an elevated shell. That is the right design — but it means a daemon launched
+from an operator's console cannot use this channel, and only a
+`windowsScheduledTask` with `runAsUser = "SYSTEM"` can.
+
 Construction from the HARDENED golden is roughly an order of magnitude
 faster than from the unhardened one, because members no longer spend their
 first boot applying staged Windows updates:
