@@ -254,6 +254,35 @@ proc deleteContainer*(b: IncusBackend, name: string): ExecResult =
   ## the caller treats as already-clean.
   b.runIncus(@["delete", "--force", name], timeoutSec = 60)
 
+proc startContainer*(b: IncusBackend, name: string) =
+  ## Start an existing container without replacing it. Already-running is a
+  ## successful no-op; a missing container remains a hard operator error.
+  let state = b.containerState(name)
+  if state.len == 0:
+    raise newVmHarnessError($b.id, lpStartup,
+      "IncusBackend.startContainer: container not found: " & name)
+  if state == "RUNNING":
+    return
+  let r = b.runIncus(@["start", name], timeoutSec = 60)
+  if r.exitCode != 0:
+    raise newVmHarnessError($b.id, lpStartup,
+      "incus start " & name & " failed (exit " & $r.exitCode & "): " &
+      r.stdout)
+
+proc stopContainer*(b: IncusBackend, name: string) =
+  ## Stop an existing container without deleting its storage or snapshots.
+  let state = b.containerState(name)
+  if state.len == 0:
+    raise newVmHarnessError($b.id, lpCleanup,
+      "IncusBackend.stopContainer: container not found: " & name)
+  if state == "STOPPED":
+    return
+  let r = b.runIncus(@["stop", "--force", name], timeoutSec = 60)
+  if r.exitCode != 0:
+    raise newVmHarnessError($b.id, lpCleanup,
+      "incus stop " & name & " failed (exit " & $r.exitCode & "): " &
+      r.stdout)
+
 # ---------------------------------------------------------------------------
 # Network + NIC-device primitives — the S2 (network-primitive) surface. These
 # map Incus managed networks and per-container NIC attachment onto the CLI in

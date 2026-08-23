@@ -19,7 +19,8 @@ ERROR / usage error, `130` INCOMPLETE (interrupted).
 | `provision` | Ensure a baseline image exists (idempotent). |
 | `run` | One-shot revert + exec + harvest + cleanup (the gate runner). |
 | `run --ephemeral` | libvirt/incus: launch one per-job clone, probe, destroy (no residue). |
-| `ephemeral-destroy` | libvirt: reclaim a clone left running by `run --ephemeral --keep`. |
+| `ephemeral-destroy` | libvirt/incus: reclaim an instance left running by `run --ephemeral --keep`. |
+| `instance wait\|exec\|copy-to\|copy-from\|start\|stop` | Operate on an existing Incus system container through typed backend methods. |
 | `probe` | Print available backends as JSON (capability detection). |
 | `backends` | Tabular listing of every known backend (`*` = registered here). |
 | `shell` | (Placeholder in M0) open an interactive shell into a baseline. |
@@ -66,12 +67,29 @@ it, destroy it leaving no residue.
 ### `ephemeral-destroy`
 
 ```
-vm-harness ephemeral-destroy --baseline <vm>
+vm-harness ephemeral-destroy --backend <libvirt|incus> --baseline <instance>
 ```
 
-libvirt-only. Reclaims a clone left running by `run --ephemeral --keep`:
-`virsh destroy` + `virsh undefine --nvram` + remove the overlay, config-drive
-ISO, and per-job OVMF nvram. The golden and OVMF template are never touched.
+For libvirt, reclaims a clone left running by `run --ephemeral --keep` with
+`virsh destroy`, `virsh undefine --nvram`, and removal of its overlay,
+config-drive ISO, and per-job OVMF nvram. For Incus, force-deletes only the
+named container. The golden/base image is never touched.
+
+### `instance`
+
+```console
+vm-harness instance wait --backend incus <name>
+vm-harness instance exec --backend incus <name> -- <command...>
+vm-harness instance copy-to --backend incus <name> <host-path> <guest-path>
+vm-harness instance copy-from --backend incus <name> <guest-path> <host-path>
+vm-harness instance start --backend incus <name>
+vm-harness instance stop --backend incus <name>
+```
+
+These commands operate on an existing container without implicitly deleting
+it. `wait`, `exec`, and both transfer commands require the container to be
+running and exec-ready. `start` is idempotent for a running container; `stop`
+is idempotent for a stopped container. Missing containers are hard errors.
 
 ### `probe` / `backends`
 

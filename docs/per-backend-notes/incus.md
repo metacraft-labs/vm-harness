@@ -94,11 +94,18 @@ incus launch vmh-base t-im0 && incus exec t-im0 -- true && incus delete -f t-im0
 | `execInGuest`            | `incus exec <name> [--env K=V] [--user U] -- <cmd...>`   |
 | `copyToGuest`            | `incus file push [-r] <host> <name><guest>`              |
 | `copyFromGuest`          | `incus file pull -r <name><guest> <host>`                |
+| `startContainer`         | `incus start <name>`                                      |
+| `stopContainer`          | `incus stop --force <name>`                               |
 | `stopAndCleanup(delete)` | `incus delete --force <name>`                            |
-| `snapshot`               | `incus snapshot <vm> <name>`                             |
-| `restoreSnapshot`        | `incus restore <vm> <name>`                              |
+| `snapshot`               | `incus snapshot create <vm> <name>`                      |
+| `restoreSnapshot`        | `incus snapshot restore <vm> <name>`                     |
 | `listSnapshots`          | `incus snapshot list <vm> --format csv`                  |
 | `removeSnapshot`         | `incus delete <vm>/<snap>`                               |
+
+The CLI exposes non-destructive existing-container operations as
+`vm-harness instance {wait,exec,copy-to,copy-from,start,stop} --backend incus`.
+They use these backend methods rather than shell-specific Incus command
+composition in consumers.
 
 ## Ephemeral per-job lifecycle
 

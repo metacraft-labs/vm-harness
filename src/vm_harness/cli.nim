@@ -178,6 +178,14 @@ Subcommands:
                           running by `run --ephemeral --keep` (destroy +
                           undefine --nvram + remove overlay/config-drive/
                           nvram — no residue). Requires --baseline.
+  instance wait <name>    Wait for an existing Incus container to accept exec.
+  instance exec <name> -- <command...>
+                          Execute argv in an existing Incus container.
+  instance copy-to <name> <host-path> <guest-path>
+  instance copy-from <name> <guest-path> <host-path>
+                          Transfer a file or directory through the backend.
+  instance start <name>   Start and await an existing Incus container.
+  instance stop <name>    Stop an existing Incus container without deleting it.
   probe                   Print available backends as JSON.
   shell                   (placeholder) Open an interactive shell into a baseline.
   backends                Tabular listing of every known backend.
@@ -1245,6 +1253,80 @@ proc cmdShell(opts: CliOpts): int =
            {"backend": opts.backend, "baseline": opts.baseline})
   0
 
+proc existingIncusHandle(opts: CliOpts, name: string):
+    tuple[backend: IncusBackend, vm: VmHandle] =
+  if opts.backend.toLowerAscii() != "incus":
+    raise newException(ValueError,
+      "instance operations currently require --backend incus")
+  if name.len == 0:
+    raise newException(ValueError, "instance operation requires a name")
+  let backend = IncusBackend(newBackend(biIncus))
+  var extra = initTable[string, string]()
+  extra["container"] = name
+  extra["storagePool"] = backend.storagePool
+  let vm = VmHandle(
+    backend: backend,
+    name: name,
+    baseline: backend.baseImage,
+    ipAddress: none(string),
+    sshPort: 0,
+    sshUser: backend.execUser,
+    sshAuth: SshAuth(kind: saNone),
+    extra: extra)
+  (backend: backend, vm: vm)
+
+proc cmdInstance(opts: CliOpts): int =
+  if opts.cmd.len < 2:
+    raise newException(ValueError,
+      "instance requires <wait|exec|copy-to|copy-from|start|stop> <name>")
+  let action = opts.cmd[0]
+  let name = opts.cmd[1]
+  let (backend, vm) = existingIncusHandle(opts, name)
+  let timeout = if opts.timeoutSec > 0: opts.timeoutSec else: 120
+
+  case action
+  of "wait":
+    if opts.cmd.len != 2:
+      raise newException(ValueError, "instance wait accepts only <name>")
+    backend.startAndAwaitReady(vm, timeout)
+  of "exec":
+    if opts.cmd.len < 3:
+      raise newException(ValueError,
+        "instance exec requires a command after <name>")
+    backend.startAndAwaitReady(vm, timeout)
+    let r = backend.execInGuest(vm, opts.envPairs, opts.cmd[2 .. ^1],
+                                timeoutSec = timeout)
+    stdout.write(r.stdout)
+    stderr.write(r.stderr)
+    return r.exitCode
+  of "copy-to":
+    if opts.cmd.len != 4:
+      raise newException(ValueError,
+        "instance copy-to requires <name> <host-path> <guest-path>")
+    backend.startAndAwaitReady(vm, timeout)
+    backend.copyToGuest(vm, opts.cmd[2], opts.cmd[3])
+  of "copy-from":
+    if opts.cmd.len != 4:
+      raise newException(ValueError,
+        "instance copy-from requires <name> <guest-path> <host-path>")
+    backend.startAndAwaitReady(vm, timeout)
+    backend.copyFromGuest(vm, opts.cmd[2], opts.cmd[3])
+  of "start":
+    if opts.cmd.len != 2:
+      raise newException(ValueError, "instance start accepts only <name>")
+    backend.startContainer(name)
+    backend.startAndAwaitReady(vm, timeout)
+  of "stop":
+    if opts.cmd.len != 2:
+      raise newException(ValueError, "instance stop accepts only <name>")
+    backend.stopContainer(name)
+  else:
+    raise newException(ValueError, "unknown instance action: " & action)
+
+  logEvent(opts.logFormat, "info", "instance operation complete",
+           {"backend": $biIncus, "action": action, "name": name})
+  0
+
 proc cmdSnapshot(opts: CliOpts): int =
   ## M30: dispatch ``snapshot create|restore|list <vm> [<name>]`` to the
   ## resolved backend. Positional args land in ``opts.cmd``.
@@ -1412,6 +1494,7 @@ proc runCli*(args: seq[string]): int =
   of "probe":     return cmdProbe(opts)
   of "backends":  return cmdBackends(opts)
   of "shell":     return cmdShell(opts)
+  of "instance":  return cmdInstance(opts)
   of "snapshot":  return cmdSnapshot(opts)
   of "baseline":  return cmdBaseline(opts)
   of "prune":     return cmdPrune(opts)

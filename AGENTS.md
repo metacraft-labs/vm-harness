@@ -16,8 +16,8 @@ host×guest):
   `libvirt` (Linux/Windows x64 via QEMU/KVM), `hyperv`, `wsl`, `incus`, `noop`.
 - **Lifecycle primitives**: boot / ephemeral clone + fast per-gate revert /
   exec-in-guest / copy files in-and-out / snapshot-restore / serial capture /
-  standardized output envelope. Driven via `vm-harness {provision,run,probe,
-  shell,backends,snapshot,baseline}` (see README "CLI reference").
+  standardized output envelope. Driven via `vm-harness {provision,run,instance,
+  probe,shell,backends,snapshot,baseline}` (see README "CLI reference").
 - **Guest OS install recipes** (`guest-recipes/`): the one-time "how to build a
   golden guest" scripts. Notably **`guest-recipes/windows-arm-base/`** — the
   maintained Win11-on-ARM golden (official MS ARM64 ISO + `autounattend.xml` +
