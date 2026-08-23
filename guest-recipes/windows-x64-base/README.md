@@ -57,15 +57,15 @@ supplies `bash.exe` on Windows, so without it:
   `##[error]bash: command not found` — including the **first** step of
   `metacraft-labs/metacraft-github-actions/setup-dev-env`, so jobs die
   before any repo-specific work runs; and
-- `actions/checkout` logs *"The repository will be downloaded using the
+- `actions/checkout` logs _"The repository will be downloaded using the
   GitHub REST API / To create a local Git repository instead, add Git
-  2.18 or higher to the PATH"* and leaves no `.git` behind.
+  2.18 or higher to the PATH"_ and leaves no `.git` behind.
 
 Earlier revisions of this recipe installed no Git at any stage, which is
 exactly the defect above.
 
 **The PATH scope is the load-bearing part.** The Actions runner runs as a
-Windows *service*. `services.exe` builds **one** environment block when
+Windows _service_. `services.exe` builds **one** environment block when
 it starts at boot, reading
 `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`, and
 hands a copy of that block to every service it launches. Therefore:
@@ -85,7 +85,7 @@ launches both inherit it — no ordering race, no reboot at job time.
 Only `C:\PortableGit\bin` goes on the machine PATH. Its three files
 (`bash.exe`, `sh.exe`, `git.exe`) are Git for Windows' ~47 KB
 `git-wrapper` shim, which prepends `..\usr\bin` and `..\mingw64\bin` to
-PATH *inside the spawned process* before exec'ing the real
+PATH _inside the spawned process_ before exec'ing the real
 `usr\bin\bash.exe`. So `shell: bash` steps also get `sha256sum`, `awk`,
 `unzip` and `tar`, **without** shadowing the Windows `find.exe` and
 `sort.exe` machine-wide (which is what putting `usr\bin` itself on the
@@ -365,7 +365,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 What neither gate can prove is the property the fleet ultimately depends on:
 that `pwsh` resolves for `NT AUTHORITY\SYSTEM` in **session 0**, because that
-depends on `services.exe` rebuilding its environment block at the *next* boot,
+depends on `services.exe` rebuilding its environment block at the _next_ boot,
 which by definition has not happened in the image being captured. Asserting the
 exact registry value `services.exe` will read is the strongest static proxy.
 The service-context proof has to be taken on a booted clone of the promoted
@@ -430,7 +430,7 @@ same boot-a-copy / modify / capture-cold procedure that
 6. Re-point the GARM image at the new golden and drain/recreate the pool
    so running instances are replaced.
 
-If the target is the **sysprepped** golden, do this on the *pre*-sysprep
+If the target is the **sysprepped** golden, do this on the _pre_-sysprep
 golden and re-run `build-sysprep-golden.sh`: booting a generalized image
 consumes the generalize.
 
@@ -473,6 +473,7 @@ Identical shape to the Git retrofit above, substituting
    with a `probe.cmd` that records `whoami`, `%PATH%`, `where pwsh` and
    `pwsh -v`. `pwsh -v` answering for `NT AUTHORITY\SYSTEM` in session 0 is
    the bar.
+
 7. Drain the scale set (`garm-cli scaleset update <id> --max-runners 0`), wait
    for in-flight jobs to **finish on their own**, then swap by `mv` so rollback
    is a single `mv` back, and restore `--max-runners`.
@@ -497,7 +498,7 @@ only when a golden is next built or retrofitted — see
   password authentication for an expired account, so `ssh admin@<ip>` — the
   route the retrofit procedure above and
   [`cloudbase-init-golden.md`](cloudbase-init-golden.md) both document as
-  *the* way to change an already-built golden — failed on an untouched copy
+  _the_ way to change an already-built golden — failed on an untouched copy
   of it. The rollout had to work around it via the QEMU guest agent. An
   unattended CI image must not carry a credential that silently expires:
   the failure lands months later, on whoever next has to touch the image,
@@ -527,7 +528,7 @@ Both fixes are held by `tests/unit/t_windows_golden_recipe_hardening.nim`,
 which asserts the directives exist, in a pass that executes, ahead of the
 network steps that can strand the chain, in files whose `Order` sequences
 are contiguous and whose commands respect the unattend length limits. What
-those tests cannot prove is that Windows *honours* the directives — that
+those tests cannot prove is that Windows _honours_ the directives — that
 `net accounts` really cleared the expiry, or that `powercfg` really stopped
 the idle timer. That is guest-only, and is what the checks in
 [§Applying these to an existing golden](#applying-these-to-an-existing-golden)
@@ -576,19 +577,88 @@ the defect itself — so the first retrofit has to go through the QEMU guest
 agent (`virsh qemu-agent-command`), which is how the 2026-08-17 rollout did
 its in-guest work. Once the credential fix is in, SSH works again.
 
+## Retrofitting the Defender exclusion fix onto an already-built golden
+
+A third defect of the same shape, and the one that shows why fixing a recipe
+is only half the job. `provision-pwsh.ps1` added its **PID-named** extraction
+staging directory as a **permanent** Defender exclusion and never removed it,
+so the promoted golden was captured carrying
+
+```
+Get-MpPreference -> ExclusionPath:
+  C:\pwsh
+  C:\Windows\Temp\vmh-pwsh-extract-6752
+```
+
+The second names a directory that stopped existing during the very run that
+added it. Windows reuses PIDs freely, so any later process that draws 6752
+recreates that path and everything written into it goes **unscanned** — on
+machines whose whole job is executing pull-request code from forks.
+
+The recipe is fixed (the staging exclusion is scoped to the extract and
+removed in a `finally`). The **image** needed a separate pass, because a
+recipe fix reaches the fleet only when a golden is next built or retrofitted:
+
+1. `qemu-img convert -O qcow2 <golden> /storage/scratch/defender-work-<date>.qcow2`
+   — a full standalone copy. **Never mutate the live golden**: running GARM
+   instances are CoW overlays whose backing file it is.
+2. Boot a throwaway domain off the copy and SSH in as `admin`.
+3. Remove **every** exclusion naming a path that does not exist — not just
+   the one you came for:
+
+   ```powershell
+   $stale = @((Get-MpPreference).ExclusionPath | Where-Object { -not (Test-Path -LiteralPath $_) })
+   foreach ($p in $stale) { Remove-MpPreference -ExclusionPath $p }
+   ```
+
+   Do **not** clear the list. `C:\pwsh` is deliberate: MsMpEng quarantines
+   `pwsh.exe` as a `PUA:Win32/PowerShellCore` false positive, so dropping it
+   would trade this defect for a worse one.
+
+4. Run `../lib/assert-defender-exclusions-sane.ps1` in the guest; exit 0 is
+   the go/no-go. It is also wired into `build-sysprep-golden.sh` as a hard
+   gate, so a future golden carrying a stale rule cannot be captured at all.
+5. `shutdown /s /t 3 /f`, wait for `shut off`, capture cold with
+   `qemu-img convert`.
+6. **Prove it on a clone of the promoted artifact**, booted fresh — and note
+   which shell you used. The guests run **Windows PowerShell 5.1**; `pwsh`
+   7.4.6 is also present at `C:\pwsh`, and anything verified only under 7 is
+   _inferred_ for 5.1, not shown.
+7. Drain (`garm-cli scaleset update <id> --max-runners 0`), wait for
+   in-flight jobs to finish **on their own**, swap by `mv` so rollback is a
+   single `mv` back, and restore `--max-runners`.
+
+A note on how to check this, because the failure mode is subtle: a scan that
+matches nothing reads exactly like "the bad thing is absent". Assert that the
+exclusions you _expect_ are positively found, not merely that the bad one is
+missing — otherwise a typo in the property name looks like a clean image.
+
+**Status (2026-08-23):** applied on `high-mem-server`.
+`/storage/iso/golden-win11-cloudbase.qcow2` now reports exactly one path
+exclusion, `C:\pwsh`, with the stale
+`C:\Windows\Temp\vmh-pwsh-extract-6752` rule gone from both `Get-MpPreference`
+and `HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths`. Proved on a
+CoW clone of the promoted image under **PowerShell 5.1** (and again under
+`pwsh` 7.4.6). Defender's posture is otherwise unchanged — real-time,
+behaviour and script scanning on, tamper protection on, PUA protection at
+block — and there were no extension, process, IP or ASR-only exclusions to
+deal with. The pre-retrofit image is preserved at
+`/storage/iso/golden-win11-cloudbase-pre-defender-20260823.qcow2` for a
+one-move rollback.
+
 ## Total wall-clock
 
 Rough budget on a 2024-era AMD EPYC server with NVMe storage:
 
-| Step | Time |
-|---|---|
-| Download virtio-win.iso | 1-2 min |
-| Verify Win11 ISO is in place | <1 min |
-| Assemble autounattend ISO | <1 min |
-| virt-install + Win11 Setup | 20-40 min |
-| OpenSSH install (FirstLogonCommands) | 1-3 min |
-| virtio-win guest tools | 2-5 min |
-| **Total** | **25-50 min** |
+| Step                                 | Time          |
+| ------------------------------------ | ------------- |
+| Download virtio-win.iso              | 1-2 min       |
+| Verify Win11 ISO is in place         | <1 min        |
+| Assemble autounattend ISO            | <1 min        |
+| virt-install + Win11 Setup           | 20-40 min     |
+| OpenSSH install (FirstLogonCommands) | 1-3 min       |
+| virtio-win guest tools               | 2-5 min       |
+| **Total**                            | **25-50 min** |
 
 The good news: this is a one-time cost per Linux host per Win11
 release. After the domain is finalized, every per-gate revert is
