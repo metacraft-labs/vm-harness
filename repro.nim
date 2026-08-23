@@ -62,6 +62,8 @@ const portableTestSpecs: seq[VmHarnessTestSpec] = @[
 ]
 
 const posixTestSpecs: seq[VmHarnessTestSpec] = @[
+  VmHarnessTestSpec(source: "tests/unit/t_cli_incus.nim",
+    binary: "t_cli_incus"),
   VmHarnessTestSpec(source: "tests/unit/t_qemu_windows_arm_backend.nim",
     binary: "t_qemu_windows_arm_backend"),
   VmHarnessTestSpec(source: "tests/unit/t_tart_backend.nim",

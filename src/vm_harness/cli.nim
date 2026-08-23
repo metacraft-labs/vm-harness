@@ -174,7 +174,7 @@ Subcommands:
                           Use --keep to leave it running, or --expect REGEX
                           to assert a serial boot marker and clean it up.
   run                     One-shot revert + exec + harvest + cleanup.
-  ephemeral-destroy       libvirt-only: reclaim an ephemeral clone left
+  ephemeral-destroy       libvirt/incus: reclaim an ephemeral instance left
                           running by `run --ephemeral --keep` (destroy +
                           undefine --nvram + remove overlay/config-drive/
                           nvram — no residue). Requires --baseline.
@@ -1100,10 +1100,32 @@ proc cmdEphemeralDestroy(opts: CliOpts): int =
   ## ``virsh destroy`` + ``virsh undefine --nvram`` + remove the CoW
   ## overlay + the injected config-drive ISO + the per-job OVMF nvram —
   ## leaving NO residue. The golden + the OVMF template are never touched.
-  let backend = newBackend(biLibvirt)
   if opts.baseline.len == 0:
     raise newException(ValueError,
       "ephemeral-destroy: --baseline is required")
+
+  if opts.backend.toLowerAscii() == "incus":
+    let ib = IncusBackend(newBackend(biIncus))
+    var extra = initTable[string, string]()
+    extra["container"] = opts.baseline
+    extra["ephemeral"] = "true"
+    extra["baseImage"] = opts.baseImage
+    extra["storagePool"] = ib.storagePool
+    let vm = VmHandle(
+      backend: ib,
+      name: opts.baseline,
+      baseline: opts.baseImage,
+      ipAddress: none(string),
+      sshPort: 0,
+      sshUser: ib.execUser,
+      sshAuth: SshAuth(kind: saNone),
+      extra: extra)
+    ib.stopAndCleanup(vm, deleteVm = true)
+    logEvent(opts.logFormat, "info", "ephemeral container: destroyed",
+             {"name": opts.baseline})
+    return 0
+
+  let backend = newBackend(biLibvirt)
   let lb = LibvirtBackend(backend)
   var extra = initTable[string, string]()
   extra["libvirtUri"] = lb.libvirtUri
