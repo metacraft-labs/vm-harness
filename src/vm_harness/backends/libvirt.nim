@@ -117,6 +117,10 @@ type
       ## Default Windows admin password. Stored in the backend struct,
       ## NEVER passed via process argv (transit is through
       ## ``sshpass -e``).
+    sshGuestOs*: GuestOs
+      ## Selects the remote shell quoting convention used by ``execInGuest``.
+      ## Defaults to Windows for compatibility with the original libvirt
+      ## runner; CLI callers can select a POSIX guest with ``--guest linux``.
     sshPort*: int
       ## Default 22.
     bootTimeoutSec*: int
@@ -181,6 +185,7 @@ proc newLibvirtBackend*(virshCmd: string = "virsh",
                         networkBridge: string = DefaultLibvirtBridge,
                         sshUser: string = DefaultLibvirtWindowsSshUser,
                         sshPassword: string = DefaultLibvirtWindowsSshPassword,
+                        sshGuestOs: GuestOs = goWindows,
                         sshPort: int = 22,
                         bootTimeoutSec: int = DefaultLibvirtBootTimeoutSec,
                         sshReadyTimeoutSec: int =
@@ -206,6 +211,7 @@ proc newLibvirtBackend*(virshCmd: string = "virsh",
     networkBridge: networkBridge,
     sshUser: sshUser,
     sshPassword: sshPassword,
+    sshGuestOs: sshGuestOs,
     sshPort: sshPort,
     bootTimeoutSec: bootTimeoutSec,
     sshReadyTimeoutSec: sshReadyTimeoutSec)
@@ -782,6 +788,29 @@ proc sshpassPrefix*(b: LibvirtBackend): seq[string] =
   if b.sshpassCmd.len == 0 or b.sshPassword.len == 0:
     return @[]
   result = @[b.sshpassCmd, "-e"]
+
+proc quotePosixShellArg*(arg: string): string =
+  ## Single-quote one argument for a POSIX login shell. Embedded single quotes
+  ## leave and re-enter the quoted region without exposing any argument bytes.
+  "'" & arg.replace("'", "'\"'\"'") & "'"
+
+proc formatSshCommand*(cmd: openArray[string]; guestOs: GuestOs): string =
+  ## OpenSSH servers pass their command payload through the guest's configured
+  ## login shell, so argv must be rendered for that shell rather than merely
+  ## concatenated.
+  case guestOs
+  of goLinux, goMacos:
+    for arg in cmd:
+      if result.len > 0:
+        result.add(' ')
+      result.add(quotePosixShellArg(arg))
+  of goWindows:
+    for arg in cmd:
+      if result.len > 0:
+        result.add(' ')
+      result.add('"')
+      result.add(arg.replace("\"", "\\\""))
+      result.add('"')
 
 proc runSshExec(b: LibvirtBackend, host: string, command: string,
                 env: Table[string, string],
@@ -1427,27 +1456,15 @@ method execInGuest*(b: LibvirtBackend, vm: VmHandle,
                    cmd: seq[string],
                    stdin: string = "",
                    timeoutSec: int = 600): ExecResult =
-  ## Run ``cmd`` in the guest via SSH. The argv is joined with spaces
-  ## and quoted to survive Windows OpenSSH's CMD-default shell. For
-  ## cross-platform parity callers should pass a single-element
-  ## ``cmd`` like ``@["powershell.exe", "-NoProfile", "-Command",
-  ## "<script>"]``.
+  ## Run ``cmd`` in the guest via SSH using the quoting rules for the guest's
+  ## configured login shell.
   when defined(linux):
     if vm.ipAddress.isNone:
       raise newException(ValueError,
         "LibvirtBackend.execInGuest: VmHandle has no IP address")
     if cmd.len == 0:
       raise newException(ValueError, "execInGuest: empty cmd")
-    var line = ""
-    for i, a in cmd:
-      if i > 0: line.add(' ')
-      # Conservative quoting: wrap each arg in double-quotes and
-      # escape embedded double-quotes. cmd.exe quoting is famously
-      # baroque; this rule is the one that matches OpenSSH-on-Windows's
-      # behaviour with `cmd /c`.
-      line.add('"')
-      line.add(a.replace("\"", "\\\""))
-      line.add('"')
+    let line = formatSshCommand(cmd, b.sshGuestOs)
     return b.runSshExec(vm.ipAddress.get, line, env, timeoutSec, stdin)
   else:
     raise newException(BackendUnavailableError,

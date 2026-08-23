@@ -36,6 +36,16 @@ suite "LibvirtBackend smoke (no live virsh)":
     check b.networkBridge == DefaultLibvirtBridge
     check b.imagePoolDir == DefaultLibvirtImagePool
     check b.sshUser == DefaultLibvirtWindowsSshUser
+    check b.sshGuestOs == goWindows
+
+  test "SSH command formatting follows the guest shell":
+    check quotePosixShellArg("$artifact") == "'$artifact'"
+    check quotePosixShellArg("O'Brien") == "'O'\"'\"'Brien'"
+    check formatSshCommand(
+      @["sh", "-c", "printf '%s' \"$artifact\""], goLinux) ==
+        "'sh' '-c' 'printf '\"'\"'%s'\"'\"' \"$artifact\"'"
+    check formatSshCommand(@["cmd", "/c", "echo %PATH%"], goWindows) ==
+      "\"cmd\" \"/c\" \"echo %PATH%\""
 
   test "probeAvailability returns false when virsh path is bogus":
     # Use a non-existent binary so the probe definitely returns false

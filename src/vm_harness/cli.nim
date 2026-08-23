@@ -785,6 +785,8 @@ proc cmdBoot(opts: CliOpts): int =
     lb.sshPort = sshForwardPort
     lb.sshUser = opts.sshUser
     lb.sshPassword = password
+    if opts.guestSet:
+      lb.sshGuestOs = opts.guest
 
   let outputDir = resolveBootOutputDir(opts.outputDir)
   createDir(outputDir)
