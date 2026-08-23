@@ -717,3 +717,74 @@ suite "Windows goldens put PowerShell 7 on the machine PATH":
     let script = readLib("provision-pwsh.ps1")
     fetch.mustNotContain(script.pinValue("PwshSha256X64"), label)
     fetch.mustNotContain(script.pinValue("PwshSha256Arm64"), label)
+
+  test "provision-pwsh.ps1 does not bake a dangling Defender exclusion into the golden":
+    # Found by inspecting a live clone of the promoted golden, 2026-08-23:
+    #
+    #     Get-MpPreference -> ExclusionPath:
+    #       C:\pwsh
+    #       C:\Windows\Temp\vmh-pwsh-extract-6752
+    #
+    # The second one is this script's own PID-named staging directory. It is
+    # added before the extract and never removed, so it is CAPTURED into the
+    # image and inherited by every ephemeral runner cloned from it -- pointing
+    # at a directory that stopped existing the moment the tree was moved into
+    # place.
+    #
+    # That is not merely untidy. Windows reuses PIDs freely, so any later
+    # process that happens to draw 6752 recreates that exact path, and it is
+    # then an UNSCANNED directory under C:\Windows\Temp on a machine whose
+    # whole job is executing pull-request code. The image ships an
+    # antivirus hole whose address is a lottery number.
+    #
+    # The `C:\pwsh` exclusion is deliberate and stays: MsMpEng quarantines
+    # pwsh.exe as a `PUA:Win32/PowerShellCore` false positive. What must not
+    # survive the run is the STAGING exclusion.
+    check fileExists(libFile("provision-pwsh.ps1"))
+    let script = readLib("provision-pwsh.ps1")
+    const label = "provision-pwsh.ps1"
+
+    # Non-vacuity: this test is meaningless if the staging path is gone or
+    # renamed, so locate it first and fail loudly rather than pass on nothing.
+    let stagingLines = script.codeLinesWith("vmh-pwsh-extract-")
+    checkpoint label & ": lines naming the staging directory: " & $stagingLines.len
+    check stagingLines.len > 0
+
+    let added = script.codeLinesWith("Add-MpPreference")
+    checkpoint label & ": Add-MpPreference lines: " & $added.len
+    check added.len > 0
+
+    let removed = script.codeLinesWith("Remove-MpPreference")
+    checkpoint label & ": Remove-MpPreference lines: " & $removed.len
+    check removed.len > 0
+
+    # The removal must name the staging variable, not $InstallDir -- removing
+    # the wrong one would drop the false-positive protection and leave the
+    # dangling rule exactly where it was.
+    var removesStaging = false
+    for line in removed:
+      if "$staging" in line:
+        removesStaging = true
+    checkpoint label & ": a Remove-MpPreference names $staging: " & $removesStaging
+    check removesStaging
+
+    var removesInstallDir = false
+    for line in removed:
+      if "$InstallDir" in line:
+        removesInstallDir = true
+    checkpoint label & ": no Remove-MpPreference names $InstallDir: " & $(not removesInstallDir)
+    check not removesInstallDir
+
+    # Ordering: the exclusion has to outlive the extract (that is what it is
+    # for) and must not outlive the move into place.
+    let code = script.codeOnly()
+    let extractAt = code.find("]::ExtractToDirectory(")
+    let moveAt = code.find("Move-Item -LiteralPath $staging")
+    let removeAt = code.find("Remove-MpPreference -ExclusionPath $staging")
+    checkpoint label & ": extract at " & $extractAt & ", move at " & $moveAt &
+      ", exclusion removed at " & $removeAt
+    check extractAt > 0
+    check moveAt > 0
+    check removeAt > 0
+    check extractAt < removeAt
+    check moveAt < removeAt

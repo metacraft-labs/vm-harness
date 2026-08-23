@@ -197,17 +197,28 @@ try {
   # -- 2. Keep Defender from eating the payload -----------------------------
   # MsMpEng quarantines pwsh.exe as a `PUA:Win32/PowerShellCore` false
   # positive often enough that the persistent runner's recipe adds this
-  # exclusion FIRST, before anything is written. Do the same, and cover the
-  # staging directory too, since that is where the bytes actually land first.
-  # Absent on trimmed images, so never fatal.
+  # exclusion FIRST, before anything is written. Do the same.
+  #
+  # ONLY $InstallDir is excluded here, and permanently -- that is the path
+  # whose contents keep tripping the false positive. The staging directory
+  # gets its own exclusion in step 5, scoped to the extract, and REMOVED
+  # again once the tree is moved into place. It used to be added here and
+  # never removed, which meant the exclusion was captured into the golden:
+  # a clone of the promoted image was found carrying
+  #
+  #     C:\Windows\Temp\vmh-pwsh-extract-6752
+  #
+  # in Get-MpPreference, naming a directory that stopped existing during the
+  # build. Windows reuses PIDs freely, so any later process that draws 6752
+  # recreates that exact path and inherits an UNSCANNED directory under
+  # C:\Windows\Temp -- on machines whose entire job is running pull-request
+  # code. An exclusion must not outlive the thing it was excluding.
   $staging = "C:\Windows\Temp\vmh-pwsh-extract-$PID"
-  foreach ($excluded in @($InstallDir, $staging)) {
-    try {
-      Add-MpPreference -ExclusionPath $excluded -ErrorAction Stop
-      Log "added Defender exclusion for $excluded"
-    } catch {
-      Log ("Defender exclusion for $excluded not applied (non-fatal): " + $_.Exception.Message)
-    }
+  try {
+    Add-MpPreference -ExclusionPath $InstallDir -ErrorAction Stop
+    Log "added Defender exclusion for $InstallDir"
+  } catch {
+    Log ("Defender exclusion for $InstallDir not applied (non-fatal): " + $_.Exception.Message)
   }
 
   if (-not $alreadyInstalled) {
@@ -299,20 +310,42 @@ try {
     # above would later mistake for an install.
     Log "extracting to $staging"
     Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $staging)
 
-    $stagedExe = Join-Path $staging 'pwsh.exe'
-    if (-not (Test-Path -LiteralPath $stagedExe)) {
-      throw "PowerShell archive did not produce $stagedExe"
+    # Scoped to the extract, and undone below. See the note in step 2: an
+    # exclusion left behind here is captured into the golden and inherited by
+    # every clone, naming a path that no longer exists.
+    try {
+      Add-MpPreference -ExclusionPath $staging -ErrorAction Stop
+      Log "added temporary Defender exclusion for $staging"
+    } catch {
+      Log ("Defender exclusion for $staging not applied (non-fatal): " + $_.Exception.Message)
     }
 
-    if (Test-Path -LiteralPath $InstallDir) {
-      Log "removing previous install at $InstallDir"
-      Remove-Item -LiteralPath $InstallDir -Recurse -Force
+    try {
+      Add-Type -AssemblyName System.IO.Compression.FileSystem
+      [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $staging)
+
+      $stagedExe = Join-Path $staging 'pwsh.exe'
+      if (-not (Test-Path -LiteralPath $stagedExe)) {
+        throw "PowerShell archive did not produce $stagedExe"
+      }
+
+      if (Test-Path -LiteralPath $InstallDir) {
+        Log "removing previous install at $InstallDir"
+        Remove-Item -LiteralPath $InstallDir -Recurse -Force
+      }
+      # Same volume, so this is a rename rather than a copy.
+      Move-Item -LiteralPath $staging -Destination $InstallDir -Force
+    } finally {
+      # `finally`, so a throw between here and the move cannot leave the rule
+      # behind either -- that is the path the original defect took.
+      try {
+        Remove-MpPreference -ExclusionPath $staging -ErrorAction Stop
+        Log "removed temporary Defender exclusion for $staging"
+      } catch {
+        Log ("could not remove Defender exclusion for $staging (non-fatal): " + $_.Exception.Message)
+      }
     }
-    # Same volume, so this is a rename rather than a copy.
-    Move-Item -LiteralPath $staging -Destination $InstallDir -Force
 
     if (-not (Test-Path -LiteralPath $pwshExe)) {
       throw "PowerShell install did not produce $pwshExe"
@@ -351,14 +384,14 @@ try {
       # pass unseen.
       if ($newPath.Length -gt 2047) {
         Log ("WARNING: machine PATH will be $($newPath.Length) chars (>2047). " +
-             'The registry write is safe, but some legacy tools and installers ' +
-             'cannot round-trip a value this long.')
+          'The registry write is safe, but some legacy tools and installers ' +
+          'cannot round-trip a value this long.')
       }
       # A value this large indicates real corruption rather than a long PATH;
       # refuse instead of writing it into the golden.
       if ($newPath.Length -gt 32000) {
         throw ("refusing to write a $($newPath.Length)-char machine PATH " +
-               '(>32000); the existing value looks corrupt: ' + $currentPath)
+          '(>32000); the existing value looks corrupt: ' + $currentPath)
       }
       $envKey.SetValue('Path', $newPath, [Microsoft.Win32.RegistryValueKind]::ExpandString)
       Log "added $InstallDir to the machine PATH ($($newPath.Length) chars, HKLM\$envKeyPath)"
@@ -446,7 +479,7 @@ try {
   $versionLine = @($probe | Where-Object { $_ -match '^PWSH_VERSION\s+(\S+)$' })
   if ($versionLine.Count -eq 0) {
     throw ('pwsh probe: ' + $pwshExe + ' did not report a version' +
-           "`n  probe output: " + ($probe -join ' | '))
+      "`n  probe output: " + ($probe -join ' | '))
   }
   $reported = ([regex]::Match([string] $versionLine[0], '^PWSH_VERSION\s+(\S+)$')).Groups[1].Value
   # Guard against an install that silently resolved to the built-in Windows
