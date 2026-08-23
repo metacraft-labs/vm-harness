@@ -426,6 +426,20 @@ proc invocationsOf(script, varName: string): seq[string] =
     if ("& $" & varName) in line:
       result.add line
 
+## Non-comment lines that INVOKE the named cmdlet as a statement, as opposed
+## to merely naming it inside a string. A gate is allowed — and expected — to
+## quote `Remove-MpPreference …` in its failure message as the operator's
+## remedy; what it must not do is call it. A bare `contains` cannot tell those
+## apart, so anchor on the statement position: an invocation begins the line,
+## whereas the message occurrence sits behind an opening quote.
+proc invokesCmdlet(script, cmdlet: string): seq[string] =
+  for rawLine in script.splitLines():
+    let line = rawLine.strip()
+    if line.startsWith("#"):
+      continue
+    if line.startsWith(cmdlet) or line.startsWith("| " & cmdlet):
+      result.add line
+
 ## Index of the FirstLogonCommand that runs provision-pwsh.ps1 with an
 ## explicit -Arch, or -1. The staging copy also names the script, so the
 ## -Arch flag is what distinguishes the invocation from the copy.
@@ -788,3 +802,157 @@ suite "Windows goldens put PowerShell 7 on the machine PATH":
     check removeAt > 0
     check extractAt < removeAt
     check moveAt < removeAt
+
+## ---------------------------------------------------------------------------
+## The image-side half of the dangling-exclusion defect.
+##
+## The suite above holds the RECIPE: provision-pwsh.ps1 now scopes its staging
+## exclusion to the extract and drops it in a `finally`. That is necessary and
+## not sufficient, and the gap is the whole lesson of this incident.
+##
+## A recipe fix reaches the fleet only when a golden is next BUILT or
+## RETROFITTED. The already-promoted `golden-win11-cloudbase.qcow2` still
+## carried
+##
+##     Get-MpPreference -> ExclusionPath:
+##       C:\pwsh
+##       C:\Windows\Temp\vmh-pwsh-extract-6752
+##
+## weeks after the recipe was correct, and every `eph-win-x64` clone inherited
+## it. Nothing anywhere refused to ship that image -- which is precisely how it
+## got promoted in the first place, and precisely what the pwsh and Git gates
+## exist to prevent for their own properties.
+##
+## So these tests hold the missing gate, on the same terms as the others: they
+## cannot prove Windows really dropped the rule (only a booted guest can say
+## that, and one did), but they prove the golden build REFUSES to capture an
+## image that still has one, that the gate tests the general invariant rather
+## than one PID, and that it cannot pass by finding nothing.
+suite "Windows goldens ship no Defender exclusion that outlived its directory":
+
+  const DefenderGate = "assert-defender-exclusions-sane.ps1"
+
+  test "the Defender gate asserts an invariant, not the one PID that was found":
+    # The stale rule was `vmh-pwsh-extract-6752`. The NEXT one will carry a
+    # different PID, from a different run, possibly from a recipe that does not
+    # exist yet. A gate that greps for 6752 -- or for `vmh-pwsh-extract-` --
+    # would pass the next golden while it shipped the same hole.
+    check fileExists(libFile(DefenderGate))
+    let gate = readLib(DefenderGate)
+    const label = DefenderGate
+    let code = gate.codeOnly()
+
+    # The mechanism: enumerate ExclusionPath, and decide by whether the path
+    # EXISTS. Both halves are load-bearing, so both are asserted on code.
+    code.mustContain("ExclusionPath", label & " (code)")
+    code.mustContain("Test-Path", label & " (code)")
+    code.mustContain("Get-MpPreference", label & " (code)")
+    # A gate that cannot fail is documentation.
+    code.mustContain("exit 1", label & " (code)")
+
+    # The specific PID, and the staging prefix, must not appear in CODE. The
+    # header explains the incident and names both, which is why this runs
+    # against codeOnly() rather than the whole file.
+    code.mustNotContain("6752", label & " (code)")
+    code.mustNotContain("vmh-pwsh-extract", label & " (code)")
+
+    # Finding a stale rule must FAIL the gate, not merely narrate it. The
+    # script has several `exit 1`s (the non-vacuity refusals), so asserting
+    # "an exit 1 exists" does not pin THIS branch: a mutation swapping the
+    # stale branch's `Fail` for an `Info` would sail past it and leave a gate
+    # that reports the defect and then certifies the image anyway. Anchor on
+    # the stale branch actually reaching a Fail.
+    let staleAt = code.find("$stale.Count -gt 0")
+    let failAfterStale = code.find("Fail (", start = max(staleAt, 0))
+    checkpoint label & ": stale branch at " & $staleAt &
+      ", next Fail( at " & $failAfterStale
+    check staleAt > 0
+    check failAfterStale > staleAt
+
+  test "the Defender gate cannot pass by finding nothing":
+    # The failure mode that matters for a checker like this: a broken
+    # Get-MpPreference, a Defender-less SKU, or a mistyped property all yield
+    # an empty list, and "no stale exclusions" then reads exactly like "no
+    # exclusions were examined". The gate must refuse to certify a list it
+    # could not read.
+    let gate = readLib(DefenderGate)
+    const label = DefenderGate
+    let code = gate.codeOnly()
+
+    # It proves the cmdlet is actually there before trusting an empty answer.
+    code.mustContain("Get-Command Get-MpPreference", label & " (code)")
+    # A throw from Get-MpPreference must be a failure, not a silent empty list.
+    code.mustContain("catch", label & " (code)")
+    # And a $null result must not be read as "zero exclusions, all fine".
+    code.mustContain("$null -eq $prefs", label & " (code)")
+
+    # Each of those three refusals must reach an `exit 1`. Counting them keeps
+    # a mutation that turns one into a warning from hiding behind the others.
+    let exits = code.codeLinesWith("exit 1")
+    checkpoint label & ": lines that exit 1: " & $exits.len
+    check exits.len >= 1
+
+    # It must report how many it examined, so a zero is visible in the log
+    # rather than indistinguishable from success.
+    code.mustContain("examined ", label & " (code)")
+
+  test "the Defender gate keeps the exclusions that are deliberate":
+    # `C:\pwsh` exists on purpose: MsMpEng quarantines pwsh.exe as a
+    # `PUA:Win32/PowerShellCore` false positive, so dropping that exclusion
+    # would brick every `shell: pwsh` step -- a worse defect than the one being
+    # fixed. The gate must therefore never remove or rewrite anything, and must
+    # not require the list to be empty.
+    let gate = readLib(DefenderGate)
+    const label = DefenderGate
+    let code = gate.codeOnly()
+
+    # A gate mutates nothing. These are the APIs that would.
+    #
+    # Checked as INVOCATIONS, not as substrings: the failure message quotes
+    # `Remove-MpPreference -ExclusionPath '<path>'` on purpose, because an
+    # operator reading it needs the remedy. Naming it is right; calling it is
+    # not, and only the statement position separates the two.
+    for cmdlet in ["Remove-MpPreference", "Set-MpPreference", "Add-MpPreference"]:
+      let calls = gate.invokesCmdlet(cmdlet)
+      checkpoint label & ": invocations of " & cmdlet & ": " & $calls.len
+      check calls.len == 0
+
+    # And it must not smuggle in "the exclusion list must be non-empty" as the
+    # invariant. An image legitimately carrying zero exclusions is fine; what
+    # the gate rejects is a list it could not READ, which is a different test.
+    # (`$stale.Count -gt 0` IS expected — that is the stale-rule branch.)
+    code.mustNotContain("$paths.Count -eq 0", label & " (code) empty-list demand")
+    code.mustContain("$stale.Count -gt 0", label & " (code) stale branch")
+
+  test "the golden build refuses to capture an image with a stale exclusion":
+    # The pwsh gate's argument, applied to the defect that slipped past it.
+    let build = readRecipe("windows-x64-base", "build-sysprep-golden.sh")
+    const label = "build-sysprep-golden.sh"
+    let code = build.codeOnly()
+
+    code.mustContain(DefenderGate, label & " (code)")
+    code.mustContain("VMH_SKIP_DEFENDER_GATE", label & " (code)")
+
+    # The gate must be RUN, not merely copied in. Anchor on the invocation.
+    let runs = code.codeLinesWith("-File C:\\Windows\\Temp\\" & DefenderGate)
+    checkpoint label & ": lines running the Defender gate in the guest: " & $runs.len
+    check runs.len == 1
+
+    # Its failure must ABORT the build rather than log and continue -- and the
+    # abort asserted here must be the one guarding the GATE RUN, not the
+    # incidental "gate script not found" guard. Anchoring on the message keeps
+    # a mutation that swaps `fail` for `log` from hiding behind the other line.
+    let aborts = code.codeLinesWith("Defender exclusion gate FAILED")
+    checkpoint label & ": lines reporting a failed Defender gate: " & $aborts.len
+    check aborts.len == 1
+    for a in aborts:
+      a.mustContain("fail \"", label & " defender-gate abort")
+
+    # The gate must run BEFORE the ~45-minute DISM /ResetBase, so a bad image
+    # fails in seconds rather than after the long leg.
+    let gateAt = code.find(DefenderGate)
+    let resetBaseAt = code.find("/ResetBase")
+    checkpoint label & ": Defender gate at " & $gateAt & ", /ResetBase at " & $resetBaseAt
+    check gateAt > 0
+    check resetBaseAt > 0
+    check gateAt < resetBaseAt

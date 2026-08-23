@@ -106,6 +106,7 @@ SYSPREP_TIMEOUT="${VMH_SYSPREP_TIMEOUT:-1800}"
 REARM_UNATTEND="${VMH_REARM_UNATTEND:-$SCRIPT_DIR/rearm-unattend.xml}"
 GIT_GATE_PS1="${VMH_GIT_GATE_PS1:-$SCRIPT_DIR/../lib/assert-git-provisioned.ps1}"
 PWSH_GATE_PS1="${VMH_PWSH_GATE_PS1:-$SCRIPT_DIR/../lib/assert-pwsh-provisioned.ps1}"
+DEFENDER_GATE_PS1="${VMH_DEFENDER_GATE_PS1:-$SCRIPT_DIR/../lib/assert-defender-exclusions-sane.ps1}"
 DRY_RUN="${VMH_SYSPREP_DRY_RUN:-}"
 
 # shellcheck disable=SC2206
@@ -134,9 +135,9 @@ ssh_guest() { # ip cmd
 guest_ip() { # domain -> prints ip or empty
   local ip
   ip=$("${VIRSH[@]}" domifaddr "$1" --source agent 2>/dev/null \
-       | grep -oE '192\.168\.122\.[0-9]+' | head -1)
+        | grep -oE '192\.168\.122\.[0-9]+' | head -1)
   [[ -z "$ip" ]] && ip=$("${VIRSH[@]}" domifaddr "$1" 2>/dev/null \
-       | grep -oE '192\.168\.122\.[0-9]+' | head -1)
+        | grep -oE '192\.168\.122\.[0-9]+' | head -1)
   echo "$ip"
 }
 
@@ -325,6 +326,58 @@ else
     fail "PowerShell 7 gate FAILED — refusing to build a golden whose clones cannot run 'shell: pwsh' steps (see [pwsh-gate] output above; re-run guest-recipes/lib/provision-pwsh.ps1 in the guest, then retry)"
   fi
   log "gate passed: PowerShell 7 is usable by services on clones of this golden"
+fi
+
+# ── gate: refuse to capture a golden carrying a stale Defender exclusion ─────
+#
+# The third defect found the same way, and the one that proves a recipe fix
+# alone is not enough. provision-pwsh.ps1 added its PID-named extraction
+# staging directory as a PERMANENT Defender exclusion and never removed it, so
+# the promoted golden shipped
+#
+#   Get-MpPreference -> ExclusionPath: C:\Windows\Temp\vmh-pwsh-extract-6752
+#
+# naming a directory that stopped existing during the very run that added it.
+# Windows reuses PIDs, so any later process drawing 6752 recreates that path
+# and gets an UNSCANNED directory -- on machines whose whole job is running
+# pull-request code from forks.
+#
+# provision-pwsh.ps1 is fixed. That fix reaches the fleet only when a golden is
+# next built or retrofitted, and NOTHING refused to ship the image that already
+# had the rule -- which is exactly why it survived promotion. This gate is that
+# missing refusal.
+#
+# It asserts an INVARIANT ("every path exclusion names a path that exists"),
+# not a hard-coded name, so it also catches the next golden's different PID and
+# staging paths from recipes that do not exist yet. It deliberately does not
+# demand an EMPTY list: C:\pwsh is a load-bearing exclusion (MsMpEng flags
+# pwsh.exe as PUA:Win32/PowerShellCore) and clearing it would trade this defect
+# for a worse one.
+#
+# Placed with the other gates, BEFORE the ~45-minute DISM /ResetBase, so a bad
+# image fails in seconds. /ResetBase drops superseded component-store payloads
+# and does not touch Defender preferences, so asserting here is equivalent to
+# asserting immediately before sysprep.
+#
+# Set VMH_SKIP_DEFENDER_GATE=1 only to build an image deliberately carrying a
+# stale exclusion. It is loud on purpose.
+if [[ -n "${VMH_SKIP_DEFENDER_GATE:-}" ]]; then
+  log "WARNING: VMH_SKIP_DEFENDER_GATE set — NOT verifying Defender exclusions."
+  log "WARNING: clones of the resulting golden may carry an exclusion naming a"
+  log "WARNING: directory that does not exist, which any process reusing that"
+  log "WARNING: PID silently inherits as an unscanned path. Do not ship this."
+else
+  [[ -f "$DEFENDER_GATE_PS1" ]] || fail "Defender gate script not found: $DEFENDER_GATE_PS1"
+  log "gate: verifying no Defender exclusion outlived the directory it excluded"
+  sshpass -p "$GUEST_PASSWORD" scp -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+    -o PreferredAuthentications=password "$DEFENDER_GATE_PS1" \
+    "admin@$IP:C:/Windows/Temp/assert-defender-exclusions-sane.ps1" \
+    || fail "could not scp the Defender gate script into the guest"
+  if ! ssh_guest "$IP" 'powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Temp\assert-defender-exclusions-sane.ps1' 2>&1 | sed 's/^/  [defender-gate] /'; then
+    fail "Defender exclusion gate FAILED — refusing to build a golden that ships an antivirus exemption for a directory that does not exist (see [defender-gate] output above; remove the stale rules with Remove-MpPreference -ExclusionPath '<path>' in the guest, then retry)"
+  fi
+  log "gate passed: every Defender exclusion on this image names a path that exists"
 fi
 
 # ── step 3a: component-store repair — DISM /ResetBase (THE UNBLOCK) ──────────
