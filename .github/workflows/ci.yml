@@ -36,7 +36,7 @@ jobs:
         # type-checked byte-identical code to eph-linux-x64. The macOS leg is
         # kept because it genuinely covers the `defined(macosx)` branches in
         # the tart/lima/utm/qemu_windows_arm backends that no Linux leg sees.
-        runner: [eph-linux-x64, eph-macos-arm64]
+        runner: [eph-linux-x64-g2, eph-macos-arm64]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -76,7 +76,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
+        runner: [eph-linux-x64-g2, eph-linux-arm64, eph-macos-arm64]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -114,7 +114,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
+        runner: [eph-linux-x64-g2, eph-linux-arm64, eph-macos-arm64]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -152,7 +152,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
+        runner: [eph-linux-x64-g2, eph-linux-arm64, eph-macos-arm64]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
