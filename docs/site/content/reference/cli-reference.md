@@ -23,6 +23,8 @@ ERROR / usage error, `130` INCOMPLETE (interrupted).
 | Subcommand | Purpose |
 | --- | --- |
 | `provision` | Ensure a baseline image exists (idempotent). |
+| `boot` | Boot ISO/QCOW2/VHDX media in a transient VM. |
+| `install` | Install ISO media into a caller-owned disk and preserve it after a verified shutdown. |
 | `run` | One-shot revert + exec + harvest + cleanup (the gate runner). |
 | `run --ephemeral` | libvirt/incus: launch one per-job clone, probe, destroy (no residue). |
 | `ephemeral-destroy` | libvirt/incus: reclaim an instance left by `run --ephemeral --keep`. |
@@ -42,6 +44,19 @@ vm-harness provision --backend <id|auto> --guest <linux|windows|macos> \
 ```
 
 Builds the baseline if absent; no-op if present. `--baseline` is required.
+
+### `install`
+
+```sh
+vm-harness install --backend auto --source-image <installer.iso> \
+  --target-disk <path> --disk-gb <GiB> --expect <serial-regex> \
+  [--secondary-iso <seed.iso>] [--timeout-sec <seconds>]
+```
+
+`install` accepts ISO media only. It refuses to overwrite an existing target,
+waits for both the required serial marker and a guest-initiated clean shutdown,
+and preserves the resulting disk while deleting the transient VM. Use a
+`.qcow2` target with libvirt and a `.vhdx` target with Hyper-V.
 
 ### `run`
 

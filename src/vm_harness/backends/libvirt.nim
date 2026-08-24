@@ -1516,6 +1516,8 @@ method stopAndCleanup*(b: LibvirtBackend, vm: VmHandle,
   when defined(linux):
     let isEphemeral = vm.extra.getOrDefault("ephemeral", "") == "true"
     let isTransientBoot = vm.baseline == "<boot-from-media>"
+    let preserveBootDisk =
+      vm.extra.getOrDefault("preserveBootDisk", "") == "true"
     try:
       if isEphemeral or isTransientBoot:
         # Force-stop immediately — a per-job VM has no state worth a
@@ -1548,7 +1550,7 @@ method stopAndCleanup*(b: LibvirtBackend, vm: VmHandle,
           if nvram.len > 0 and fileExists(nvram):
             try: removeFile(nvram)
             except CatchableError: discard
-        else:
+        elif not preserveBootDisk:
           try: b.deleteDomainDisk(vm.name)
           except CatchableError: discard
     except CatchableError:
@@ -1799,6 +1801,9 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
       raise newException(BackendUnavailableError,
         "LibvirtBackend.bootFromMedia does not support bmkRootfsTar; " &
         "use WslBackend for tarball boots")
+    if spec.targetDiskPath.len > 0 and spec.kind != bmkIso:
+      raise newException(ValueError,
+        "BootMediaSpec.targetDiskPath is valid only with bmkIso")
     if spec.mediaPath.len == 0:
       raise newException(ValueError, "BootMediaSpec.mediaPath is empty")
     if not fileExists(spec.mediaPath):
@@ -1842,6 +1847,26 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
         raise newVmHarnessError($b.id, lpStartup,
           "LibvirtBackend.bootFromMedia: qemu-img overlay failed (exit " &
           $overlay.exitCode & "): " & overlay.stdout)
+    elif spec.kind == bmkIso and spec.targetDiskPath.len > 0:
+      attachedMediaPath = absolutePath(spec.targetDiskPath)
+      if fileExists(attachedMediaPath) or dirExists(attachedMediaPath):
+        raise newException(ValueError,
+          "BootMediaSpec.targetDiskPath already exists: " & attachedMediaPath)
+      let targetDir = parentDir(attachedMediaPath)
+      if targetDir.len > 0:
+        createDir(targetDir)
+      let diskGB = if spec.diskGB > 0: spec.diskGB else: 8
+      let createDisk = runProcessCapture(@[
+        b.qemuImgCmd, "create", "-f", "qcow2",
+        attachedMediaPath, $diskGB & "G"], timeoutSec = 120)
+      if createDisk.exitCode != 0:
+        raise newVmHarnessError($b.id, lpStartup,
+          "LibvirtBackend.bootFromMedia: target disk creation failed (exit " &
+          $createDisk.exitCode & "): " & createDisk.stdout)
+      setFilePermissions(attachedMediaPath, {
+        fpUserRead, fpUserWrite,
+        fpGroupRead, fpGroupWrite,
+        fpOthersRead, fpOthersWrite})
 
     var argv: seq[string] = @[
       b.virtInstallCmd,
@@ -1865,7 +1890,11 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
     of bmkIso:
       # Empty boot disk; we boot off the CD.
       argv.add("--disk")
-      argv.add("size=8,format=qcow2,bus=virtio")
+      if spec.targetDiskPath.len > 0:
+        argv.add("path=" & attachedMediaPath & ",format=qcow2,bus=virtio")
+      else:
+        let diskGB = if spec.diskGB > 0: spec.diskGB else: 8
+        argv.add("size=" & $diskGB & ",format=qcow2,bus=virtio")
       argv.add("--cdrom")
       argv.add(spec.mediaPath)
     of bmkRootfsTar:
@@ -1903,6 +1932,9 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
     extra["mediaPath"] = spec.mediaPath
     if attachedMediaPath != spec.mediaPath:
       extra["transientDiskPath"] = attachedMediaPath
+    if spec.targetDiskPath.len > 0:
+      extra["targetDiskPath"] = attachedMediaPath
+      extra["preserveBootDisk"] = "true"
     extra["serialLogPath"] = serialLogPath
     result = VmHandle(
       backend: b,
@@ -1922,6 +1954,20 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
   else:
     raise newException(BackendUnavailableError,
       "LibvirtBackend.bootFromMedia requires a Linux host")
+
+method waitForShutdown*(b: LibvirtBackend, vm: VmHandle,
+                        timeoutSec: int): bool =
+  when defined(linux):
+    let deadline = epochTime() + max(timeoutSec, 0).float
+    while true:
+      if b.domainState(vm.name) == "shut off":
+        return true
+      if epochTime() >= deadline:
+        return false
+      sleep(1000)
+  else:
+    raise newException(BackendUnavailableError,
+      "LibvirtBackend.waitForShutdown requires a Linux host")
 
 method captureSerial*(b: LibvirtBackend, vm: VmHandle): SerialStream =
   ## Poll the file-backed serial device created with the domain. QEMU writes

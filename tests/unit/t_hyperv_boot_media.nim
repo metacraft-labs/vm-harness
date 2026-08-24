@@ -115,3 +115,13 @@ suite "buildNewBootVmCommand: vTPM is opt-in and generation-aware":
     let ps = render(spec)
     check "$wantTpm = $false" in ps
     check "$diskGB  = 8" in ps
+
+suite "buildNewBootVmCommand: caller-owned installation disk":
+  test "an explicit target disk is created and attached without reuse":
+    var spec = win11Spec()
+    spec.targetDiskPath = "C:\\images\\reproos-installed.vhdx"
+    let ps = render(spec)
+    check "$targetVhdx = 'C:\\images\\reproos-installed.vhdx'" in ps
+    check "$bootVhdx = if ($kind -eq 'vhdx')" in ps
+    check "target boot disk already exists" in ps
+    check "New-VHD -Path $bootVhdx" in ps

@@ -183,6 +183,10 @@ vm-harness boot      --backend <id|auto> --source-image <file-or-dir> \
                      [--screenshot <png> --screenshot-delay-sec N] \
                      (--keep | --expect <serial-regex>)
 
+vm-harness install   --backend <id|auto> --source-image <installer.iso> \
+                     --target-disk <blank-disk-path> --disk-gb N \
+                     --expect <serial-success-regex> [--timeout-sec N]
+
 vm-harness run       --backend <id|auto> --guest <linux|windows|macos> \
                      --baseline <name> --output-dir <path> \
                      [--env KEY=VAL ...] [--copy-to host:guest ...] \
@@ -203,6 +207,14 @@ which supports content-addressed recipe outputs without scripting a filename.
 With `--screenshot`, the harness waits for the required `--expect` marker,
 captures the graphical console, and removes the transient VM unless `--keep`
 is also set.
+
+`install` is the persistent-disk counterpart to `boot`. It creates a blank
+caller-owned QCOW2 disk on libvirt or VHDX disk on Hyper-V, boots the installer,
+requires both the serial success marker and a guest-initiated clean shutdown,
+then removes the transient VM while preserving the installed disk. Existing
+target paths are rejected. Use `--secondary-iso` when an installer needs a
+separate unattended seed; do not place per-instance secrets on reusable install
+media.
 
 `--backend auto` picks per the dispatch table (design doc §6):
 

@@ -656,12 +656,14 @@ proc buildNewBootVmCommand*(b: HyperVBackend, spec: BootMediaSpec,
   let diskGB = if spec.diskGB > 0: spec.diskGB else: 8
   let mediaPath = spec.mediaPath
   let seedIsoPath = spec.secondaryIsoPath
+  let targetDiskPath = spec.targetDiskPath
   result = &"""$ErrorActionPreference = 'Stop'
 Import-Module Hyper-V -ErrorAction Stop
 $vmName  = '{psQuote(vmName)}'
 $pipe    = '\\.\pipe\{psQuote(pipeName)}'
 $mediaPath = '{psQuote(mediaPath)}'
 $seedIso = '{psQuote(seedIsoPath)}'
+$targetVhdx = '{psQuote(targetDiskPath)}'
 $scratchVhdx = '{psQuote(scratchVhdxPath)}'
 $scratchIso = Join-Path (Split-Path -Parent $scratchVhdx) "$vmName.boot.iso"
 $gen     = {generation}
@@ -681,19 +683,30 @@ if (Get-VM -Name $vmName -ErrorAction SilentlyContinue) {{
 
 # Resolve boot disk: VHDX is attached directly, QCOW2 is converted into a
 # transient dynamic VHDX, and ISO gets a transient blank installation disk.
-$bootVhdx = if ($kind -eq 'vhdx') {{ $mediaPath }} else {{ $scratchVhdx }}
+$bootVhdx = if ($kind -eq 'vhdx') {{
+  $mediaPath
+}} elseif ($kind -eq 'iso' -and $targetVhdx) {{
+  $targetVhdx
+}} else {{
+  $scratchVhdx
+}}
 
 if ($kind -eq 'iso') {{
   if (-not (Test-Path -LiteralPath $mediaPath)) {{
     throw "bmkIso requires mediaPath to exist: $mediaPath"
   }}
-  $dir = Split-Path -Parent $scratchVhdx
-  if (-not (Test-Path $dir)) {{ New-Item -ItemType Directory -Force -Path $dir | Out-Null }}
+  $scratchDir = Split-Path -Parent $scratchVhdx
+  if (-not (Test-Path $scratchDir)) {{ New-Item -ItemType Directory -Force -Path $scratchDir | Out-Null }}
   # Hyper-V's service account cannot attach media through WSL UNC shares.
   # Localize every ISO into the transient VM directory while this process
   # still has access to the caller's source path.
   Copy-Item -LiteralPath $mediaPath -Destination $scratchIso -Force
-  New-VHD -Path $scratchVhdx -SizeBytes ([int64]$diskGB * 1GB) -Dynamic | Out-Null
+  if (Test-Path -LiteralPath $bootVhdx) {{
+    throw "target boot disk already exists: $bootVhdx"
+  }}
+  $bootDir = Split-Path -Parent $bootVhdx
+  if (-not (Test-Path $bootDir)) {{ New-Item -ItemType Directory -Force -Path $bootDir | Out-Null }}
+  New-VHD -Path $bootVhdx -SizeBytes ([int64]$diskGB * 1GB) -Dynamic | Out-Null
 }} elseif ($kind -eq 'qcow2') {{
   if (-not (Test-Path -LiteralPath $mediaPath)) {{
     throw "bmkQcow2 requires mediaPath to exist: $mediaPath"
@@ -854,6 +867,9 @@ method bootFromMedia*(b: HyperVBackend, spec: BootMediaSpec): VmHandle =
       raise newException(BackendUnavailableError,
         "HyperVBackend.bootFromMedia does not support bmkRootfsTar; " &
         "use WslBackend for tarball boots")
+    if spec.targetDiskPath.len > 0 and spec.kind != bmkIso:
+      raise newException(ValueError,
+        "BootMediaSpec.targetDiskPath is valid only with bmkIso")
     if spec.mediaPath.len == 0:
       raise newException(ValueError, "BootMediaSpec.mediaPath is empty")
     if not fileExists(spec.mediaPath):
@@ -890,6 +906,9 @@ method bootFromMedia*(b: HyperVBackend, spec: BootMediaSpec): VmHandle =
     extra["scratchVhdx"] = scratchVhdx
     extra["bootMediaPath"] = spec.mediaPath
     extra["seedIsoPath"] = spec.secondaryIsoPath
+    if spec.targetDiskPath.len > 0:
+      extra["targetDiskPath"] = absolutePath(spec.targetDiskPath)
+      extra["preserveBootDisk"] = "true"
     extra["scratchDir"] = baseTmp
     extra["serialLogPath"] = if spec.serialLogPath.len > 0: spec.serialLogPath
                              else: baseTmp / (vmName & ".serial.log")
@@ -905,6 +924,28 @@ method bootFromMedia*(b: HyperVBackend, spec: BootMediaSpec): VmHandle =
   else:
     raise newException(BackendUnavailableError,
       "HyperVBackend.bootFromMedia requires a Windows host")
+
+method waitForShutdown*(b: HyperVBackend, vm: VmHandle,
+                        timeoutSec: int): bool =
+  when defined(windows):
+    let psBlock = &"""$ErrorActionPreference = 'Stop'
+$deadline = [DateTime]::UtcNow.AddSeconds({max(timeoutSec, 0)})
+do {{
+  $vm = Get-VM -Name '{psQuote(vm.name)}' -ErrorAction SilentlyContinue
+  if (-not $vm) {{ exit 2 }}
+  if ($vm.State -eq 'Off') {{ exit 0 }}
+  Start-Sleep -Seconds 1
+}} while ([DateTime]::UtcNow -lt $deadline)
+exit 1
+"""
+    let r = runProcessCapture(@[
+      $b.powershellLauncher, "-NoLogo", "-NoProfile", "-ExecutionPolicy",
+      "Bypass", "-NonInteractive", "-Command", psBlock],
+      timeoutSec = max(timeoutSec, 0) + 30)
+    r.exitCode == 0
+  else:
+    raise newException(BackendUnavailableError,
+      "HyperVBackend.waitForShutdown requires a Windows host")
 
 method captureSerial*(b: HyperVBackend, vm: VmHandle): SerialStream =
   ## Start the VM and spawn a background ``pwsh`` that tails the named

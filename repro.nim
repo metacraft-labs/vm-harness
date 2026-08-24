@@ -41,6 +41,8 @@ const portableTestSpecs: seq[VmHarnessTestSpec] = @[
     binary: "t_cli_boot"),
   VmHarnessTestSpec(source: "tests/unit/t_hyperv_parsers.nim",
     binary: "t_hyperv_parsers"),
+  VmHarnessTestSpec(source: "tests/unit/t_hyperv_boot_media.nim",
+    binary: "t_hyperv_boot_media"),
   VmHarnessTestSpec(source: "tests/unit/t_wsl_parsers.nim",
     binary: "t_wsl_parsers"),
   VmHarnessTestSpec(source: "tests/unit/t_utm_parsers.nim",

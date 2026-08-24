@@ -203,6 +203,10 @@ type
     kind*: BootMediaKind
     mediaPath*: string              ## primary boot media (VHDX/ISO/tar path)
     secondaryIsoPath*: string       ## optional second ISO (e.g. cloud-init seed)
+    targetDiskPath*: string         ## optional caller-owned blank install disk
+      ## Valid only with bmkIso. When set, the backend creates a blank disk at
+      ## this exact path, installs into it, and never removes it during VM
+      ## cleanup. Existing paths are rejected instead of overwritten.
     cpus*: int                      ## defaults to 2 when zero
     memoryMB*: int                  ## defaults to 2048 when zero
     generation*: int                ## 1 (legacy BIOS) or 2 (UEFI); defaults to 2
@@ -451,6 +455,15 @@ method captureSerial*(b: VmBackend, vm: VmHandle): SerialStream {.base.} =
   ## backend that explicitly documents serial-after-revertToBaseline).
   raise newException(BackendUnavailableError,
     "captureSerial not implemented for backend " & $b.id)
+
+method waitForShutdown*(b: VmBackend, vm: VmHandle,
+                        timeoutSec: int): bool {.base.} =
+  ## Wait for a guest-initiated clean poweroff. Returns false on timeout or
+  ## when the backend can no longer prove the VM reached its normal off state.
+  ## This is deliberately separate from stopAndCleanup: installer consumers
+  ## must distinguish a completed install from a controller-forced teardown.
+  raise newException(BackendUnavailableError,
+    "waitForShutdown not implemented for backend " & $b.id)
 
 method captureScreenshot*(b: VmBackend, vm: VmHandle,
                           outputPath: string) {.base.} =

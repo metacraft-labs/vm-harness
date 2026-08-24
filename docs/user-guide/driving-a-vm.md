@@ -172,3 +172,15 @@ boot-media primitives: `bootFromMedia(spec)` returns a `VmHandle`, then
 `serialSend`, and `closeSerial`. This is how ReproOS boot tests assert on
 systemd's serial output. Backends without direct-boot support raise
 `BackendUnavailableError`.
+
+For a real installer lifecycle, set `BootMediaSpec.targetDiskPath` with ISO
+media, assert the installer success marker, and call `waitForShutdown` before
+cleanup. The target path is caller-owned: backends reject an existing path and
+`stopAndCleanup` removes the transient VM without deleting the installed disk.
+The CLI packages this sequence as:
+
+```sh
+vm-harness install --backend auto --source-image installer.iso \
+  --target-disk build/installed.qcow2 --disk-gb 16 \
+  --expect 'INSTALL COMPLETE' --timeout-sec 1800
+```

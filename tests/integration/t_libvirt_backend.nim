@@ -241,6 +241,46 @@ suite "LibvirtBackend smoke (no live virsh)":
     expect ValueError:
       discard transientBootNetworkArgs(BootMediaSpec(sshForwardPort: -1))
 
+  test "ISO install preserves an explicit caller-owned target disk":
+    when defined(linux):
+      let root = createTempDir("vmh-libvirt-install", "")
+      defer: removeDir(root)
+      let media = root / "installer.iso"
+      let target = root / "reproos-installed.qcow2"
+      let qemuImg = root / "qemu-img"
+      let virtInstall = root / "virt-install"
+      let argvLog = root / "virt-install.argv"
+      writeFile(media, "installer")
+      writeFile(qemuImg,
+        "#!/bin/sh\n" &
+        "test \"$1\" = create || exit 2\n" &
+        ": > \"$4\"\n")
+      writeFile(virtInstall,
+        "#!/bin/sh\n" &
+        "printf '%s\\n' \"$@\" > '" & argvLog & "'\n")
+      setFilePermissions(qemuImg, getFilePermissions(qemuImg) + {fpUserExec})
+      setFilePermissions(virtInstall,
+        getFilePermissions(virtInstall) + {fpUserExec})
+      let b = newLibvirtBackend(
+        virshCmd = "/nonexistent/virsh-no-such",
+        virtInstallCmd = virtInstall,
+        qemuImgCmd = qemuImg,
+        imagePoolDir = root)
+      let vm = b.bootFromMedia(BootMediaSpec(
+        name: BootDomainNamePrefix & "persistent-disk",
+        kind: bmkIso,
+        mediaPath: media,
+        targetDiskPath: target,
+        generation: 1,
+        diskGB: 12))
+      check fileExists(target)
+      check vm.extra.getOrDefault("targetDiskPath") == absolutePath(target)
+      check vm.extra.getOrDefault("preserveBootDisk") == "true"
+      check ("path=" & absolutePath(target) &
+        ",format=qcow2,bus=virtio") in readFile(argvLog)
+      b.stopAndCleanup(vm, deleteVm = true)
+      check fileExists(target)
+
   test "captureScreenshot writes a non-empty console frame":
     when defined(linux):
       let root = createTempDir("vmh-libvirt-screenshot", "")

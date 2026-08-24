@@ -48,6 +48,8 @@ type
     guestSet*: bool
     baseline*: string
     sourceImage*: string
+    secondaryIsoPath*: string
+    targetDiskPath*: string
     mediaKind*: string
     expectPattern*: string
     generation*: int
@@ -72,6 +74,7 @@ type
     logFormat*: LogFormat
     allowNoopFallback*: bool
     timeoutSec*: int
+    waitForShutdown*: bool
     running*: bool               ## `--running` flag for `snapshot create`.
     # M4 libvirt-slice canonical-command flags. See
     # docs/m4-libvirt.md → "Operator command examples" for the
@@ -173,6 +176,9 @@ Subcommands:
   boot                    Boot ISO/QCOW2/VHDX media in a transient VM.
                           Use --keep to leave it running, or --expect REGEX
                           to assert a serial boot marker and clean it up.
+  install                 Boot an ISO into a caller-owned target disk, require
+                          a serial success marker and clean guest shutdown,
+                          then remove the transient VM but preserve the disk.
   run                     One-shot revert + exec + harvest + cleanup.
   ephemeral-destroy       libvirt/incus: reclaim an ephemeral instance left
                           running by `run --ephemeral --keep` (destroy +
@@ -229,9 +235,13 @@ Common flags:
                                   build-autounattend-iso.sh, ...). Required by
                                   backends that consume recipe-shaped inputs.
   --source-image <ref>
+  --secondary-iso <path>          `boot`/`install`: attach a second read-only ISO.
+  --target-disk <path>            `install`: create and preserve this blank disk.
   --kind <auto|iso|qcow2|vhdx|rootfs-tar>
                                   Media kind for `boot` (default: extension).
   --expect <regex>                `boot`: wait for a serial-console match.
+  --wait-for-shutdown             `boot`: require a clean guest poweroff after
+                                  the serial assertion before cleanup.
   --generation <1|2>             `boot`: legacy BIOS or UEFI (default: 2).
   --graphics <none|vnc|spice>    `boot`: graphical console (default: none).
   --video <model>                `boot`: video model (default: virtio).
@@ -404,6 +414,10 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.recipeBuildDir = args[i]; inc i
     of "--source-image":
       inc i; result.sourceImage = args[i]; inc i
+    of "--secondary-iso":
+      inc i; result.secondaryIsoPath = args[i]; inc i
+    of "--target-disk":
+      inc i; result.targetDiskPath = args[i]; inc i
     of "--kind":
       inc i; result.mediaKind = args[i]; inc i
     of "--expect":
@@ -510,6 +524,9 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.ephemeralPrefix = args[i]; inc i
     of "--timeout-sec":
       inc i; result.timeoutSec = parseInt(args[i]); inc i
+    of "--wait-for-shutdown":
+      result.waitForShutdown = true
+      inc i
     of "--env":
       inc i
       let p = parseEnvPair(args[i])
@@ -739,8 +756,21 @@ proc resolveBootOutputDir*(requested: string;
   else:
     getTempDir() / ("vm-harness-boot-" & $processId)
 
-proc cmdBoot(opts: CliOpts): int =
-  if not opts.keepEphemeral and opts.expectPattern.len == 0 and
+proc cmdBoot(opts: CliOpts; installMode = false): int =
+  if installMode:
+    if opts.targetDiskPath.len == 0:
+      raise newException(ValueError,
+        "install: --target-disk is required")
+    if opts.expectPattern.len == 0:
+      raise newException(ValueError,
+        "install: --expect is required so a failed installer poweroff cannot " &
+        "be accepted as success")
+    if opts.keepEphemeral or opts.viewer or opts.screenshotPath.len > 0 or
+        opts.cmd.len > 0:
+      raise newException(ValueError,
+        "install: viewer, screenshot, SSH command, and --keep modes are not " &
+        "valid during target-disk installation")
+  if not installMode and not opts.keepEphemeral and opts.expectPattern.len == 0 and
       not opts.viewer and opts.screenshotPath.len == 0 and opts.cmd.len == 0:
     raise newException(ValueError,
       "boot: pass --keep to leave the VM running, --viewer for manual " &
@@ -759,6 +789,9 @@ proc cmdBoot(opts: CliOpts): int =
 
   let mediaPath = resolveBootMediaPath(opts.sourceImage)
   let mediaKind = parseBootMediaKind(opts.mediaKind, mediaPath)
+  if opts.targetDiskPath.len > 0 and mediaKind != bmkIso:
+    raise newException(ValueError,
+      "--target-disk is valid only when booting installer ISO media")
   let id = resolveBootBackendId(opts, mediaKind, detectHostPlatform())
   let backend = newBackend(id, noopFallback = opts.allowNoopFallback)
   if not backend.probeAvailability():
@@ -813,7 +846,12 @@ proc cmdBoot(opts: CliOpts): int =
     name: "",
     kind: mediaKind,
     mediaPath: mediaPath,
-    secondaryIsoPath: "",
+    secondaryIsoPath: (if opts.secondaryIsoPath.len > 0:
+                         absolutePath(opts.secondaryIsoPath)
+                       else: ""),
+    targetDiskPath: (if opts.targetDiskPath.len > 0:
+                       absolutePath(opts.targetDiskPath)
+                     else: ""),
     cpus: (if opts.cpus > 0: opts.cpus else: 2),
     memoryMB: (if opts.memoryMB > 0: opts.memoryMB else: 4096),
     generation: opts.generation,
@@ -821,6 +859,7 @@ proc cmdBoot(opts: CliOpts): int =
     graphics: graphics,
     videoModel: opts.videoModel,
     sshForwardPort: sshForwardPort,
+    diskGB: (if opts.diskGB > 0: opts.diskGB else: 8),
     serialPipeName: "",
     serialLogPath: outputDir / "boot.serial.log",
     extra: extra)
@@ -838,7 +877,9 @@ proc cmdBoot(opts: CliOpts): int =
       serial = backend.captureSerial(vm)
 
     if opts.expectPattern.len > 0:
-      let timeout = if opts.timeoutSec > 0: opts.timeoutSec else: 180
+      let timeout = if opts.timeoutSec > 0: opts.timeoutSec
+                    elif installMode: 1800
+                    else: 180
       let match = backend.expectLine(serial, opts.expectPattern, timeout)
       if not match.matched:
         logEvent(opts.logFormat, "error", "boot marker not observed",
@@ -852,6 +893,17 @@ proc cmdBoot(opts: CliOpts): int =
       # Let Start-VM leave the PowerShell launcher before closing its serial
       # reader. Closing the reader does not stop the VM.
       sleep(1000)
+
+    if installMode or opts.waitForShutdown:
+      let shutdownTimeout = if opts.timeoutSec > 0: opts.timeoutSec
+                            elif installMode: 1800
+                            else: 180
+      if not backend.waitForShutdown(vm, shutdownTimeout):
+        logEvent(opts.logFormat, "error", "clean guest shutdown not observed",
+                 {"vm": vm.name, "serialLog": serial.logPath})
+        return 1
+      logEvent(opts.logFormat, "info", "clean guest shutdown observed",
+               {"vm": vm.name})
 
     if opts.screenshotPath.len > 0:
       if opts.screenshotDelaySec > 0:
@@ -1489,6 +1541,7 @@ proc runCli*(args: seq[string]): int =
     return 0
   of "provision": return cmdProvision(opts)
   of "boot":      return cmdBoot(opts)
+  of "install":   return cmdBoot(opts, installMode = true)
   of "run":       return cmdRun(opts)
   of "ephemeral-destroy": return cmdEphemeralDestroy(opts)
   of "probe":     return cmdProbe(opts)
