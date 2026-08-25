@@ -55,7 +55,10 @@ and preserves the resulting disk while deleting the transient VM. Use a
 
 For libvirt media boots, a command after `--` runs through the loopback SSH
 forward. Select key-only authentication with `--ssh-forward-port auto`,
-`--ssh-user <user>`, and `--ssh-private-key <path>`. Password-based guests can
+`--ssh-user <user>`, and `--ssh-private-key <path>`. Persist and verify the
+guest host identity with `--ssh-known-hosts <path>` and a stable
+`--ssh-host-key-alias <name>` when automatic forwarding may select a different
+port on each boot. Password-based guests can
 instead use `--ssh-password-env <name>`; the two authentication options are
 mutually exclusive.
 

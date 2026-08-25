@@ -119,6 +119,11 @@ type
       ## ``sshpass -e``).
     sshKeyPath*: string
       ## Private key used when password authentication is disabled.
+    sshKnownHostsPath*: string
+      ## Persistent known-hosts file. Empty preserves the legacy ephemeral
+      ## media-boot behavior that does not retain host identity.
+    sshHostKeyAlias*: string
+      ## Stable known-hosts lookup name, independent of forwarded host ports.
     sshGuestOs*: GuestOs
       ## Selects the remote shell quoting convention used by ``execInGuest``.
       ## Defaults to Windows for compatibility with the original libvirt
@@ -188,6 +193,8 @@ proc newLibvirtBackend*(virshCmd: string = "virsh",
                         sshUser: string = DefaultLibvirtWindowsSshUser,
                         sshPassword: string = DefaultLibvirtWindowsSshPassword,
                         sshKeyPath: string = "",
+                        sshKnownHostsPath: string = "",
+                        sshHostKeyAlias: string = "",
                         sshGuestOs: GuestOs = goWindows,
                         sshPort: int = 22,
                         bootTimeoutSec: int = DefaultLibvirtBootTimeoutSec,
@@ -215,6 +222,8 @@ proc newLibvirtBackend*(virshCmd: string = "virsh",
     sshUser: sshUser,
     sshPassword: sshPassword,
     sshKeyPath: sshKeyPath,
+    sshKnownHostsPath: sshKnownHostsPath,
+    sshHostKeyAlias: sshHostKeyAlias,
     sshGuestOs: sshGuestOs,
     sshPort: sshPort,
     bootTimeoutSec: bootTimeoutSec,
@@ -778,15 +787,24 @@ proc configuredSshAuth(b: LibvirtBackend): SshAuth =
   else:
     SshAuth(kind: saNone)
 
-proc sshBaseArgs*(b: LibvirtBackend, host: string): seq[string] =
-  ## Build a base ``ssh`` argv with the standard "non-interactive,
-  ## don't pollute known_hosts, accept whatever key the guest presents"
-  ## set of flags. Per-call args are appended by the caller.
-  let userHost = b.sshUser & "@" & host
+proc sshHostKeyArgs*(b: LibvirtBackend): seq[string] =
+  if b.sshKnownHostsPath.len == 0:
+    return @[
+      "-o", "StrictHostKeyChecking=no",
+      "-o", "UserKnownHostsFile=/dev/null",
+    ]
   result = @[
-    b.sshCmd,
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "UserKnownHostsFile=" & b.sshKnownHostsPath,
+  ]
+  if b.sshHostKeyAlias.len > 0:
+    result.add(@["-o", "HostKeyAlias=" & b.sshHostKeyAlias])
+
+proc sshBaseArgs*(b: LibvirtBackend, host: string): seq[string] =
+  ## Build a non-interactive SSH argv. Callers may opt into persistent
+  ## trust-on-first-use host identity with ``sshKnownHostsPath``.
+  let userHost = b.sshUser & "@" & host
+  result = @[b.sshCmd] & b.sshHostKeyArgs() & @[
     "-o", "LogLevel=ERROR",
     "-o", "ConnectTimeout=10",
     "-p", $b.sshPort]
@@ -857,10 +875,7 @@ proc runSshExec(b: LibvirtBackend, host: string, command: string,
 proc scpToGuest(b: LibvirtBackend, host, hostPath, guestPath: string,
                 timeoutSec: int = 600) =
   let target = b.sshUser & "@" & host & ":" & guestPath
-  var argv = b.sshpassPrefix() & @[
-    b.scpCmd,
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
+  var argv = b.sshpassPrefix() & @[b.scpCmd] & b.sshHostKeyArgs() & @[
     "-o", "LogLevel=ERROR",
     "-o", "ConnectTimeout=10",
     "-P", $b.sshPort]
@@ -880,10 +895,7 @@ proc scpToGuest(b: LibvirtBackend, host, hostPath, guestPath: string,
 proc scpFromGuest(b: LibvirtBackend, host, guestPath, hostPath: string,
                   timeoutSec: int = 600) =
   let src = b.sshUser & "@" & host & ":" & guestPath
-  var argv = b.sshpassPrefix() & @[
-    b.scpCmd,
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
+  var argv = b.sshpassPrefix() & @[b.scpCmd] & b.sshHostKeyArgs() & @[
     "-o", "LogLevel=ERROR",
     "-o", "ConnectTimeout=10",
     "-P", $b.sshPort]

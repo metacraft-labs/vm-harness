@@ -62,6 +62,8 @@ type
     sshUser*: string
     sshPasswordEnv*: string
     sshPrivateKey*: string
+    sshKnownHosts*: string
+    sshHostKeyAlias*: string
     cpus*: int
     memoryMB*: int
     diskGB*: int
@@ -258,6 +260,9 @@ Common flags:
   --ssh-password-env <name>      `boot`: environment variable containing the
                                   SSH password; the value is never put in argv.
   --ssh-private-key <path>       `boot`: private key for key-only SSH.
+  --ssh-known-hosts <path>       `boot`: persist and verify the guest host key.
+  --ssh-host-key-alias <name>    `boot`: stable host identity across forwarded
+                                  port changes; requires --ssh-known-hosts.
   --cpus <int>                    Backend default applies when omitted.
   --vcpu <int>                    Alias for --cpus (canonical libvirt M4 shape).
   --memory-mb <int>
@@ -467,6 +472,10 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.sshPasswordEnv = args[i]; inc i
     of "--ssh-private-key":
       inc i; result.sshPrivateKey = args[i]; inc i
+    of "--ssh-known-hosts":
+      inc i; result.sshKnownHosts = args[i]; inc i
+    of "--ssh-host-key-alias":
+      inc i; result.sshHostKeyAlias = args[i]; inc i
     of "--cpus", "--vcpu":
       # ``--vcpu`` is the canonical libvirt M4 spelling; ``--cpus`` is
       # the historical vm-harness spelling. Both produce the same
@@ -627,6 +636,12 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
   if result.sshPrivateKey.len > 0 and not fileExists(result.sshPrivateKey):
     raise newException(ValueError,
       &"--ssh-private-key '{result.sshPrivateKey}': file not found")
+  if result.sshHostKeyAlias.len > 0 and result.sshKnownHosts.len == 0:
+    raise newException(ValueError,
+      "--ssh-host-key-alias requires --ssh-known-hosts")
+  if result.sshHostKeyAlias.anyIt(it.isSpaceAscii or ord(it) < 32):
+    raise newException(ValueError,
+      "--ssh-host-key-alias must not contain whitespace or control characters")
 
 proc logEvent*(format: LogFormat, level: string, msg: string,
               fields: openArray[(string, string)] = []) =
@@ -842,6 +857,9 @@ proc cmdBoot(opts: CliOpts; installMode = false): int =
           opts.sshPasswordEnv)
       lb.sshPassword = password
       lb.sshKeyPath = ""
+    if opts.sshKnownHosts.len > 0:
+      lb.sshKnownHostsPath = absolutePath(opts.sshKnownHosts)
+      lb.sshHostKeyAlias = opts.sshHostKeyAlias
     if opts.guestSet:
       lb.sshGuestOs = opts.guest
 

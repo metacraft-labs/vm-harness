@@ -83,6 +83,46 @@ suite "CLI libvirt M4 canonical-command flag plumbing":
     check "IdentitiesOnly=yes" in sshArgs
     check backend.sshpassPrefix().len == 0
 
+  test "boot can pin host identity across forwarded port changes":
+    let privateKey = getAppFilename()
+    let knownHosts = getTempDir() / "vmh-cli-known-hosts"
+    let opts = parseCliOpts(@[
+      "boot",
+      "--backend", "libvirt",
+      "--source-image", "reproos.qcow2",
+      "--ssh-forward-port", "auto",
+      "--ssh-user", "repro",
+      "--ssh-private-key", privateKey,
+      "--ssh-known-hosts", knownHosts,
+      "--ssh-host-key-alias", "reproos-installed-disk",
+      "--", "hostname"])
+    check opts.sshKnownHosts == knownHosts
+    check opts.sshHostKeyAlias == "reproos-installed-disk"
+
+    let backend = newLibvirtBackend(
+      sshPassword = "",
+      sshKeyPath = privateKey,
+      sshKnownHostsPath = knownHosts,
+      sshHostKeyAlias = opts.sshHostKeyAlias)
+    let sshArgs = backend.sshBaseArgs("127.0.0.1")
+    check "StrictHostKeyChecking=accept-new" in sshArgs
+    check "UserKnownHostsFile=" & knownHosts in sshArgs
+    check "HostKeyAlias=reproos-installed-disk" in sshArgs
+    check "StrictHostKeyChecking=no" notin sshArgs
+    check "UserKnownHostsFile=/dev/null" notin sshArgs
+
+  test "host-key aliases require a persistent known-hosts file":
+    expect ValueError:
+      discard parseCliOpts(@[
+        "boot", "--ssh-host-key-alias", "reproos-installed-disk"])
+
+  test "host-key aliases reject whitespace":
+    expect ValueError:
+      discard parseCliOpts(@[
+        "boot",
+        "--ssh-known-hosts", getTempDir() / "vmh-cli-known-hosts",
+        "--ssh-host-key-alias", "not one host"])
+
   test "boot rejects ambiguous SSH authentication":
     expect ValueError:
       discard parseCliOpts(@[
