@@ -53,6 +53,12 @@ waits for both the required serial marker and a guest-initiated clean shutdown,
 and preserves the resulting disk while deleting the transient VM. Use a
 `.qcow2` target with libvirt and a `.vhdx` target with Hyper-V.
 
+For libvirt media boots, a command after `--` runs through the loopback SSH
+forward. Select key-only authentication with `--ssh-forward-port auto`,
+`--ssh-user <user>`, and `--ssh-private-key <path>`. Password-based guests can
+instead use `--ssh-password-env <name>`; the two authentication options are
+mutually exclusive.
+
 ### `run`
 
 ```

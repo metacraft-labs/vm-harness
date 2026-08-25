@@ -62,6 +62,39 @@ suite "CLI libvirt M4 canonical-command flag plumbing":
     check opts.sshPasswordEnv == "REPROOS_SSH_PASSWORD"
     check opts.cmd == @["hostname"]
 
+  test "boot accepts key-only SSH without a password option":
+    let privateKey = getAppFilename()
+    let opts = parseCliOpts(@[
+      "boot",
+      "--backend", "libvirt",
+      "--source-image", "reproos.qcow2",
+      "--ssh-forward-port", "auto",
+      "--ssh-user", "repro",
+      "--ssh-private-key", privateKey,
+      "--", "hostname"])
+    check opts.sshPrivateKey == privateKey
+    check opts.sshPasswordEnv.len == 0
+    check opts.cmd == @["hostname"]
+
+    let backend = newLibvirtBackend(
+      sshPassword = "", sshKeyPath = privateKey)
+    let sshArgs = backend.sshBaseArgs("127.0.0.1")
+    check sshArgs[sshArgs.find("-i") + 1] == privateKey
+    check "IdentitiesOnly=yes" in sshArgs
+    check backend.sshpassPrefix().len == 0
+
+  test "boot rejects ambiguous SSH authentication":
+    expect ValueError:
+      discard parseCliOpts(@[
+        "boot",
+        "--ssh-password-env", "REPROOS_SSH_PASSWORD",
+        "--ssh-private-key", getAppFilename()])
+
+  test "boot rejects a missing SSH private key":
+    expect ValueError:
+      discard parseCliOpts(@[
+        "boot", "--ssh-private-key", "/definitely/missing/id_ed25519"])
+
   test "boot rejects an invalid SSH forwarding port":
     expect ValueError:
       discard parseCliOpts(@[

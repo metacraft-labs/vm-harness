@@ -61,6 +61,7 @@ type
     sshForwardPort*: int
     sshUser*: string
     sshPasswordEnv*: string
+    sshPrivateKey*: string
     cpus*: int
     memoryMB*: int
     diskGB*: int
@@ -256,6 +257,7 @@ Common flags:
   --ssh-user <name>              `boot`: SSH user for a command after `--`.
   --ssh-password-env <name>      `boot`: environment variable containing the
                                   SSH password; the value is never put in argv.
+  --ssh-private-key <path>       `boot`: private key for key-only SSH.
   --cpus <int>                    Backend default applies when omitted.
   --vcpu <int>                    Alias for --cpus (canonical libvirt M4 shape).
   --memory-mb <int>
@@ -463,6 +465,8 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.sshUser = args[i]; inc i
     of "--ssh-password-env":
       inc i; result.sshPasswordEnv = args[i]; inc i
+    of "--ssh-private-key":
+      inc i; result.sshPrivateKey = args[i]; inc i
     of "--cpus", "--vcpu":
       # ``--vcpu`` is the canonical libvirt M4 spelling; ``--cpus`` is
       # the historical vm-harness spelling. Both produce the same
@@ -617,6 +621,12 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
   if result.controllerPubKey.len > 0 and not fileExists(result.controllerPubKey):
     raise newException(ValueError,
       &"--controller-pubkey '{result.controllerPubKey}': file not found")
+  if result.sshPasswordEnv.len > 0 and result.sshPrivateKey.len > 0:
+    raise newException(ValueError,
+      "--ssh-password-env and --ssh-private-key are mutually exclusive")
+  if result.sshPrivateKey.len > 0 and not fileExists(result.sshPrivateKey):
+    raise newException(ValueError,
+      &"--ssh-private-key '{result.sshPrivateKey}': file not found")
 
 proc logEvent*(format: LogFormat, level: string, msg: string,
               fields: openArray[(string, string)] = []) =
@@ -814,18 +824,24 @@ proc cmdBoot(opts: CliOpts; installMode = false): int =
     if opts.sshUser.len == 0:
       raise newException(ValueError,
         "boot: a guest command requires --ssh-user")
-    if opts.sshPasswordEnv.len == 0:
+    if opts.sshPasswordEnv.len == 0 and opts.sshPrivateKey.len == 0:
       raise newException(ValueError,
-        "boot: a guest command requires --ssh-password-env")
-    let password = getEnv(opts.sshPasswordEnv)
-    if password.len == 0:
-      raise newException(ValueError,
-        "boot: SSH password environment variable is unset or empty: " &
-        opts.sshPasswordEnv)
+        "boot: a guest command requires --ssh-password-env or " &
+        "--ssh-private-key")
     let lb = LibvirtBackend(backend)
     lb.sshPort = sshForwardPort
     lb.sshUser = opts.sshUser
-    lb.sshPassword = password
+    if opts.sshPrivateKey.len > 0:
+      lb.sshPassword = ""
+      lb.sshKeyPath = absolutePath(opts.sshPrivateKey)
+    else:
+      let password = getEnv(opts.sshPasswordEnv)
+      if password.len == 0:
+        raise newException(ValueError,
+          "boot: SSH password environment variable is unset or empty: " &
+          opts.sshPasswordEnv)
+      lb.sshPassword = password
+      lb.sshKeyPath = ""
     if opts.guestSet:
       lb.sshGuestOs = opts.guest
 

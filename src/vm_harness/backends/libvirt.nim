@@ -117,6 +117,8 @@ type
       ## Default Windows admin password. Stored in the backend struct,
       ## NEVER passed via process argv (transit is through
       ## ``sshpass -e``).
+    sshKeyPath*: string
+      ## Private key used when password authentication is disabled.
     sshGuestOs*: GuestOs
       ## Selects the remote shell quoting convention used by ``execInGuest``.
       ## Defaults to Windows for compatibility with the original libvirt
@@ -185,6 +187,7 @@ proc newLibvirtBackend*(virshCmd: string = "virsh",
                         networkBridge: string = DefaultLibvirtBridge,
                         sshUser: string = DefaultLibvirtWindowsSshUser,
                         sshPassword: string = DefaultLibvirtWindowsSshPassword,
+                        sshKeyPath: string = "",
                         sshGuestOs: GuestOs = goWindows,
                         sshPort: int = 22,
                         bootTimeoutSec: int = DefaultLibvirtBootTimeoutSec,
@@ -211,6 +214,7 @@ proc newLibvirtBackend*(virshCmd: string = "virsh",
     networkBridge: networkBridge,
     sshUser: sshUser,
     sshPassword: sshPassword,
+    sshKeyPath: sshKeyPath,
     sshGuestOs: sshGuestOs,
     sshPort: sshPort,
     bootTimeoutSec: bootTimeoutSec,
@@ -766,6 +770,14 @@ proc autostartDomain*(b: LibvirtBackend, name: string,
 # ---------------------------------------------------------------------------
 # SSH transport helpers.
 
+proc configuredSshAuth(b: LibvirtBackend): SshAuth =
+  if b.sshKeyPath.len > 0:
+    SshAuth(kind: saKeyFile, keyPath: b.sshKeyPath)
+  elif b.sshPassword.len > 0:
+    SshAuth(kind: saPassword, password: b.sshPassword)
+  else:
+    SshAuth(kind: saNone)
+
 proc sshBaseArgs*(b: LibvirtBackend, host: string): seq[string] =
   ## Build a base ``ssh`` argv with the standard "non-interactive,
   ## don't pollute known_hosts, accept whatever key the guest presents"
@@ -777,15 +789,18 @@ proc sshBaseArgs*(b: LibvirtBackend, host: string): seq[string] =
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "LogLevel=ERROR",
     "-o", "ConnectTimeout=10",
-    "-p", $b.sshPort,
-    userHost]
+    "-p", $b.sshPort]
+  if b.sshKeyPath.len > 0:
+    result.add(@["-o", "IdentitiesOnly=yes", "-i", b.sshKeyPath])
+  result.add(userHost)
 
 proc sshpassPrefix*(b: LibvirtBackend): seq[string] =
   ## ``sshpass -e`` prefix; the password is delivered through the
   ## ``SSHPASS`` env var when ``runProcessCapture`` is called, never
   ## via argv. Returns empty seq when ``sshpassCmd`` isn't set (i.e.
   ## the caller has key-based auth).
-  if b.sshpassCmd.len == 0 or b.sshPassword.len == 0:
+  if b.sshKeyPath.len > 0 or b.sshpassCmd.len == 0 or
+      b.sshPassword.len == 0:
     return @[]
   result = @[b.sshpassCmd, "-e"]
 
@@ -833,7 +848,8 @@ proc runSshExec(b: LibvirtBackend, host: string, command: string,
   let fullCmd = prefix & command
   var argv = b.sshpassPrefix() & b.sshBaseArgs(host) & @[fullCmd]
   var passEnv = initTable[string, string]()
-  if b.sshpassCmd.len > 0 and b.sshPassword.len > 0:
+  if b.sshKeyPath.len == 0 and b.sshpassCmd.len > 0 and
+      b.sshPassword.len > 0:
     passEnv["SSHPASS"] = b.sshPassword
   runProcessCapture(argv, timeoutSec = timeoutSec, env = passEnv,
                     stdinData = stdinData)
@@ -847,10 +863,13 @@ proc scpToGuest(b: LibvirtBackend, host, hostPath, guestPath: string,
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "LogLevel=ERROR",
     "-o", "ConnectTimeout=10",
-    "-P", $b.sshPort,
-    hostPath, target]
+    "-P", $b.sshPort]
+  if b.sshKeyPath.len > 0:
+    argv.add(@["-o", "IdentitiesOnly=yes", "-i", b.sshKeyPath])
+  argv.add(@[hostPath, target])
   var passEnv = initTable[string, string]()
-  if b.sshpassCmd.len > 0 and b.sshPassword.len > 0:
+  if b.sshKeyPath.len == 0 and b.sshpassCmd.len > 0 and
+      b.sshPassword.len > 0:
     passEnv["SSHPASS"] = b.sshPassword
   let r = runProcessCapture(argv, timeoutSec = timeoutSec, env = passEnv)
   if r.exitCode != 0:
@@ -867,10 +886,13 @@ proc scpFromGuest(b: LibvirtBackend, host, guestPath, hostPath: string,
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "LogLevel=ERROR",
     "-o", "ConnectTimeout=10",
-    "-P", $b.sshPort,
-    src, hostPath]
+    "-P", $b.sshPort]
+  if b.sshKeyPath.len > 0:
+    argv.add(@["-o", "IdentitiesOnly=yes", "-i", b.sshKeyPath])
+  argv.add(@[src, hostPath])
   var passEnv = initTable[string, string]()
-  if b.sshpassCmd.len > 0 and b.sshPassword.len > 0:
+  if b.sshKeyPath.len == 0 and b.sshpassCmd.len > 0 and
+      b.sshPassword.len > 0:
     passEnv["SSHPASS"] = b.sshPassword
   let r = runProcessCapture(argv, timeoutSec = timeoutSec, env = passEnv)
   if r.exitCode != 0:
@@ -1418,7 +1440,7 @@ method revertToBaseline*(b: LibvirtBackend, baselineName: string): VmHandle =
       ipAddress: some(ip),
       sshPort: b.sshPort,
       sshUser: b.sshUser,
-      sshAuth: SshAuth(kind: saPassword, password: b.sshPassword),
+      sshAuth: b.configuredSshAuth(),
       extra: extra)
   else:
     raise newException(BackendUnavailableError,
@@ -1946,8 +1968,8 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
                     none(string)),
       sshPort: spec.sshForwardPort,
       sshUser: (if spec.sshForwardPort > 0: b.sshUser else: ""),
-      sshAuth: (if spec.sshForwardPort > 0 and b.sshPassword.len > 0:
-                  SshAuth(kind: saPassword, password: b.sshPassword)
+      sshAuth: (if spec.sshForwardPort > 0:
+                  b.configuredSshAuth()
                 else:
                   SshAuth(kind: saNone)),
       extra: extra)
