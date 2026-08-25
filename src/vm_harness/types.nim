@@ -194,6 +194,11 @@ type
     bgVnc = "vnc"              ## loopback-only VNC console
     bgSpice = "spice"          ## loopback-only SPICE console
 
+  BootAcceleration* = enum
+    baAuto = "auto"            ## backend selects hardware acceleration
+    baKvm = "kvm"              ## require Linux KVM acceleration
+    baTcg = "tcg"              ## QEMU software emulation
+
   BootMediaSpec* = object
     ## Direct-boot media for testing OS bring-up itself (not test-in-guest).
     ## Distinct from BaselineSpec: BaselineSpec provisions a long-lived
@@ -211,6 +216,7 @@ type
     memoryMB*: int                  ## defaults to 2048 when zero
     generation*: int                ## 1 (legacy BIOS) or 2 (UEFI); defaults to 2
     secureBootEnabled*: bool        ## defaults to false (most test ISOs unsigned)
+    acceleration*: BootAcceleration ## libvirt execution mode; defaults to auto
     graphics*: BootGraphicsKind     ## graphical console; defaults to none
     videoModel*: string             ## backend video model; defaults to virtio
     sshForwardPort*: int            ## loopback host port forwarded to guest SSH

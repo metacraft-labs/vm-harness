@@ -53,6 +53,7 @@ type
     mediaKind*: string
     expectPattern*: string
     generation*: int
+    acceleration*: string
     graphics*: string
     videoModel*: string
     viewer*: bool
@@ -246,6 +247,7 @@ Common flags:
   --wait-for-shutdown             `boot`: require a clean guest poweroff after
                                   the serial assertion before cleanup.
   --generation <1|2>             `boot`: legacy BIOS or UEFI (default: 2).
+  --acceleration <auto|kvm|tcg> `boot`: execution mode (default: auto).
   --graphics <none|vnc|spice>    `boot`: graphical console (default: none).
   --video <model>                `boot`: video model (default: virtio).
   --viewer                       `boot`: open virt-viewer for libvirt and
@@ -382,6 +384,7 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
   result.memoryMB = 0
   result.diskGB = 0
   result.generation = 2
+  result.acceleration = "auto"
   result.graphics = "none"
   result.videoModel = "virtio"
   if args.len == 0 or args[0] in ["-h", "--help", "help"]:
@@ -434,6 +437,13 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       result.generation = parseInt(args[i])
       if result.generation notin [1, 2]:
         raise newException(ValueError, "--generation expects 1 or 2")
+      inc i
+    of "--acceleration":
+      inc i
+      result.acceleration = args[i].toLowerAscii()
+      if result.acceleration notin ["auto", "kvm", "tcg"]:
+        raise newException(ValueError,
+          "--acceleration expects auto, kvm, or tcg")
       inc i
     of "--graphics":
       inc i
@@ -876,6 +886,10 @@ proc cmdBoot(opts: CliOpts; installMode = false): int =
     of "vnc": bgVnc
     of "spice": bgSpice
     else: bgNone
+  let acceleration = case opts.acceleration
+    of "kvm": baKvm
+    of "tcg": baTcg
+    else: baAuto
   let spec = BootMediaSpec(
     name: "",
     kind: mediaKind,
@@ -890,6 +904,7 @@ proc cmdBoot(opts: CliOpts; installMode = false): int =
     memoryMB: (if opts.memoryMB > 0: opts.memoryMB else: 4096),
     generation: opts.generation,
     secureBootEnabled: false,
+    acceleration: acceleration,
     graphics: graphics,
     videoModel: opts.videoModel,
     sshForwardPort: sshForwardPort,
@@ -1243,6 +1258,9 @@ proc cmdEphemeralDestroy(opts: CliOpts): int =
     sshAuth: SshAuth(kind: saNone),
     extra: extra)
   lb.stopAndCleanup(vm, deleteVm = true)
+  if lb.domainExists(opts.baseline):
+    raise newVmHarnessError($biLibvirt, lpCleanup,
+      "ephemeral-destroy could not remove domain " & opts.baseline)
   logEvent(opts.logFormat, "info", "ephemeral clone: destroyed",
            {"name": opts.baseline})
   0

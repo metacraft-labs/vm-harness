@@ -323,6 +323,11 @@ proc domainState*(b: LibvirtBackend, name: string): string =
     return ""
   result = r.stdout.strip()
 
+proc domainNeedsForceStop*(state: string): bool =
+  ## Libvirt may pause a domain after an I/O or watchdog failure. Such a
+  ## domain is still active and must be destroyed before it can be undefined.
+  state.len > 0 and state notin ["shut off", "crashed"]
+
 proc domainIpAddress*(b: LibvirtBackend, name: string): string =
   ## Returns the first non-empty IPv4 the libvirt guest-agent or DHCP
   ## lease table knows about for the domain's first interface. Returns
@@ -364,7 +369,7 @@ proc destroyDomain*(b: LibvirtBackend, name: string) =
   ## ``virsh destroy <name>`` (force-stop). Idempotent; returns
   ## silently when the domain is already stopped or undefined.
   if not b.domainExists(name): return
-  if b.domainState(name) != "running": return
+  if not domainNeedsForceStop(b.domainState(name)): return
   discard b.runVirsh(@["destroy", name], timeoutSec = 60)
 
 proc shutdownDomain*(b: LibvirtBackend, name: string,
@@ -373,11 +378,15 @@ proc shutdownDomain*(b: LibvirtBackend, name: string,
   ## ``destroy`` if the guest doesn't react inside ``waitSec``. Safe
   ## from finally blocks.
   if not b.domainExists(name): return
-  if b.domainState(name) != "running": return
+  let initialState = b.domainState(name)
+  if not domainNeedsForceStop(initialState): return
+  if initialState != "running":
+    b.destroyDomain(name)
+    return
   discard b.runVirsh(@["shutdown", name], timeoutSec = 30)
   let deadline = epochTime() + waitSec.float
   while epochTime() < deadline:
-    if b.domainState(name) != "running":
+    if not domainNeedsForceStop(b.domainState(name)):
       return
     sleep(1000)
   b.destroyDomain(name)
@@ -1718,6 +1727,17 @@ proc transientBootGraphicsArgs*(spec: BootMediaSpec): seq[string] =
   of bgSpice:
     @["--graphics", "spice,listen=127.0.0.1", "--video", videoModel]
 
+proc transientBootAccelerationArgs*(spec: BootMediaSpec): seq[string] =
+  ## TCG must not inherit a host CPU model: that model can contain KVM-only
+  ## features, particularly on nested-virtualization hosts such as WSL2.
+  case spec.acceleration
+  of baAuto:
+    @["--cpu", "host-model"]
+  of baKvm:
+    @["--virt-type", "kvm", "--cpu", "host-model"]
+  of baTcg:
+    @["--virt-type", "qemu", "--cpu", "qemu64"]
+
 proc transientBootNetworkArgs*(spec: BootMediaSpec): seq[string] =
   ## Direct boots are network-isolated unless a caller explicitly requests an
   ## SSH forward. The user-mode NIC remains reachable only through loopback.
@@ -1908,8 +1928,8 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
       "--name", domainName,
       "--memory", $mem,
       "--vcpus", $cpus,
-      "--cpu", "host-model",
       "--machine", "q35"]
+    argv.add(transientBootAccelerationArgs(spec))
     argv.add(transientBootNetworkArgs(spec))
     argv.add("--noautoconsole")
     argv.add(transientBootFirmwareArgs(spec, ovmf.loader, ovmf.nvram))

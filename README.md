@@ -179,6 +179,7 @@ vm-harness provision --backend <id|auto> --guest <linux|windows|macos> \
 vm-harness boot      --backend <id|auto> --source-image <file-or-dir> \
                      [--kind <auto|iso|qcow2|vhdx>] \
                      [--cpus N] [--memory-mb N] \
+                     [--acceleration <auto|kvm|tcg>] \
                      [--graphics <none|vnc|spice>] \
                      [--screenshot <png> --screenshot-delay-sec N] \
                      (--keep | --expect <serial-regex>)
@@ -198,6 +199,10 @@ vm-harness probe     # JSON report of available backends.
 vm-harness backends  # Tabular listing.
 vm-harness shell     --backend <id|auto> --baseline <name>   # placeholder in M0
 ```
+
+Focused test executions are named Reprobuild run edges. For example,
+`repro run test-t_libvirt_backend` builds and executes only the libvirt
+regression binary; `repro build test` runs the portable aggregate suite.
 
 `boot` uses Hyper-V on Windows and libvirt/QEMU on Linux. Hyper-V cannot
 attach QCOW2 directly, so the backend converts it to a transient dynamic VHDX

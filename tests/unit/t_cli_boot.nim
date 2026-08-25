@@ -13,6 +13,7 @@ suite "CLI boot media":
       "--kind", "qcow2",
       "--expect", "systemd",
       "--generation", "2",
+      "--acceleration", "tcg",
       "--graphics", "vnc",
       "--video", "virtio",
       "--screenshot", "build/welcome.png",
@@ -27,6 +28,7 @@ suite "CLI boot media":
     check opts.mediaKind == "qcow2"
     check opts.expectPattern == "systemd"
     check opts.generation == 2
+    check opts.acceleration == "tcg"
     check opts.graphics == "vnc"
     check opts.videoModel == "virtio"
     check opts.screenshotPath == "build/welcome.png"
@@ -39,6 +41,7 @@ suite "CLI boot media":
     let opts = parseCliOpts(@["boot", "--source-image", "reproos.qcow2",
                               "--keep"])
     check opts.generation == 2
+    check opts.acceleration == "auto"
     check opts.graphics == "none"
     check opts.videoModel == "virtio"
 
@@ -57,6 +60,8 @@ suite "CLI boot media":
       discard parseCliOpts(@["boot", "--generation", "3"])
     expect ValueError:
       discard parseCliOpts(@["boot", "--graphics", "public-vnc"])
+    expect ValueError:
+      discard parseCliOpts(@["boot", "--acceleration", "nested-magic"])
     expect ValueError:
       discard parseCliOpts(@[
         "boot", "--screenshot-delay-sec", "-1"])

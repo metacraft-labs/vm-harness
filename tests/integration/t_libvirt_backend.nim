@@ -141,6 +141,72 @@ suite "LibvirtBackend smoke (no live virsh)":
     # And calling it twice in a row also must not raise.
     b.stopAndCleanup(vm, deleteVm = true)
 
+  test "stopAndCleanup force-stops a paused transient domain":
+    when defined(linux):
+      let root = createTempDir("vmh-libvirt-paused-cleanup", "")
+      defer: removeDir(root)
+      let fakeVirsh = root / "virsh"
+      let argvLog = root / "virsh.argv"
+      writeFile(fakeVirsh,
+        "#!/bin/sh\n" &
+        "printf '%s\\n' \"$3\" >> '" & argvLog & "'\n" &
+        "case \"$3\" in\n" &
+        "  dominfo) exit 0 ;;\n" &
+        "  domstate) printf 'paused\\n' ;;\n" &
+        "  destroy|undefine) exit 0 ;;\n" &
+        "  *) exit 2 ;;\n" &
+        "esac\n")
+      setFilePermissions(fakeVirsh, getFilePermissions(fakeVirsh) +
+        {fpUserExec})
+      let b = newLibvirtBackend(
+        virshCmd = fakeVirsh, libvirtUri = "qemu:///test")
+      let vm = VmHandle(
+        backend: b, name: BootDomainNamePrefix & "paused",
+        baseline: "<boot-from-media>", ipAddress: none(string),
+        sshPort: 0, sshUser: "", sshAuth: SshAuth(kind: saNone),
+        extra: initTable[string, string]())
+      b.stopAndCleanup(vm, deleteVm = true)
+      let commands = readFile(argvLog).splitLines()
+      check "destroy" in commands
+      check "undefine" in commands
+
+  test "stopAndCleanup force-stops a paused persistent domain":
+    when defined(linux):
+      let root = createTempDir("vmh-libvirt-paused-persistent", "")
+      defer: removeDir(root)
+      let fakeVirsh = root / "virsh"
+      let argvLog = root / "virsh.argv"
+      writeFile(fakeVirsh,
+        "#!/bin/sh\n" &
+        "printf '%s\\n' \"$3\" >> '" & argvLog & "'\n" &
+        "case \"$3\" in\n" &
+        "  dominfo) exit 0 ;;\n" &
+        "  domstate) printf 'paused\\n' ;;\n" &
+        "  destroy|undefine) exit 0 ;;\n" &
+        "  *) exit 2 ;;\n" &
+        "esac\n")
+      setFilePermissions(fakeVirsh, getFilePermissions(fakeVirsh) +
+        {fpUserExec})
+      let b = newLibvirtBackend(
+        virshCmd = fakeVirsh, libvirtUri = "qemu:///test")
+      let vm = VmHandle(
+        backend: b, name: "persistent-paused", baseline: "baseline",
+        ipAddress: none(string), sshPort: 0, sshUser: "",
+        sshAuth: SshAuth(kind: saNone),
+        extra: initTable[string, string]())
+      b.stopAndCleanup(vm, deleteVm = true)
+      let commands = readFile(argvLog).splitLines()
+      check "destroy" in commands
+      check "undefine" in commands
+
+  test "only inactive libvirt states skip force-stop":
+    check domainNeedsForceStop("running")
+    check domainNeedsForceStop("paused")
+    check domainNeedsForceStop("in shutdown")
+    check not domainNeedsForceStop("shut off")
+    check not domainNeedsForceStop("crashed")
+    check not domainNeedsForceStop("")
+
   test "snapshot surface raises BackendUnavailableError with M4 Phase B sentinel":
     let b = newLibvirtBackend()
     expect BackendUnavailableError:
@@ -227,6 +293,16 @@ suite "LibvirtBackend smoke (no live virsh)":
                    "--video", "virtio"]
     let headless = transientBootGraphicsArgs(BootMediaSpec())
     check headless == @["--graphics", "none"]
+
+  test "transient boot acceleration selects compatible CPU models":
+    check transientBootAccelerationArgs(BootMediaSpec(
+      acceleration: baAuto)) == @["--cpu", "host-model"]
+    check transientBootAccelerationArgs(BootMediaSpec(
+      acceleration: baKvm)) ==
+        @["--virt-type", "kvm", "--cpu", "host-model"]
+    check transientBootAccelerationArgs(BootMediaSpec(
+      acceleration: baTcg)) ==
+        @["--virt-type", "qemu", "--cpu", "qemu64"]
 
   test "transient SSH forwarding is explicit and loopback-only":
     check transientBootNetworkArgs(BootMediaSpec()) ==

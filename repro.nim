@@ -9,6 +9,7 @@
 import repro_project_dsl
 import ct_test_nim_unittest
 import repro_dsl_stdlib/nixpkgs_pin
+import repro_resources/run_edge
 
 # TI2 producer-surface declaration: vm-harness's resource providers live in a
 # SEPARATE module (`src/vm_harness/repro/resources.nim`, re-authored via the RP4
@@ -127,9 +128,12 @@ package vm_harness:
         extraInputs = @["src", "guest-scripts", "guest-recipes"],
         actionId = "vm_harness.test_build." & spec.binary)
       buildActions.add(edge.action)
-      executeActions.add(edge.testBinary.run(
+      let execute = edge.testBinary.run(
         actionId = "vm_harness.test_execute." & spec.binary,
-        registerImplicitName = false))
+        registerImplicitName = false)
+      executeActions.add(execute)
+      run("test-" & spec.binary, build = execute.id,
+        owningPackage = "vm_harness")
 
     for spec in portableTestSpecs:
       emitTestPair(spec, testBuildActions, testExecuteActions)

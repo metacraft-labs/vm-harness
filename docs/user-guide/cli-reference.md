@@ -40,6 +40,19 @@ vm-harness provision --backend <id|auto> --guest <linux|windows|macos> \
 
 Builds the baseline if absent; no-op if present. `--baseline` is required.
 
+### `boot`
+
+```sh
+vm-harness boot --backend auto --source-image <media> \
+  [--acceleration <auto|kvm|tcg>] [--graphics <none|vnc|spice>] \
+  (--keep | --expect <serial-regex>)
+```
+
+Libvirt defaults to hardware acceleration when it is available. Select `tcg`
+for QEMU software emulation on hosts where KVM is unavailable or nested KVM is
+unreliable; TCG uses libvirt's portable `qemu64` CPU model rather than
+`host-model`.
+
 ### `install`
 
 ```sh
@@ -180,6 +193,7 @@ scratch (SSH password files, mount-share scripts). `--dry-run` reports only.
 | `--memory-gb <int>` | — | Alias for `--memory-mb`, in GiB (converted at parse time). |
 | `--disk-gb <int>` | 50 | Guest disk in GiB. |
 | `--source-image <ref>` | — | Backend-specific base image reference. |
+| `--acceleration <auto\|kvm\|tcg>` | `auto` | Libvirt media-boot execution mode. `tcg` uses QEMU software emulation. |
 
 ### Recipe / Windows provisioning
 
