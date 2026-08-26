@@ -78,6 +78,7 @@ type
     logFormat*: LogFormat
     allowNoopFallback*: bool
     timeoutSec*: int
+    sshReadyTimeoutSec*: int
     waitForShutdown*: bool
     running*: bool               ## `--running` flag for `snapshot create`.
     # M4 libvirt-slice canonical-command flags. See
@@ -315,6 +316,7 @@ Common flags:
   --copy-from guest:host          (repeatable)
   --install-shim binary:logpath   (repeatable)
   --timeout-sec <int>
+  --ssh-ready-timeout-sec <int>   Maximum wait for SSH before a boot command.
   --log-format <human|json>
   --allow-noop-fallback           Use NoopBackend if the real one isn't installed.
   --                              End of flags; remainder is the gate command.
@@ -547,6 +549,13 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i; result.ephemeralPrefix = args[i]; inc i
     of "--timeout-sec":
       inc i; result.timeoutSec = parseInt(args[i]); inc i
+    of "--ssh-ready-timeout-sec":
+      inc i
+      result.sshReadyTimeoutSec = parseInt(args[i])
+      if result.sshReadyTimeoutSec <= 0:
+        raise newException(ValueError,
+          "--ssh-ready-timeout-sec expects a positive integer")
+      inc i
     of "--wait-for-shutdown":
       result.waitForShutdown = true
       inc i
@@ -965,7 +974,11 @@ proc cmdBoot(opts: CliOpts; installMode = false): int =
 
     if opts.cmd.len > 0:
       let timeout = if opts.timeoutSec > 0: opts.timeoutSec else: 180
-      backend.startAndAwaitReady(vm, timeout)
+      let readyTimeout = if opts.sshReadyTimeoutSec > 0:
+                           opts.sshReadyTimeoutSec
+                         else:
+                           min(timeout, 300)
+      backend.startAndAwaitReady(vm, readyTimeout)
       let execution = backend.execInGuest(
         vm, opts.envPairs, opts.cmd, timeoutSec = timeout)
       if execution.stdout.len > 0:

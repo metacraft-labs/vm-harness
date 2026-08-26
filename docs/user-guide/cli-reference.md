@@ -45,6 +45,7 @@ Builds the baseline if absent; no-op if present. `--baseline` is required.
 ```sh
 vm-harness boot --backend auto --source-image <media> \
   [--acceleration <auto|kvm|tcg>] [--graphics <none|vnc|spice>] \
+  [--ssh-ready-timeout-sec <seconds>] \
   (--keep | --expect <serial-regex>)
 ```
 
@@ -228,6 +229,7 @@ scratch (SSH password files, mount-share scripts). `--dry-run` reports only.
 | `--copy-from guest:host` | Copy a guest file out after exec (repeatable). |
 | `--install-shim binary:logpath` | Install an argv-trace shim around a guest binary (repeatable). |
 | `--timeout-sec <int>` | Per-exec timeout (default 600). |
+| `--ssh-ready-timeout-sec <int>` | Maximum wait for SSH before a boot command (default: the smaller of `--timeout-sec` and 300 seconds). |
 | `--log-format <human\|json>` | Structured log output on stderr. |
 | `--` | End of flags; everything after is the in-guest command. |
 

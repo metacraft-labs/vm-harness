@@ -20,7 +20,8 @@ suite "CLI boot media":
       "--screenshot-delay-sec", "3",
       "--viewer",
       "--wait-for-shutdown",
-      "--timeout-sec", "90"])
+      "--timeout-sec", "90",
+      "--ssh-ready-timeout-sec", "20"])
     check opts.subcommand == "boot"
     check opts.sourceImage == "images"
     check opts.secondaryIsoPath == "seed.iso"
@@ -36,6 +37,7 @@ suite "CLI boot media":
     check opts.viewer
     check opts.waitForShutdown
     check opts.timeoutSec == 90
+    check opts.sshReadyTimeoutSec == 20
 
   test "boot graphics and firmware defaults are explicit":
     let opts = parseCliOpts(@["boot", "--source-image", "reproos.qcow2",
@@ -65,6 +67,9 @@ suite "CLI boot media":
     expect ValueError:
       discard parseCliOpts(@[
         "boot", "--screenshot-delay-sec", "-1"])
+    expect ValueError:
+      discard parseCliOpts(@[
+        "boot", "--ssh-ready-timeout-sec", "0"])
 
   test "install parses as a target-disk lifecycle":
     let opts = parseCliOpts(@[

@@ -182,6 +182,7 @@ vm-harness boot      --backend <id|auto> --source-image <file-or-dir> \
                      [--acceleration <auto|kvm|tcg>] \
                      [--graphics <none|vnc|spice>] \
                      [--screenshot <png> --screenshot-delay-sec N] \
+                     [--ssh-ready-timeout-sec N] \
                      (--keep | --expect <serial-regex>)
 
 vm-harness install   --backend <id|auto> --source-image <installer.iso> \
