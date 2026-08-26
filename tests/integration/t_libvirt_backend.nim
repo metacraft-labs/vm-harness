@@ -47,6 +47,13 @@ suite "LibvirtBackend smoke (no live virsh)":
     check formatSshCommand(@["cmd", "/c", "echo %PATH%"], goWindows) ==
       "\"cmd\" \"/c\" \"echo %PATH%\""
 
+  test "SSH host trust failures are distinguished from transient readiness":
+    check isFatalSshTrustFailure(
+      "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!")
+    check isFatalSshTrustFailure("Host key verification failed.")
+    check not isFatalSshTrustFailure("Connection refused")
+    check not isFatalSshTrustFailure("Permission denied (publickey).")
+
   test "probeAvailability returns false when virsh path is bogus":
     # Use a non-existent binary so the probe definitely returns false
     # even on a host with libvirt installed.

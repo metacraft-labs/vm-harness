@@ -881,6 +881,11 @@ proc runSshExec(b: LibvirtBackend, host: string, command: string,
   runProcessCapture(argv, timeoutSec = timeoutSec, env = passEnv,
                     stdinData = stdinData)
 
+proc isFatalSshTrustFailure*(output: string): bool =
+  let normalized = output.toLowerAscii()
+  "remote host identification has changed" in normalized or
+    "host key verification failed" in normalized
+
 proc scpToGuest(b: LibvirtBackend, host, hostPath, guestPath: string,
                 timeoutSec: int = 600) =
   let target = b.sshUser & "@" & host & ":" & guestPath
@@ -1484,6 +1489,12 @@ method startAndAwaitReady*(b: LibvirtBackend, vm: VmHandle,
                            timeoutSec = 15)
       if r.exitCode == 0 and r.stdout.strip().len > 0:
         return
+      if isFatalSshTrustFailure(r.stdout):
+        raise (ref GuestBootFailureError)(
+          backend: $b.id, phase: lpStartup,
+          msg: "LibvirtBackend.startAndAwaitReady: SSH host trust " &
+               "validation failed: " & r.stdout.strip(),
+          cause: nil)
       sleep(2000)
     raise (ref GuestBootFailureError)(
       backend: $b.id, phase: lpStartup,
