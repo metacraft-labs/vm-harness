@@ -21,6 +21,7 @@ run_nim r --hints:off tests/unit/t_utm_parsers.nim
 run_nim r --hints:off tests/unit/t_tart_shared_dirs.nim
 run_nim r --hints:off tests/unit/t_qemu_windows_arm_backend.nim
 run_nim r --hints:off tests/unit/t_qemu_windows_arm_overlay.nim
+run_nim r --hints:off tests/unit/t_qemu_boot_backend.nim
 run_nim r --hints:off tests/unit/t_windows_golden_recipe_hardening.nim
 run_nim r --hints:off tests/unit/t_tart_backend.nim
 run_nim r --hints:off tests/unit/t_lima_backend.nim

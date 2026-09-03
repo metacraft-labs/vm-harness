@@ -69,10 +69,11 @@
 ## helpers can run anywhere. Backend *registration* is unconditional,
 ## but ``probeAvailability`` returns false on non-Linux hosts.
 
-import std/[algorithm, options, os, osproc, sequtils, streams, strtabs,
+import std/[options, os, osproc, streams, strtabs,
             strutils, tables, times]
 import ../types
 import ../auto
+import ../firmware
 import ../serial
 
 # ---------------------------------------------------------------------------
@@ -1774,58 +1775,16 @@ proc resolveTransientOvmf(spec: BootMediaSpec): tuple[loader, nvram: string] =
   ## Resolve OVMF without assuming that libvirt's firmware descriptor search
   ## path includes Nix store packages. Explicit CLI flags and environment
   ## variables take precedence over conventional distro locations.
+  ##
+  ## The search itself lives in ``../firmware.nim`` so the direct-QEMU boot
+  ## backend resolves firmware identically; an empty result here means "let
+  ## virt-install try its native firmware descriptors", whose error includes
+  ## distro-specific remediation when none are installed.
   let generation = if spec.generation > 0: spec.generation else: 2
   if generation != 2:
     return
-
-  proc acceptPair(loader, nvram: string): bool =
-    if loader.len == 0 and nvram.len == 0:
-      return false
-    if loader.len == 0 or nvram.len == 0:
-      raise newException(ValueError,
-        "UEFI boot requires both a loader and an NVRAM template")
-    if not fileExists(loader):
-      raise newException(IOError, "UEFI loader does not exist: " & loader)
-    if not fileExists(nvram):
-      raise newException(IOError,
-        "UEFI NVRAM template does not exist: " & nvram)
-    result = true
-
-  let explicitLoader = spec.extra.getOrDefault("uefiLoader")
-  let explicitNvram = spec.extra.getOrDefault("uefiNvramTemplate")
-  if acceptPair(explicitLoader, explicitNvram):
-    return (explicitLoader, explicitNvram)
-
-  let envLoader = getEnv("VMH_OVMF_CODE")
-  let envNvram = getEnv("VMH_OVMF_VARS")
-  if acceptPair(envLoader, envNvram):
-    return (envLoader, envNvram)
-
-  const conventionalPairs = [
-    ("/run/libvirt/nix-ovmf/edk2-x86_64-code.fd",
-     "/run/libvirt/nix-ovmf/edk2-i386-vars.fd"),
-    ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
-    ("/usr/share/edk2/ovmf/OVMF_CODE.fd",
-     "/usr/share/edk2/ovmf/OVMF_VARS.fd"),
-    ("/usr/share/edk2/x64/OVMF_CODE.fd",
-     "/usr/share/edk2/x64/OVMF_VARS.fd"),
-  ]
-  for pair in conventionalPairs:
-    if fileExists(pair[0]) and fileExists(pair[1]):
-      return pair
-
-  when defined(linux):
-    var nixLoaders = toSeq(
-      walkPattern("/nix/store/*-OVMF-*-fd/FV/OVMF_CODE.fd"))
-    nixLoaders.sort()
-    for loader in nixLoaders.reversed():
-      let nvram = loader.parentDir / "OVMF_VARS.fd"
-      if fileExists(nvram):
-        return (loader, nvram)
-
-  # Let virt-install try its native firmware descriptors. Its error includes
-  # distro-specific remediation when none are installed.
-  return ("", "")
+  resolveOvmfPair(spec.extra.getOrDefault("uefiLoader"),
+                  spec.extra.getOrDefault("uefiNvramTemplate"))
 
 type
   LibvirtSerialStream* = ref object of SerialStream

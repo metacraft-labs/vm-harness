@@ -41,6 +41,7 @@ type
     biTartLinuxArm = "tart-linux-arm"
     biUtmWindowsArm = "utm-windows-arm"
     biQemuWindowsArm = "qemu-windows-arm"
+    biQemuBoot = "qemu-boot"
     biLibvirt = "libvirt"
     biLima = "lima"
     biIncus = "incus"

@@ -1343,7 +1343,7 @@ proc cmdBackends(opts: CliOpts): int =
                of biHyperv, biWsl: "windows"
                of biTartMacos, biTartLinuxArm, biUtmWindowsArm,
                   biQemuWindowsArm: "macos-arm"
-               of biLibvirt, biLima: "linux/macos"
+               of biLibvirt, biLima, biQemuBoot: "linux/macos"
                of biIncus: "linux"
     let guests = case id
                  of biNoop: "any"
@@ -1352,7 +1352,7 @@ proc cmdBackends(opts: CliOpts): int =
                  of biTartMacos: "macos"
                  of biTartLinuxArm: "linux"
                  of biUtmWindowsArm, biQemuWindowsArm: "windows"
-                 of biLibvirt: "linux,windows"
+                 of biLibvirt, biQemuBoot: "linux,windows"
                  of biLima: "linux"
                  of biIncus: "linux"
     let marker = if registered: "*" else: " "

@@ -31,6 +31,7 @@ and the
 | `tart-linux-arm` | macOS (Apple Silicon) | Linux (ARM) | `tart clone` | SSH |
 | `utm-windows-arm` | macOS (Apple Silicon) | Windows (ARM) | `utmctl clone` from local bundle | SSH |
 | `qemu-windows-arm` | macOS (Apple Silicon) | Windows (ARM) | per-job qcow2 overlay | SSH |
+| `qemu-boot` | Linux | Linux, Windows | per-run qcow2 CoW overlay, discarded with the run directory (boot assertions only — no baselines, snapshots or `execInGuest`) | — (serial console) |
 | `noop` | any | any | — | — (test fixture only) |
 
 The `noop` backend is a reference fixture for exercising harness scaffolding

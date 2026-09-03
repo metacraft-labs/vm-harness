@@ -287,6 +287,26 @@ Tracked as a future vm-harness milestone (not yet numbered).
 - **Auth**: cloud-init injects SSH pubkey for Linux; autounattend creates admin user for Windows.
 - **Cleanup**: `virsh shutdown <domain>` then `virsh undefine --remove-all-storage <domain>` (only for ephemeral domains; baseline domains preserved).
 
+### 4.6 qemu-boot (HostPlatform: hpLinux; Guests: goLinux, goWindows)
+
+A **daemon-less direct-boot** backend (`backends/qemu_boot.nim`). It implements only the `bootFromMedia` / `captureSerial` / `expectLine` / `serialSend` / `waitForShutdown` / `stopAndCleanup` slice of the trait — it boots a disk image or ISO to assert on OS bring-up, and does not pretend to offer baselines, snapshots or `execInGuest`.
+
+**Why it exists alongside §4.5.** For a long-lived, networked, pool-managed guest the libvirt backend is the right adapter. It is the wrong one for a boot-assertion gate:
+
+- It needs `virt-install` and a running `libvirtd` the caller has authorisation on. A gate whose purpose is to prove the serial-expect engine works must not be able to *skip* because a system daemon is missing.
+- It defines a domain in a **host-global namespace**. On a host that also runs production CI, a leaked transient domain is a hazard; an owned child process that dies with its parent is not.
+- Its file-backed serial device is output-only — `LibvirtBackend.serialSend` raises by construction — so driving a login prompt is not reachable from it without changing the device model.
+
+**What it does not duplicate.** Matching goes through `serial.nim`'s `SerialLineBuffer` / `expectLineImpl`, the same cursor-advancing PCRE engine every other backend uses. There is exactly one serial-expect implementation in the tree. Firmware resolution is shared too: both this backend and §4.5 call `firmware.resolveOvmfPair`.
+
+- **Serial device**: one `-chardev socket` carrying QEMU's own `logfile=`, wired to `-serial`. QEMU writes every guest byte to the log from the first firmware byte onward whether or not anything is connected, so reads poll a plain file (no reader thread, no connect race). `serialSend` connects to the socket, writes, drains briefly and disconnects — never holding the connection means the harness cannot back-pressure the guest's console by failing to drain it.
+- **Disk**: always a qcow2 CoW overlay over the caller's image, inside the run directory. The artifact under test is never mutated.
+- **Firmware**: `generation: 2` resolves an OVMF pair and copies the NVRAM *template* to a per-VM writable file; `generation: 1` boots SeaBIOS.
+- **Acceleration**: `baAuto` picks KVM when `/dev/kvm` is openable read-write and TCG otherwise, so the backend works in a container with no `/dev/kvm`.
+- **Naming**: every VM name must start with the backend's configured `namePrefix`, which is what lets `sweepStaleQemuBootProcesses` recognise what the harness owns (it matches the `-name <prefix>…` argv entry, never "is a qemu process").
+- **Cleanup**: `stopAndCleanup` SIGTERMs then SIGKILLs the child and removes the run directory — overlay, NVRAM copy, chardev socket and QEMU's own logs together. Idempotent and safe from a `finally`. Callers should place `BootMediaSpec.serialLogPath` *outside* the run directory so the transcript survives as an artifact.
+- **TPM**: not wired here (see `qemu_windows_arm.nim` for the swtpm lifecycle to copy). `buildQemuBootArgs` is a pure function over a value type so adding the `-tpmdev` trio stays a local, unit-testable change.
+
 ## 5. In-guest scripts (Tier-1 only)
 
 ### 5.1 posix.sh

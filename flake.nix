@@ -41,6 +41,18 @@
                 pkgs.libvirt
                 pkgs.qemu
                 pkgs.lima
+                # The QemuBootBackend boots UEFI guests through
+                # `-drive if=pflash` and needs an edk2 firmware pair;
+                # `OVMF.fd` carries no binaries, it is here so the pair
+                # is realised in the store and the shellHook can name it
+                # exactly (see VMH_OVMF_CODE / VMH_OVMF_VARS below).
+                pkgs.OVMF.fd
+                # swtpm backs QEMU's `-tpmdev emulator`. The
+                # qemu_windows_arm backend already drives a full swtpm
+                # lifecycle and its `probeAvailability` fails without
+                # this on PATH; the libvirt backend's vTPM support needs
+                # the same binary.
+                pkgs.swtpm
               ]
             else
               [ ];
@@ -139,6 +151,16 @@
             shellHook = ''
               ${pre-commit-check.shellHook}
               export VM_HARNESS_ROOT="$PWD"
+              ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+                # Pin the firmware pair src/vm_harness/firmware.nim resolves
+                # to. Its last-resort fallback is a /nix/store glob whose
+                # winner is the lexically greatest store hash, which is not a
+                # stable choice; naming the flake's own OVMF makes a UEFI boot
+                # gate assert against the firmware this shell pins. Respects an
+                # operator override.
+                export VMH_OVMF_CODE="''${VMH_OVMF_CODE:-${pkgs.OVMF.fd}/FV/OVMF_CODE.fd}"
+                export VMH_OVMF_VARS="''${VMH_OVMF_VARS:-${pkgs.OVMF.fd}/FV/OVMF_VARS.fd}"
+              ''}
               echo "vm-harness dev shell"
               echo "  nim:    $(nim --version | head -n1)"
               echo "  nimble: $(nimble --version | head -n1)"

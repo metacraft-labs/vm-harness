@@ -144,7 +144,7 @@ scratch (SSH password files, mount-share scripts). `--dry-run` reports only.
 
 | Flag | Meaning |
 | --- | --- |
-| `--backend <id\|auto>` | One of `auto`, `noop`, `hyperv`, `wsl`, `tart-macos`, `tart-linux-arm`, `utm-windows-arm`, `qemu-windows-arm`, `libvirt`, `lima`, `incus`. |
+| `--backend <id\|auto>` | One of `auto`, `noop`, `hyperv`, `wsl`, `tart-macos`, `tart-linux-arm`, `utm-windows-arm`, `qemu-windows-arm`, `qemu-boot`, `libvirt`, `lima`, `incus`. |
 | `--guest <linux\|windows\|macos>` | Required when `--backend auto`. |
 | `--allow-noop-fallback` | Use `NoopBackend` if the real backend isn't installed (selection tests on hypervisor-less hosts). |
 | `--baseline <name>` | Logical baseline tag (== libvirt domain name). |
