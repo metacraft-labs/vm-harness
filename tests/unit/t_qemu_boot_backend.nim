@@ -8,8 +8,9 @@
 ##
 ## The live end of the contract (a guest really boots, the expect engine
 ## really matches, teardown really removes everything) is covered by
-## reprobuild's registered boot-smoke gates, which drive a synthetic
-## guest under a real QEMU.
+## ``tests/integration/t_boot_smoke_harness_fails_on_missing_line.nim``
+## and ``tests/integration/t_boot_smoke_harness_tears_down_on_failure.nim``,
+## which drive a synthetic guest under a real QEMU.
 
 import std/[os, strutils, tables, tempfiles, unittest]
 import vm_harness

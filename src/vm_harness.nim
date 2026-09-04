@@ -11,6 +11,8 @@
 ## - Orchestrator: ``GateSpec``, ``GateResult``, ``runGate``.
 ## - Guest scripts (embedded): ``PosixRunner``, ``WindowsRunner``,
 ##   ``writeGuestRunner``, ``renderShimScript``.
+## - Boot smoke: ``BootSmokeSpec``, ``BootSmokeStep``, ``runBootSmoke``,
+##   ``writeSyntheticBootDisk``.
 ## - NoopBackend (test fixture): re-exported from ``backends/noop``.
 ##
 ## See ``docs/design.md`` for the canonical design reference and the
@@ -33,6 +35,7 @@ import ./vm_harness/backends/tart
 import ./vm_harness/backends/utm
 import ./vm_harness/backends/qemu_windows_arm
 import ./vm_harness/backends/qemu_boot
+import ./vm_harness/boot_smoke
 import ./vm_harness/backends/lima
 import ./vm_harness/backends/libvirt
 import ./vm_harness/backends/incus
@@ -54,6 +57,7 @@ export tart
 export utm
 export qemu_windows_arm
 export qemu_boot
+export boot_smoke
 export lima
 export libvirt
 export incus

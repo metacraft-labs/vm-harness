@@ -37,3 +37,10 @@ run_nim r --hints:off tests/e2e/t_vm_harness_auto_backend_selection.nim
 # Backend contracts that do not require a live hypervisor.
 run_nim r --hints:off tests/integration/t_libvirt_backend.nim
 run_nim r --hints:off tests/integration/t_cli_libvirt_flags.nim
+
+# Live boot-smoke falsifiability gates. These really boot QEMU, but under
+# TCG against a 512-byte synthetic guest that halts in under a second, so
+# they need no hypervisor and no prebuilt artifact. They exit early with a
+# printed reason on non-Linux hosts; on Linux they never skip.
+run_nim r --hints:off tests/integration/t_boot_smoke_harness_fails_on_missing_line.nim
+run_nim r --hints:off tests/integration/t_boot_smoke_harness_tears_down_on_failure.nim
