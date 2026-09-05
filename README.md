@@ -98,8 +98,12 @@ Cross-cutting infrastructure that ships across all of the above:
 
 Outstanding:
 
-- **M4 Phase B** — libvirt snapshot/restore, argv-trace shim,
-  serial-stream primitives. Tracked in `docs/m4-libvirt.md`.
+- **M4 Phase B** — libvirt snapshot/restore is **done** (campaign WR0:
+  `snapshot` / `snapshotRunning` / `restoreSnapshot` / `listSnapshots` /
+  `removeSnapshot`, as external `virsh` snapshots); still outstanding are
+  the argv-trace shim, the serial-stream primitives, and
+  `exportBaseline` / `importBaseline` (campaign WR3). Tracked in
+  `docs/m4-libvirt.md`.
 - **M4 Phase C** — libvirt GPU + SR-IOV + USB passthrough. Gated on
   applicable runner hardware.
 

@@ -22,21 +22,21 @@ the consumer-facing recipe at
 |---|---|---|
 | `probeAvailability` | shipped | Returns true when `virsh --version` AND `virsh list` against `qemu:///system` both succeed. |
 | `provisionBaseline` (ISO + autounattend) | shipped | Shells out to `virt-install` with q35/UEFI/SMM + virtio-blk + virtio-net + virtio-win driver injection. Idempotent when the domain already exists. |
-| `revertToBaseline` | shipped (long-lived domain only) | Starts the named domain, polls `virsh domifaddr` for an IP, returns a `VmHandle`. Does NOT do per-gate snapshot revert — that's Phase B. |
+| `revertToBaseline` | shipped (long-lived domain only) | Starts the named domain, polls `virsh domifaddr` for an IP, returns a `VmHandle`. Does NOT itself do per-gate snapshot revert; `restoreSnapshot` is the primitive for that, and wiring the fleet onto it is campaign WR1. |
 | `startAndAwaitReady` | shipped | Polls SSH `hostname` until the guest accepts logins. |
 | `execInGuest` | shipped | SSH via Windows OpenSSH; argv quoted for cmd.exe; env propagated via `set KEY=VAL && ...`. |
 | `copyToGuest` / `copyFromGuest` | shipped | scp with `sshpass -e` (password never on argv). |
 | `bootFromMedia` (qcow2/ISO) | shipped | Transient `virt-install --import` (qcow2) or `--cdrom` (ISO); domain name must start with `repro-test-boot-libvirt-` for the safety sweep. |
 | `stopAndCleanup` | shipped | ACPI `virsh shutdown` then fall back to `destroy`; optional `undefine --remove-all-storage`. Never raises (finally-safe). |
 | `installArgvTraceShim` | NOT shipped (Phase B) | Same shim shape as `hyperv.nim` but install path needs SSH transit. |
-| `snapshot` / `restoreSnapshot` / `snapshotRunning` | NOT shipped (Phase B) | `virsh snapshot-create-as` + `--live` wraps. |
-| `exportBaseline` / `importBaseline` | NOT shipped (Phase B) | `virsh dumpxml` + `qemu-img convert` with reflinks. |
+| `snapshot` / `snapshotRunning` / `restoreSnapshot` / `listSnapshots` / `removeSnapshot` | shipped (campaign WR0) | EXTERNAL `virsh snapshot-create-as` (`--live` + an external memspec for the hot form) and `snapshot-revert --running`. See [`per-backend-notes/libvirt-snapshot-benchmarks.md`](per-backend-notes/libvirt-snapshot-benchmarks.md) for why external rather than internal, and for what is measured vs not. |
+| `exportBaseline` / `importBaseline` | NOT shipped (campaign WR3) | `virsh dumpxml` + `qemu-img convert` with reflinks — and must answer how an exported warm state avoids reproducing one guest identity on many domains. |
 | `captureSerial` / `expectLine` | NOT shipped (Phase B) | QEMU `-serial pty` + `virsh console` plumbing. |
 | GPU passthrough | NOT shipped (Phase C) | Needs host-side IOMMU bind/unbind. |
 | SR-IOV NIC passthrough | NOT shipped (Phase C) | Needs `ip link set vfX` + virsh device-attach. |
 
 Every NOT-shipped method raises `BackendUnavailableError` with an
-unambiguous message naming the planned Phase B / C work, so callers
+unambiguous message naming the planned follow-on work, so callers
 discover the gap loudly instead of seeing a silent no-op.
 
 ## What Phase A is for

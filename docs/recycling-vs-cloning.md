@@ -36,8 +36,8 @@ identity, recycled after each job.
 The Hyper-V conclusion does not transfer, and assuming it would be a
 mistake.
 
-**Cloning is already cheap here.** `libvirt.nim:652` creates the per-job
-disk with
+**Cloning is already cheap here.** `provisionEphemeralClone`
+(`libvirt.nim:736`) creates the per-job disk with
 
 ```
 qemu-img create -f qcow2 -b <golden> -F qcow2 <overlay>
@@ -49,22 +49,40 @@ clone-per-job unattractive on Hyper-V simply does not exist here, and the
 current libvirt ephemeral path (a fresh CoW overlay per job) is already the
 right shape for capacity.
 
-**But recycling does not exist at all.** `snapshot`, `snapshotRunning`,
-`restoreSnapshot`, `listSnapshots` and `removeSnapshot` are all
-unimplemented stubs that raise, tagged "M4 Phase B"
-(`libvirt.nim:1561-1602`). The doc header lists them under *out of scope*.
+**Recycling now exists, and is unmeasured.** As of campaign WR0,
+`snapshot`, `snapshotRunning`, `restoreSnapshot`, `listSnapshots` and
+`removeSnapshot` are implemented as EXTERNAL `virsh` snapshots
+(`libvirt.nim:1852-2035`); `exportBaseline` / `importBaseline` remain stubs
+and belong to WR3. `snapshotRunning` wraps
+`virsh snapshot-create-as --live` with an external memspec, which is what
+captures RAM — and `--live` is *only* legal for external snapshots, so an
+internal one would have quietly given up the resume.
 
-So a libvirt guest today is always COLD: cheap to create, but it pays a
-full guest boot every job. For the Linux guests that hardly matters. For
-the **Windows** guest on `eph-win-x64` it matters a lot — it is the same
-Windows 11 image, so it pays the same ~36 s boot that the Hyper-V warm path
-was measured to reduce to ~5 s.
+Two storage properties were measured on `high-mem-server` against real
+libvirt 11.7 and both favour recycling:
 
-**Verdict: the win is available and unclaimed.** Implementing M4 Phase B —
-specifically `virsh snapshot-create-as --live` (memory + CPU + device
-state) or `virsh save`/`restore` — would give the Windows libvirt runners
-the same 36 s -> 5 s improvement, on top of cloning that is already free.
-That is the highest-value unimplemented thing found in this audit.
+- **A restore does not rewrite the saved state.** Two consecutive restores
+  left the frozen disk byte-identical, mtime unchanged. So "prepare the warm
+  state once, restore it many times" is the cheap direction.
+- **One restore writes one empty overlay** (kilobytes), then reads the
+  memory image. Unlike Hyper-V, where recycle cost scales with how much the
+  job wrote (6.67 s clean vs 13.59 s after a write-heavy job), the write
+  side here does not scale with the guest.
+
+What is still missing is the **number**: nobody has yet timed
+restore-to-ready against boot-to-ready on a libvirt guest, because that means
+booting the 16 GiB Windows golden on a host that is already heavily
+CPU-contended during CI hours. Hyper-V's 36 s → ~5 s is the analogy that
+motivated the work, not a measurement of this backend.
+
+**Verdict: the capability is claimed; the measurement is not.** Run the
+maintenance-window procedure in
+[`per-backend-notes/libvirt-snapshot-benchmarks.md`](per-backend-notes/libvirt-snapshot-benchmarks.md).
+`defaultAlgorithmFor(biLibvirt)` stays `clone-per-task` until it produces
+restore-to-ready p50 ≤ 10 s and ≥ 4× faster than a cold boot in the same run;
+flipping on an analogy would put every libvirt pool — Linux guests included,
+where a boot costs a second or two and recycling buys nothing — onto a path
+that has never run against a live guest.
 
 ## incus — the answer depends entirely on the storage driver
 
@@ -115,10 +133,10 @@ comparison to beat is "delete and relaunch", not "cold boot".
 | backend | clone (capacity) | recycle (per job) | what to do |
 | ------- | ---------------- | ----------------- | ---------- |
 | Hyper-V | ~50 s, real copy | **7-14 s, carries RAM** | warm pool + recycle (measured) |
-| libvirt | **O(1) CoW overlay** | not implemented (M4 Phase B) | implement stateful snapshots; biggest unclaimed win, especially for Windows |
+| libvirt | **O(1) CoW overlay** | implemented (WR0), **not yet timed** | measure restore-vs-boot on the Windows golden, then decide; saved state is immutable across restores, which favours recycling |
 | incus | `incus copy` | implemented, cost = f(driver) | **`dir` makes it a full copy; ZFS makes it O(1)** — re-measure when ZFS lands |
 
 The general rule, stated once: **recycle when restoring is cheaper than
 creating, clone when it is not.** Hyper-V and incus-on-ZFS sit on one side
-of that line, incus-on-`dir` on the other, and libvirt cannot answer yet
-because it has no restore to price.
+of that line, incus-on-`dir` on the other, and libvirt now has a restore to
+price but has not yet been priced.

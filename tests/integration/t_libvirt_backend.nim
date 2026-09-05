@@ -17,9 +17,11 @@
 ##    finally-safety contract).
 ##  - ``buildVirtInstallArgs`` produces a stable argv shape — pure
 ##    function, tested by string-match.
-##  - Snapshot/export methods raise ``BackendUnavailableError`` with
-##    the documented "M4 Phase B" sentinel string so callers
-##    debugging the unimplemented surface get a clear signpost.
+##  - ``exportBaseline`` / ``importBaseline`` still raise
+##    ``BackendUnavailableError``, naming WR3 as their owner.
+##  - The snapshot surface (campaign WR0) makes the right DECISIONS —
+##    which is what the second suite in this file covers, against a fake
+##    ``virsh`` binary. See the mock justification there.
 ##  - The backend is registered with the auto-selection factory.
 
 import std/[options, os, sequtils, strutils, tables, tempfiles, unittest]
@@ -214,27 +216,341 @@ suite "LibvirtBackend smoke (no live virsh)":
     check not domainNeedsForceStop("crashed")
     check not domainNeedsForceStop("")
 
-  test "snapshot surface raises BackendUnavailableError with M4 Phase B sentinel":
+  test "exportBaseline / importBaseline still raise, and say WR3 owns them":
+    # Deliberately NOT implemented by WR0: a transferable baseline is the
+    # operation that could materialise ONE warm state (machine name and DHCP
+    # lease included) on many domains, which is the identity collision the
+    # in-place surface refuses to create. Whoever implements it owes that an
+    # answer, so the stub names the milestone rather than going quiet.
     let b = newLibvirtBackend()
-    expect BackendUnavailableError:
-      discard b.snapshot("any", "any")
-    expect BackendUnavailableError:
-      discard b.snapshotRunning("any", "any")
-    expect BackendUnavailableError:
-      b.restoreSnapshot("any", "any")
-    expect BackendUnavailableError:
-      discard b.listSnapshots("any")
-    expect BackendUnavailableError:
-      b.removeSnapshot("any", "any")
     expect BackendUnavailableError:
       b.exportBaseline("any", "/tmp/x")
     expect BackendUnavailableError:
       discard b.importBaseline("/tmp/x")
-    # The error message should make the deferred-to-Phase-B intent obvious.
+    # The sentinel is asserted on BOTH, not just one: the old "M4 Phase B"
+    # version of this test checked the marker string on a single method, and
+    # a half-renamed pair is exactly how a reader ends up chasing the wrong
+    # milestone.
     try:
-      discard b.snapshot("any", "any")
+      b.exportBaseline("any", "/tmp/x")
     except BackendUnavailableError as e:
-      check "Phase B" in e.msg
+      check "WR3" in e.msg
+    try:
+      discard b.importBaseline("/tmp/x")
+    except BackendUnavailableError as e:
+      check "WR3" in e.msg
+
+# ---------------------------------------------------------------------------
+# Snapshot surface (campaign WR0) — the decision logic, against a FAKE virsh.
+#
+# MOCK JUSTIFICATION (repo policy: every mock needs one).
+#
+# These tests substitute a 20-line shell script for the `virsh` BINARY. They
+# do not mock the backend, the domain model, or any vm-harness type: the real
+# LibvirtBackend methods run, build real argv, and parse real virsh-shaped
+# text off a real process boundary. What is faked is only libvirt's ANSWER,
+# and it is faked to reach states this host cannot be made to produce
+# safely: a domain that is `shut off` when asked to be snapshotted hot, two
+# domains sharing one writable disk, and a `snapshot-revert` that fails with
+# "revert requires force". Every one of those is a branch that decides
+# whether a warm pool member keeps a distinct identity, and none can be
+# reached on high-mem-server without either booting Windows guests or
+# deliberately mis-wiring domains next to the production CI fleet.
+#
+# The complementary REAL-virsh coverage is
+# `tests/e2e/t_libvirt_snapshot_surface_conformance.nim` (an offline scratch
+# domain, actual snapshot/revert/delete round trip) and the WR0 gate
+# `tests/e2e/t_libvirt_live_snapshot_restore.nim` (a real running guest).
+# Both self-skip when their prerequisites are absent; this suite does not,
+# which is why the decision logic lives here.
+
+proc writeFakeVirsh(path, argvLog, body: string) =
+  ## A fake `virsh` that appends its full argv to `argvLog` and then runs
+  ## `body` (a `case "$3" in ... esac`, where $3 is the subcommand because
+  ## every call is `virsh --connect <uri> <sub> ...`).
+  writeFile(path,
+    "#!/bin/sh\n" &
+    "printf '%s\\n' \"$*\" >> '" & argvLog & "'\n" &
+    body)
+  setFilePermissions(path, getFilePermissions(path) + {fpUserExec})
+
+proc logLines(argvLog: string): seq[string] =
+  if not fileExists(argvLog): return @[]
+  for line in readFile(argvLog).splitLines():
+    if line.strip().len > 0: result.add(line)
+
+proc mentions(lines: seq[string], needle: string): bool =
+  for l in lines:
+    if needle in l: return true
+  false
+
+suite "LibvirtBackend snapshot surface (fake virsh)":
+
+  test "snapshotRunning refuses a domain that is not running":
+    when defined(linux):
+      let root = createTempDir("vmh-libvirt-snap-notrunning", "")
+      defer: removeDir(root)
+      let fakeVirsh = root / "virsh"
+      let argvLog = root / "virsh.argv"
+      writeFakeVirsh(fakeVirsh, argvLog,
+        "case \"$3\" in\n" &
+        "  dominfo) exit 0 ;;\n" &
+        "  domstate) printf 'shut off\\n' ;;\n" &
+        "  *) exit 2 ;;\n" &
+        "esac\n")
+      let b = newLibvirtBackend(virshCmd = fakeVirsh,
+                                libvirtUri = "qemu:///test",
+                                imagePoolDir = root)
+      var msg = ""
+      try:
+        discard b.snapshotRunning("member-0", "warm")
+      except VmHarnessError as e:
+        msg = e.msg
+      check "requires domain state 'running'" in msg
+      check "shut off" in msg
+      # And it must not have taken a snapshot anyway: a cold snapshot that
+      # looks like a warm one is exactly the silent failure being prevented.
+      check not logLines(argvLog).mentions("snapshot-create-as")
+
+  test "snapshotRunning refuses when another domain shares the writable disk":
+    when defined(linux):
+      # The identity-collision guard. A running-state snapshot captures the
+      # guest's machine name and DHCP lease; two domains on one disk file
+      # would restore into one identity (measured on Hyper-V: two guests
+      # both came up as WIN-EDC8DG9PTDT on 172.27.94.244).
+      let root = createTempDir("vmh-libvirt-snap-shared", "")
+      defer: removeDir(root)
+      let fakeVirsh = root / "virsh"
+      let argvLog = root / "virsh.argv"
+      writeFakeVirsh(fakeVirsh, argvLog,
+        "case \"$3\" in\n" &
+        "  dominfo) exit 0 ;;\n" &
+        "  domstate) printf 'running\\n' ;;\n" &
+        "  list) printf 'member-0\\nmember-1\\n' ;;\n" &
+        "  domblklist)\n" &
+        "    printf ' Type   Device   Target   Source\\n'\n" &
+        "    printf ' file   disk     vda      /pool/shared.qcow2\\n' ;;\n" &
+        "  *) exit 2 ;;\n" &
+        "esac\n")
+      let b = newLibvirtBackend(virshCmd = fakeVirsh,
+                                libvirtUri = "qemu:///test",
+                                imagePoolDir = root)
+      var msg = ""
+      try:
+        discard b.snapshotRunning("member-0", "warm")
+      except VmHarnessError as e:
+        msg = e.msg
+      check "member-1" in msg
+      check "identical network identity" in msg
+      check not logLines(argvLog).mentions("snapshot-create-as")
+
+  test "snapshotRunning refuses to overwrite an existing memory-state file":
+    when defined(linux):
+      let root = createTempDir("vmh-libvirt-snap-memexists", "")
+      defer: removeDir(root)
+      let fakeVirsh = root / "virsh"
+      let argvLog = root / "virsh.argv"
+      writeFakeVirsh(fakeVirsh, argvLog,
+        "case \"$3\" in\n" &
+        "  dominfo) exit 0 ;;\n" &
+        "  domstate) printf 'running\\n' ;;\n" &
+        "  list) printf 'member-0\\n' ;;\n" &
+        "  domblklist)\n" &
+        "    printf ' Type   Device   Target   Source\\n'\n" &
+        "    printf ' file   disk     vda      /pool/member-0.qcow2\\n' ;;\n" &
+        "  *) exit 2 ;;\n" &
+        "esac\n")
+      let b = newLibvirtBackend(virshCmd = fakeVirsh,
+                                libvirtUri = "qemu:///test",
+                                imagePoolDir = root)
+      # A leftover memstate is another member's warm RAM. Silently reusing
+      # it is the same identity collision by a different route.
+      writeFile(b.memoryStatePathFor("member-0", "warm"), "stale-ram")
+      var msg = ""
+      try:
+        discard b.snapshotRunning("member-0", "warm")
+      except VmHarnessError as e:
+        msg = e.msg
+      check "already exists" in msg
+      check not logLines(argvLog).mentions("snapshot-create-as")
+
+  test "snapshotRunning issues --live with an external memspec when clean":
+    when defined(linux):
+      let root = createTempDir("vmh-libvirt-snap-live", "")
+      defer: removeDir(root)
+      let fakeVirsh = root / "virsh"
+      let argvLog = root / "virsh.argv"
+      writeFakeVirsh(fakeVirsh, argvLog,
+        "case \"$3\" in\n" &
+        "  dominfo) exit 0 ;;\n" &
+        "  domstate) printf 'running\\n' ;;\n" &
+        "  list) printf 'member-0\\n' ;;\n" &
+        "  domblklist)\n" &
+        "    printf ' Type   Device   Target   Source\\n'\n" &
+        "    printf ' file   disk     vda      /pool/member-0.qcow2\\n'\n" &
+        "    printf ' file   cdrom    sda      /iso/virtio-win.iso\\n' ;;\n" &
+        "  snapshot-create-as) exit 0 ;;\n" &
+        "  *) exit 2 ;;\n" &
+        "esac\n")
+      let b = newLibvirtBackend(virshCmd = fakeVirsh,
+                                libvirtUri = "qemu:///test",
+                                imagePoolDir = root)
+      check b.snapshotRunning("member-0", "warm") == "warm"
+      let lines = logLines(argvLog)
+      check lines.mentions("snapshot-create-as")
+      check lines.mentions("--live")
+      check lines.mentions("--memspec")
+      check lines.mentions(b.memoryStatePathFor("member-0", "warm") &
+                           ",snapshot=external")
+      # The shared install media is excluded explicitly.
+      check lines.mentions("sda,snapshot=no")
+
+  test "snapshot (cold) is --disk-only and carries no memory state":
+    when defined(linux):
+      let root = createTempDir("vmh-libvirt-snap-cold", "")
+      defer: removeDir(root)
+      let fakeVirsh = root / "virsh"
+      let argvLog = root / "virsh.argv"
+      writeFakeVirsh(fakeVirsh, argvLog,
+        "case \"$3\" in\n" &
+        "  dominfo) exit 0 ;;\n" &
+        "  domblklist)\n" &
+        "    printf ' Type   Device   Target   Source\\n'\n" &
+        "    printf ' file   disk     vda      /pool/member-0.qcow2\\n' ;;\n" &
+        "  snapshot-create-as) exit 0 ;;\n" &
+        "  *) exit 2 ;;\n" &
+        "esac\n")
+      let b = newLibvirtBackend(virshCmd = fakeVirsh,
+                                libvirtUri = "qemu:///test",
+                                imagePoolDir = root)
+      check b.snapshot("member-0", "cold") == "cold"
+      let lines = logLines(argvLog)
+      check lines.mentions("--disk-only")
+      check not lines.mentions("--live")
+      check not lines.mentions("--memspec")
+
+  test "listSnapshots parses names, and a virsh failure raises":
+    when defined(linux):
+      let root = createTempDir("vmh-libvirt-snap-list", "")
+      defer: removeDir(root)
+      let fakeVirsh = root / "virsh"
+      let argvLog = root / "virsh.argv"
+      writeFakeVirsh(fakeVirsh, argvLog,
+        "case \"$3\" in\n" &
+        "  snapshot-list)\n" &
+        "    case \"$5\" in\n" &
+        "      member-0) printf 'pool-baseline-0\\n\\nwarm\\n' ;;\n" &
+        "      *) printf 'error: failed to get domain\\n'; exit 1 ;;\n" &
+        "    esac ;;\n" &
+        "  *) exit 2 ;;\n" &
+        "esac\n")
+      let b = newLibvirtBackend(virshCmd = fakeVirsh,
+                                libvirtUri = "qemu:///test",
+                                imagePoolDir = root)
+      check b.listSnapshots("member-0") == @["pool-baseline-0", "warm"]
+      expect VmHarnessError:
+        discard b.listSnapshots("no-such-domain")
+
+  test "removeSnapshot is a no-op for an unknown snapshot, and sweeps the RAM image":
+    when defined(linux):
+      let root = createTempDir("vmh-libvirt-snap-remove", "")
+      defer: removeDir(root)
+      let fakeVirsh = root / "virsh"
+      let argvLog = root / "virsh.argv"
+      writeFakeVirsh(fakeVirsh, argvLog,
+        "case \"$3\" in\n" &
+        "  dominfo) exit 0 ;;\n" &
+        "  snapshot-list) printf 'warm\\n' ;;\n" &
+        "  snapshot-delete) exit 0 ;;\n" &
+        "  *) exit 2 ;;\n" &
+        "esac\n")
+      let b = newLibvirtBackend(virshCmd = fakeVirsh,
+                                libvirtUri = "qemu:///test",
+                                imagePoolDir = root)
+      # Idempotent: the base contract says removing a missing snapshot is a
+      # no-op, because teardown blocks get re-entered.
+      b.removeSnapshot("member-0", "never-existed")
+      check not logLines(argvLog).mentions("snapshot-delete")
+
+      # The RAM image is the guest's whole memory (16 GiB on the Windows
+      # lane). Leaking one per teardown would fill the pool in a few cycles.
+      let memPath = b.memoryStatePathFor("member-0", "warm")
+      writeFile(memPath, "ram")
+      b.removeSnapshot("member-0", "warm")
+      check logLines(argvLog).mentions("snapshot-delete")
+      check not fileExists(memPath)
+
+  test "restoreSnapshot reverts --running and retries with --force ONLY on that refusal":
+    when defined(linux):
+      let root = createTempDir("vmh-libvirt-snap-revert", "")
+      defer: removeDir(root)
+      let fakeVirsh = root / "virsh"
+      let argvLog = root / "virsh.argv"
+      # First snapshot-revert fails the way libvirt refuses a risky revert
+      # ("revert requires force"); the second, with --force, succeeds.
+      writeFakeVirsh(fakeVirsh, argvLog,
+        "case \"$3\" in\n" &
+        "  dominfo) exit 0 ;;\n" &
+        "  snapshot-revert)\n" &
+        "    if [ -f '" & root & "/tried' ]; then exit 0; fi\n" &
+        "    : > '" & root & "/tried'\n" &
+        "    printf 'error: revert requires force\\n'; exit 1 ;;\n" &
+        "  *) exit 2 ;;\n" &
+        "esac\n")
+      let b = newLibvirtBackend(virshCmd = fakeVirsh,
+                                libvirtUri = "qemu:///test",
+                                imagePoolDir = root)
+      b.restoreSnapshot("member-0", "warm")
+      let lines = logLines(argvLog)
+      check lines.len == 3            # dominfo + revert + forced revert
+      check lines[1].contains("--running")
+      check not lines[1].contains("--force")
+      check lines[2].contains("--force")
+
+  test "restoreSnapshot does NOT force on an unrelated failure":
+    when defined(linux):
+      let root = createTempDir("vmh-libvirt-snap-revert-fail", "")
+      defer: removeDir(root)
+      let fakeVirsh = root / "virsh"
+      let argvLog = root / "virsh.argv"
+      writeFakeVirsh(fakeVirsh, argvLog,
+        "case \"$3\" in\n" &
+        "  dominfo) exit 0 ;;\n" &
+        "  snapshot-revert)\n" &
+        "    printf 'error: unsupported configuration\\n'; exit 1 ;;\n" &
+        "  *) exit 2 ;;\n" &
+        "esac\n")
+      let b = newLibvirtBackend(virshCmd = fakeVirsh,
+                                libvirtUri = "qemu:///test",
+                                imagePoolDir = root)
+      expect VmHarnessError:
+        b.restoreSnapshot("member-0", "warm")
+      # Exactly one revert attempt: --force must not paper over a real
+      # incompatibility.
+      var reverts = 0
+      for l in logLines(argvLog):
+        if "snapshot-revert" in l: inc reverts
+      check reverts == 1
+
+  test "restoreSnapshot refuses an undefined domain before touching virsh":
+    when defined(linux):
+      let root = createTempDir("vmh-libvirt-snap-revert-nodom", "")
+      defer: removeDir(root)
+      let fakeVirsh = root / "virsh"
+      let argvLog = root / "virsh.argv"
+      writeFakeVirsh(fakeVirsh, argvLog,
+        "case \"$3\" in\n" &
+        "  dominfo) exit 1 ;;\n" &
+        "  *) exit 2 ;;\n" &
+        "esac\n")
+      let b = newLibvirtBackend(virshCmd = fakeVirsh,
+                                libvirtUri = "qemu:///test",
+                                imagePoolDir = root)
+      expect VmHarnessError:
+        b.restoreSnapshot("never-defined", "warm")
+      check not logLines(argvLog).mentions("snapshot-revert")
+
+suite "LibvirtBackend (continued)":
 
   test "bootFromMedia rejects rootfs-tar (WSL-only) cleanly":
     let b = newLibvirtBackend()
