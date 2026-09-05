@@ -197,6 +197,21 @@ proc stopStartedProcess(pid: int) =
   else:
     discard runProcessCapture(@["kill", "-9", $pid], timeoutSec = 5)
 
+proc pathExists*(path: string): bool =
+  ## True for ANY inode at ``path``, including a unix-domain socket.
+  ##
+  ## This is not a stylistic preference over ``os.fileExists``: that one
+  ## is ``S_ISREG``, so it reports every chardev/swtpm control socket
+  ## this backend creates as *absent*. Waiting for a socket with
+  ## ``fileExists`` never succeeds, and removing one guarded by
+  ## ``fileExists`` never runs. ``qemu_windows_arm.nim`` carries the same
+  ## helper for the same reason; it is private there.
+  try:
+    discard getFileInfo(path, followSymlink = false)
+    true
+  except OSError:
+    false
+
 proc shQuote*(s: string): string =
   ## POSIX single-quote escaping. Used only for the ``sh -c 'exec …'``
   ## wrapper that redirects QEMU's own stdout/stderr into the run
@@ -248,8 +263,16 @@ proc kvmUsable*(): bool =
   ## KVM is usable when ``/dev/kvm`` exists and this process may open it
   ## read-write. Probing the device beats probing group membership: the
   ## host may grant access through an ACL or a permissive mode.
+  ##
+  ## The existence probe is ``pathExists``, not ``os.fileExists``:
+  ## ``/dev/kvm`` is a character device and ``fileExists`` is ``S_ISREG``,
+  ## so it answers false on every host that HAS KVM. With ``fileExists``
+  ## here this proc returned false unconditionally on Linux and every
+  ## qemu-boot guest ran under TCG — correct, but roughly ten times
+  ## slower, which is the difference between a boot gate that costs
+  ## seconds and one that costs minutes.
   when defined(linux):
-    if not fileExists("/dev/kvm"):
+    if not pathExists("/dev/kvm"):
       return false
     try:
       let f = open("/dev/kvm", fmReadWriteExisting)
@@ -428,7 +451,7 @@ method bootFromMedia*(b: QemuBootBackend, spec: BootMediaSpec): VmHandle =
         removeFile(serialLogPath)
 
       let socketPath = b.serialSocketPathFor(vmName)
-      if fileExists(socketPath):
+      if pathExists(socketPath):
         removeFile(socketPath)
 
       var launch = QemuBootLaunch(
@@ -546,7 +569,7 @@ method bootFromMedia*(b: QemuBootBackend, spec: BootMediaSpec): VmHandle =
         stopStartedProcess(pid)
       try:
         let sock = b.serialSocketPathFor(vmName)
-        if fileExists(sock): removeFile(sock)
+        if pathExists(sock): removeFile(sock)
       except CatchableError: discard
       try:
         if dirExists(runDir): removeDir(runDir)
@@ -568,7 +591,7 @@ method stopAndCleanup*(b: QemuBootBackend, vm: VmHandle,
       try: stopStartedProcess(parseInt(pidText))
       except ValueError: discard
     let sock = vm.extra.getOrDefault("serialSocketPath", "")
-    if sock.len > 0 and fileExists(sock):
+    if sock.len > 0 and pathExists(sock):
       try: removeFile(sock) except CatchableError: discard
     if deleteVm:
       let runDir = vm.extra.getOrDefault("runDir", "")
@@ -645,7 +668,7 @@ method serialSend*(b: QemuBootBackend, stream: SerialStream, text: string) =
     if s == nil or s.socketPath.len == 0:
       raise newException(BackendUnavailableError,
         "QemuBootBackend.serialSend: no chardev socket for this stream")
-    if not fileExists(s.socketPath):
+    if not pathExists(s.socketPath):
       raise newVmHarnessError($b.id, lpExec,
         "QemuBootBackend.serialSend: serial socket is gone: " & s.socketPath)
     # Qualified: ``std/posix`` also exports AF_UNIX / SOCK_STREAM as cint.
