@@ -121,36 +121,57 @@ proc defaultAlgorithmFor*(backend: BackendId): PoolAlgorithm =
     # RAM resumes in ~5 s. Not a marginal call.
     paRecycleFromPool
   of biLibvirt:
-    # NO LONGER FORCED, but still not measured -- and the honest answer to
-    # that pair is "leave it alone".
+    # MEASURED 2026-09-05 on high-mem-server, against the real 16 GiB
+    # Windows golden (`golden-win11-cloudbase.qcow2`, 4 vCPU, UEFI/q35 --
+    # the production eph-win-x64 shape). The answer is NO, and it is not
+    # close. This entry used to say "not measured"; it now says "measured,
+    # and recycling does not clear the bar".
     #
-    # What changed (campaign WR0, 2026-09-05): snapshot / snapshotRunning /
-    # restoreSnapshot / listSnapshots / removeSnapshot are implemented, as
-    # EXTERNAL virsh snapshots, so `paRecycleFromPool` would now at least
-    # RUN here. Two of the properties the algorithm depends on were
-    # measured on high-mem-server against real libvirt 11.7 and hold:
-    # restoring does not rewrite the saved state (two restores left the
-    # frozen disk byte-identical, mtime unchanged -- so "prepare once,
-    # restore many" is the cheap direction), and each restore's write is a
-    # fresh disposable overlay, not a copy of the guest.
+    #   restore + resume -> SSH-ready  p50 46.9 s  (n=10, interleaved)
+    #                                  p50 35.9 s  (n=5, tools/bench)
+    #   cold boot -> SSH-ready         p50 73.7 s  (n=10, same run)
+    #                                  p50 59.0 s  (n=5, clean boots)
+    #   ratio, same interleaved run    1.57x       (1.26x vs clean boot)
     #
-    # What did NOT change: nobody has timed restore-to-ready against
-    # boot-to-ready on a libvirt guest. Hyper-V's 36 s -> 7.2 s is an
-    # ANALOGY (different hypervisor, VHDX not qcow2), and libvirt's cost
-    # profile genuinely differs -- cloning here is already O(1), a qcow2
-    # CoW overlay over the golden, so the recycle win is only the skipped
-    # BOOT, not an avoided file copy the way it was on Hyper-V.
+    # The bar was p50 <= 10 s AND >= 4x. Both fail by 3-4x.
     #
-    # Flipping on an analogy would put every libvirt Pool -- Linux guests
-    # included, where a boot costs ~1-2 s and recycling buys nothing --
-    # onto a path that has never run against a live guest. So: keep
-    # `paClonePerTask`, which cannot be wrong about isolation.
+    # Read that carefully: recycling is NOT slower. It is modestly faster
+    # than the boot it replaces -- 1.57x against the interleaved cold arm,
+    # 1.26x against a clean boot. It is just not faster ENOUGH.
+    # `paRecycleFromPool` buys a member that carries state across jobs, and
+    # a 1.26-1.57x saving does not pay for that isolation risk where a 4x+
+    # saving would have. So `paClonePerTask` stays because it cannot be
+    # wrong about isolation and the speedup on offer is too small to trade
+    # for that -- NOT because it is the faster path.
     #
-    # WHAT WOULD JUSTIFY THE FLIP, precisely: run
-    # `tests/e2e/t_libvirt_live_snapshot_restore.nim` (or the
-    # tools/bench pair) on the Windows golden in a maintenance window; flip
-    # when restore-to-ready p50 <= 10 s AND >= 4x faster than
-    # boot-to-ready in the same run. Procedure and thresholds:
+    # WHY, because the decomposition is what a future implementer needs:
+    #
+    #   snapshot-revert --running   34.4 s   <- 96% of the cycle
+    #   resume -> SSH-ready          1.7 s   <-   5% of the cycle
+    #
+    # The guest is NOT the problem. 1.7 s back to SSH-ready beats Hyper-V's
+    # 5.08 s on the same guest OS. The whole cost is re-reading the 2.61 GiB
+    # memory image at ~81 MB/s, against ~668 MB/s for Hyper-V's comparable
+    # 3,395 MB image. That ~8x throughput gap is the single thing standing
+    # between libvirt and the budget, and it is structural rather than
+    # contention: the bench ran at HIGHER host load than the gate (load1
+    # 38->71 vs 11->38) and was FASTER, with a tight 27.4-37.4 s spread.
+    #
+    # The storage properties the algorithm depends on all hold, and were
+    # re-confirmed at Windows scale across 20 reverts: a restore rewrites
+    # neither the frozen disk nor the memory image (both byte-stable, mtime
+    # unchanged to the nanosecond), and each cycle writes only a disposable
+    # ~120 MB overlay. So "prepare once, restore many" IS the cheap
+    # direction on qcow2 -- it is simply not a fast one.
+    #
+    # WHAT WOULD JUSTIFY REVISITING: not a re-run of the same benchmark, but
+    # a fix to the memory-image reload. Get `snapshot-revert --running`
+    # under ~10 s for a 2.6 GiB memstate and the arithmetic inverts, because
+    # the resume half already clears the budget with room to spare.
+    # Candidates, none of them yet separated: single-threaded incoming
+    # migration-from-file, ZFS overhead on the memstate volume, and the
+    # QEMU process teardown/re-create that an external-snapshot revert does.
+    # Full numbers, host conditions and evidence:
     # `docs/per-backend-notes/libvirt-snapshot-benchmarks.md`.
     paClonePerTask
   of biIncus:
