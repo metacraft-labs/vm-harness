@@ -16,13 +16,19 @@
 ##    ``execInGuest``, ``copyToGuest``, ``copyFromGuest``,
 ##    ``startAndAwaitReady``, ``stopAndCleanup``.
 ##
+## *Also shipped (campaign WR0, formerly "M4 Phase B"):*
+##
+##  - ``snapshot`` / ``snapshotRunning`` / ``restoreSnapshot`` /
+##    ``listSnapshots`` / ``removeSnapshot`` — EXTERNAL ``virsh
+##    snapshot-*`` snapshots. ``snapshotRunning`` captures the guest's
+##    RAM so a restore RESUMES instead of booting, which is what makes a
+##    warm pool cheaper than a cold one. See the block comment above
+##    ``snapshot`` for why external rather than internal.
+##
 ## *Out of scope (tracked as later phases):*
 ##
-##  - ``snapshot`` / ``restoreSnapshot`` / ``snapshotRunning`` /
-##    ``listSnapshots`` / ``removeSnapshot`` (M4 Phase B — wraps
-##    ``virsh snapshot-*``).
-##  - ``exportBaseline`` / ``importBaseline`` (M4 Phase B — wraps
-##    ``virsh save`` + qcow2 reflink copy).
+##  - ``exportBaseline`` / ``importBaseline`` (campaign WR3 — wraps
+##    ``virsh dumpxml`` + ``qemu-img convert``).
 ##  - SR-IOV + GPU passthrough device wiring (M4 Phase C — needs
 ##    host-side IOMMU + bind/unbind helpers).
 ##  - ``installArgvTraceShim`` (M4 Phase B — Windows shim shape is
@@ -48,9 +54,10 @@
 ##    ``windows-runner-001``). Unlike the Tart/UTM clone-based
 ##    backends, libvirt has cheap native snapshot/revert, so we don't
 ##    spin up a separate per-gate ephemeral; the same long-lived domain
-##    is reverted to a named snapshot each gate. (M4 Phase B will wire
-##    that path. The M4 Phase A slice treats the domain as a
-##    long-lived "runner" VM and skips per-gate revert.)
+##    is reverted to a named snapshot each gate. (``restoreSnapshot``
+##    now implements that revert; ``revertToBaseline`` itself still
+##    treats the domain as a long-lived "runner" VM — wiring the two
+##    together for the fleet is campaign WR1's job.)
 ##  - The disk image lives at
 ##    ``/var/lib/libvirt/images/<name>.qcow2`` (the default libvirt
 ##    pool).
@@ -107,6 +114,18 @@ type
       ## resolve where ``virt-install`` writes the qcow2 (and where
       ## ``stopAndCleanup`` deletes it from). Defaults to
       ## ``/var/lib/libvirt/images``.
+    snapshotStateDir*: string
+      ## Where the EXTERNAL snapshot artifacts go — the frozen disk
+      ## overlays and, for ``snapshotRunning``, the guest RAM image.
+      ## Empty (the default) means "alongside the domain's disk", i.e.
+      ## ``imagePoolDir``.
+      ##
+      ## It is a separate knob because the two have different size and
+      ## bandwidth profiles: a per-job CoW overlay is megabytes, while a
+      ## warm Windows member's RAM image is the guest's whole memory
+      ## (16 GiB on ``eph-win-x64``), written once at pool construction
+      ## and read on every recycle. An operator may want that on a
+      ## different volume from the golden pool.
     networkBridge*: string
       ## libvirt network for the guest's primary NIC. Defaults to
       ## ``virbr0`` (the libvirt-managed NAT bridge). Pass a host
@@ -190,6 +209,7 @@ proc newLibvirtBackend*(virshCmd: string = "virsh",
                         sshpassCmd: string = "sshpass",
                         libvirtUri: string = DefaultLibvirtUri,
                         imagePoolDir: string = DefaultLibvirtImagePool,
+                        snapshotStateDir: string = "",
                         networkBridge: string = DefaultLibvirtBridge,
                         sshUser: string = DefaultLibvirtWindowsSshUser,
                         sshPassword: string = DefaultLibvirtWindowsSshPassword,
@@ -219,6 +239,7 @@ proc newLibvirtBackend*(virshCmd: string = "virsh",
     sshpassCmd: sshpassCmd,
     libvirtUri: effUri,
     imagePoolDir: effPool,
+    snapshotStateDir: snapshotStateDir,
     networkBridge: networkBridge,
     sshUser: sshUser,
     sshPassword: sshPassword,
@@ -1434,8 +1455,11 @@ method revertToBaseline*(b: LibvirtBackend, baselineName: string): VmHandle =
   ## exists, starts it if it isn't running, polls for the leased IP +
   ## SSH-ready, and returns a VmHandle pointing at the live domain.
   ##
-  ## M4 Phase B will wire ``virsh snapshot-revert --running`` here for
-  ## the test-fixture use case.
+  ## ``virsh snapshot-revert --running`` is now available as
+  ## ``restoreSnapshot`` for the test-fixture / warm-pool use case; this
+  ## method is deliberately NOT rewritten to call it, because the fleet
+  ## still reaches libvirt through the per-job CoW clone path and
+  ## changing that is campaign WR1, not WR0.
   when defined(linux):
     if not b.domainExists(baselineName):
       raise newVmHarnessError($b.id, lpRevert,
@@ -1632,55 +1656,413 @@ method uninstallArgvTraceShim*(b: LibvirtBackend, vm: VmHandle,
   discard
 
 # ---------------------------------------------------------------------------
-# M30 surface — snapshot / restore / list / hot snapshots / export /
-# import. The M4 Phase A slice ships clear NotImplementedDefect stubs
-# so the conformance surface is unambiguous and the call sites either
-# work or fail loudly. Each method documents the wrapped virsh call
-# planned for Phase B.
+# M30 surface — snapshot / restore / list / hot snapshots.
+#
+# Implemented by the WR0 slice of `Warm-Runners-And-Layered-CI-Images`
+# (what earlier revisions of this file called "M4 Phase B"). The point of
+# the slice is ``snapshotRunning``: a snapshot that carries the guest's RAM
+# is what lets a restore RESUME instead of BOOT, which is the entire reason
+# a warm pool beats a cold one for the Windows lane.
+#
+# EXTERNAL, not internal — and that is a decision, not a transcription.
+# ``virsh snapshot-create-as`` offers two families:
+#
+#   * INTERNAL (the no-flag default) writes both the disk delta and, for a
+#     running domain, the RAM image INSIDE the domain's own qcow2. The guest
+#     is stunned for the whole memory dump, and ``--live`` is rejected
+#     outright — virsh(1): "If --live is specified, libvirt takes the
+#     snapshot while the guest is running. ... This is currently supported
+#     only for external full system snapshots."
+#   * EXTERNAL freezes the current disk file (that frozen file IS the
+#     snapshot), layers a fresh overlay on top for subsequent writes, and
+#     writes the RAM image to a separate file by live migration-to-file, so
+#     the guest keeps running.
+#
+# The warm-pool model these primitives serve prepares a member's warm state
+# ONCE and restores it many times (``pool.nim`` — ``release`` restores, not
+# ``acquire``), so it wants the saved state immutable and the per-cycle write
+# small. External gives exactly that shape: ``snapshotRunning`` FREEZES the
+# domain's current disk file (that file, plus a read-only
+# ``<domain>.<snap>.memstate``, IS the warm state), routes subsequent writes
+# to a fresh ``<domain>.<snap>.<target>.qcow2``, and each
+# ``restoreSnapshot`` discards that scratch layer and re-reads the same
+# memory image. Internal would instead put the warm RAM image inside the
+# very file each job writes to.
+#
+# Measured on high-mem-server against libvirt 11.7 (see the per-backend
+# note): two consecutive reverts left the frozen file byte-identical with
+# an unchanged mtime, and libvirt itself re-created the scratch layer each
+# time — under a name IT chooses, next to the frozen file, so the path from
+# ``snapshotDiskPathFor`` governs only the layer created at snapshot time.
+#
+# Reverting to an external snapshot requires libvirt >= 10.9; high-mem-server
+# runs 11.7. ``restoreSnapshot`` surfaces an older libvirt's refusal as a
+# plain virsh error rather than silently degrading to a cold boot.
+#
+# NOTE the layering relative to the per-job CoW overlay the ephemeral path
+# builds (``buildEphemeralDomainXml`` -> ``qemu-img create -b <golden>``):
+# these snapshots stack ON TOP of whatever the domain's active disk already
+# is. A warm pool member is a long-lived domain whose active disk is its own
+# overlay over the shared golden, so the chain after ``snapshotRunning`` is
+#   golden (shared, read-only)
+#     <- member overlay              (frozen: the snapshot's disk state)
+#       <- scratch overlay           (rewritten by every restore)
+# and the golden is never written. See
+# ``docs/per-backend-notes/libvirt-snapshot-benchmarks.md``.
+
+const
+  LibvirtMemoryStateSuffix* = ".memstate"
+    ## Extension for the external RAM image ``snapshotRunning`` writes.
+
+type
+  LibvirtBlockDev* = object
+    ## One row of ``virsh domblklist <domain> --details``.
+    srcType*: string   ## ``file`` / ``block`` / ``network``
+    device*: string    ## ``disk`` / ``cdrom`` / ``floppy``
+    target*: string    ## guest-visible target, e.g. ``vda``
+    source*: string    ## host-side path (empty for an unpopulated cdrom)
+
+proc effectiveSnapshotStateDir*(b: LibvirtBackend): string =
+  ## Where external snapshot artifacts land. ``snapshotStateDir`` when the
+  ## operator set one, else next to the domain's disk.
+  if b.snapshotStateDir.len > 0: b.snapshotStateDir else: b.imagePoolDir
+
+proc ensureSnapshotStateDir*(b: LibvirtBackend) =
+  ## Best-effort: the directory normally exists (it is the image pool).
+  ## A hard failure here would be reported by virsh anyway, with a better
+  ## message than a bare OSError.
+  let dir = b.effectiveSnapshotStateDir
+  if dir.len > 0 and not dirExists(dir):
+    try: createDir(dir)
+    except CatchableError: discard
+
+proc memoryStatePathFor*(b: LibvirtBackend, vmName, snapshotName: string): string =
+  ## The RAM image for one (domain, snapshot) pair. Keyed on BOTH names,
+  ## which is load-bearing rather than tidy: a RAM image carries the guest's
+  ## machine name and DHCP lease, so two domains that shared one memstate
+  ## path would come up as the same machine. See ``snapshotRunning``.
+  b.effectiveSnapshotStateDir / (vmName & "." & snapshotName &
+                                 LibvirtMemoryStateSuffix)
+
+proc snapshotDiskPathFor*(b: LibvirtBackend,
+                          vmName, snapshotName, target: string): string =
+  ## The scratch overlay a snapshot layers over the frozen disk state.
+  b.effectiveSnapshotStateDir / (vmName & "." & snapshotName & "." & target &
+                                 ".qcow2")
+
+proc escapeVirshSpec*(v: string): string =
+  ## ``--memspec`` / ``--diskspec`` use ``,`` as the field separator; a
+  ## literal comma is escaped by doubling it (virsh(1)).
+  v.replace(",", ",,")
+
+proc parseDomblklistDetails*(text: string): seq[LibvirtBlockDev] =
+  ## Parse ``virsh domblklist <domain> --details``:
+  ##
+  ## ```
+  ##  Type   Device   Target   Source
+  ## ---------------------------------------------------
+  ##  file   disk     vda      /storage/libvirt/win.qcow2
+  ##  file   cdrom    sda      -
+  ## ```
+  ##
+  ## Pure so it is testable without libvirt. An empty/`-` source is
+  ## reported as an empty string (virsh prints ``-`` for an empty tray).
+  for line in text.splitLines():
+    let s = line.strip()
+    if s.len == 0: continue
+    if s.startsWith("-"): continue
+    let parts = s.splitWhitespace()
+    if parts.len < 3: continue
+    if parts[0] == "Type": continue          # header row
+    var dev = LibvirtBlockDev(srcType: parts[0], device: parts[1],
+                              target: parts[2], source: "")
+    if parts.len >= 4 and parts[3] != "-":
+      dev.source = parts[3]
+    result.add(dev)
+
+proc snapshotableDisks*(devs: seq[LibvirtBlockDev]): seq[LibvirtBlockDev] =
+  ## The devices an external snapshot must create an overlay for: writable
+  ## file-backed ``disk`` devices. Everything else (cdroms carrying the
+  ## shared Windows/virtio ISOs, floppies) is excluded — the same rule
+  ## ``undefineDomain`` follows for ``--remove-all-storage``, and for the
+  ## same reason: those paths are shared host media, not VM-owned storage.
+  for d in devs:
+    if d.device == "disk" and d.srcType == "file" and d.source.len > 0:
+      result.add(d)
+
+proc sharesWritableDisk*(a, b: seq[LibvirtBlockDev]): bool =
+  ## True when two domains have a writable disk source in common.
+  for x in snapshotableDisks(a):
+    for y in snapshotableDisks(b):
+      if x.source == y.source: return true
+  false
+
+proc parseSnapshotNames*(text: string): seq[string] =
+  ## Parse ``virsh snapshot-list <domain> --name`` — one name per line,
+  ## blank lines dropped. Pure, so it is testable without libvirt.
+  for line in text.splitLines():
+    let s = line.strip()
+    if s.len > 0: result.add(s)
+
+proc domainBlockDevices*(b: LibvirtBackend, name: string): seq[LibvirtBlockDev] =
+  ## ``virsh domblklist <name> --details``. Empty seq on error.
+  let r = b.runVirsh(@["domblklist", "--domain", name, "--details"],
+                     timeoutSec = 30)
+  if r.exitCode != 0: return @[]
+  parseDomblklistDetails(r.stdout)
+
+proc domainsSharingWritableDisk*(b: LibvirtBackend, name: string): seq[string] =
+  ## Every OTHER defined domain that has a writable disk file in common
+  ## with ``name``. Used as the identity-collision guard in
+  ## ``snapshotRunning``; see there for why it matters.
+  let mine = b.domainBlockDevices(name)
+  if mine.len == 0: return @[]
+  for other in b.listAllDomainNames():
+    if other == name: continue
+    if sharesWritableDisk(mine, b.domainBlockDevices(other)):
+      result.add(other)
+
+proc buildSnapshotCreateArgs*(b: LibvirtBackend, vmName, snapshotName: string,
+                              devs: seq[LibvirtBlockDev],
+                              live: bool): seq[string] =
+  ## The ``virsh snapshot-create-as`` sub-argv, as a pure function of the
+  ## domain's block list — the same testable shape as
+  ## ``buildVirtInstallArgs``. ``live = true`` adds the external RAM image
+  ## (``snapshotRunning``); ``live = false`` is ``--disk-only``, i.e. no vm
+  ## state, which is what makes a restore of it BOOT rather than resume.
+  result = @["snapshot-create-as", "--domain", vmName,
+             "--name", snapshotName, "--atomic"]
+  if live:
+    result.add("--live")
+    result.add("--memspec")
+    result.add("file=" &
+      escapeVirshSpec(b.memoryStatePathFor(vmName, snapshotName)) &
+      ",snapshot=external")
+  else:
+    result.add("--disk-only")
+  for d in devs:
+    result.add("--diskspec")
+    if d.device == "disk" and d.srcType == "file" and d.source.len > 0:
+      result.add(d.target & ",snapshot=external,file=" &
+        escapeVirshSpec(b.snapshotDiskPathFor(vmName, snapshotName, d.target)))
+    else:
+      # Explicit rather than implicit: libvirt would otherwise try to
+      # snapshot the shared install ISOs attached as cdroms.
+      result.add(d.target & ",snapshot=no")
 
 method snapshot*(b: LibvirtBackend, vmName, snapshotName: string): string =
-  raise newException(BackendUnavailableError,
-    "LibvirtBackend.snapshot — M4 libvirt slice (Phase B) will wrap " &
-    "`virsh snapshot-create-as " & vmName & " " & snapshotName &
-    " --disk-only --atomic`. Snapshot support tracked as M4 Phase B.")
+  ## COLD snapshot: ``virsh snapshot-create-as <vm> <snap> --disk-only
+  ## --atomic``. Disk state only, no vm state, whatever the domain's run
+  ## state is — so ``restoreSnapshot`` of one of these BOOTS the guest.
+  ## That is the control arm for the warm path, not a substitute for it:
+  ## use ``snapshotRunning`` when you want a restore to resume.
+  when defined(linux):
+    if not b.domainExists(vmName):
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "LibvirtBackend.snapshot: domain '" & vmName & "' is not defined")
+    b.ensureSnapshotStateDir()
+    let devs = b.domainBlockDevices(vmName)
+    let args = b.buildSnapshotCreateArgs(vmName, snapshotName, devs,
+                                         live = false)
+    let r = b.runVirsh(args, timeoutSec = 300)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "virsh snapshot-create-as (disk-only) failed for " & vmName & "/" &
+        snapshotName & " (exit " & $r.exitCode & "): " & r.stdout)
+    result = snapshotName
+  else:
+    raise newException(BackendUnavailableError,
+      "LibvirtBackend.snapshot requires a Linux host")
 
 method snapshotRunning*(b: LibvirtBackend, vmName,
                         snapshotName: string): string =
-  raise newException(BackendUnavailableError,
-    "LibvirtBackend.snapshotRunning — M4 libvirt slice (Phase B) will " &
-    "wrap `virsh snapshot-create-as " & vmName & " " & snapshotName &
-    " --live` (memory + CPU + device state). Tracked as M4 Phase B.")
+  ## HOT snapshot: ``virsh snapshot-create-as <vm> <snap> --live --memspec
+  ## file=<...>.memstate,snapshot=external --diskspec <t>,snapshot=external,
+  ## file=<...> --atomic``. Captures RAM + CPU + device state of a RUNNING
+  ## domain, so ``restoreSnapshot`` resumes it instead of booting it.
+  ##
+  ## Two preconditions are asserted rather than assumed, because both
+  ## failure modes are silent:
+  ##
+  ## 1. **The domain must be ``running``** (mirrors ``hyperv.nim``'s
+  ##    ``$vm.State -ne 'Running'`` throw). A snapshot of a stopped domain
+  ##    carries no RAM; it would look like a success and then boot on
+  ##    restore, which is the exact cost this primitive exists to remove.
+  ##
+  ## 2. **No other defined domain may share this domain's writable disk,
+  ##    and the memstate path must be free.** A RAM image carries the
+  ##    guest's machine name and DHCP lease with it — two Hyper-V guests
+  ##    restored from ONE warm checkpoint came up as ``WIN-EDC8DG9PTDT`` at
+  ##    ``172.27.94.244`` *both* (see
+  ##    ``docs/per-backend-notes/hyperv-snapshot-benchmarks.md``). A warm
+  ##    pool must therefore be N distinct warm states, never N readers of
+  ##    one. Sharing a disk file (or a memstate path) between domains is
+  ##    how that would happen here, so it is refused at the point of
+  ##    capture instead of debugged later as a NetBIOS conflict.
+  when defined(linux):
+    let state = b.domainState(vmName)
+    if state != "running":
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "LibvirtBackend.snapshotRunning requires domain state 'running'; " &
+        "got '" & (if state.len == 0: "<undefined>" else: state) &
+        "' for '" & vmName & "'. A snapshot taken while the domain is not " &
+        "running carries no RAM, so restoring it would boot rather than " &
+        "resume. Start the domain and wait for guest readiness first.")
+
+    let shared = b.domainsSharingWritableDisk(vmName)
+    if shared.len > 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "LibvirtBackend.snapshotRunning refuses to capture '" & vmName &
+        "': its writable disk is also attached to " & shared.join(", ") &
+        ". A running-state snapshot captures the guest's machine name and " &
+        "DHCP lease, so a warm state shared between domains yields guests " &
+        "with identical network identity. Give each pool member its own " &
+        "disk (a per-member CoW overlay over the golden) and snapshot each " &
+        "one separately.")
+
+    let memPath = b.memoryStatePathFor(vmName, snapshotName)
+    if fileExists(memPath):
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "LibvirtBackend.snapshotRunning: memory-state file " & memPath &
+        " already exists. Refusing to overwrite it — that file is another " &
+        "warm state, and reusing it is how two members end up with one " &
+        "identity. Remove the stale snapshot with removeSnapshot first.")
+
+    b.ensureSnapshotStateDir()
+    let devs = b.domainBlockDevices(vmName)
+    if snapshotableDisks(devs).len == 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "LibvirtBackend.snapshotRunning: domain '" & vmName & "' has no " &
+        "writable file-backed disk to snapshot (domblklist reported " &
+        $devs.len & " device(s))")
+    let args = b.buildSnapshotCreateArgs(vmName, snapshotName, devs,
+                                         live = true)
+    # Generous timeout: --live streams the guest's whole RAM to the
+    # memstate file (16 GiB on the Windows lane) while the guest keeps
+    # running. This is pool-CONSTRUCTION cost, paid once per member.
+    let r = b.runVirsh(args, timeoutSec = 1800)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "virsh snapshot-create-as --live failed for " & vmName & "/" &
+        snapshotName & " (exit " & $r.exitCode & "): " & r.stdout)
+    result = snapshotName
+  else:
+    raise newException(BackendUnavailableError,
+      "LibvirtBackend.snapshotRunning requires a Linux host")
 
 method restoreSnapshot*(b: LibvirtBackend, vmName, snapshotName: string) =
-  raise newException(BackendUnavailableError,
-    "LibvirtBackend.restoreSnapshot — M4 libvirt slice (Phase B) will " &
-    "wrap `virsh snapshot-revert " & vmName & " " & snapshotName &
-    " --running`. Tracked as M4 Phase B.")
+  ## ``virsh snapshot-revert <vm> <snap> --running``.
+  ##
+  ## ``--running`` normalises the outcome across both snapshot kinds: a
+  ## snapshot with vm state resumes from its RAM image, one without boots.
+  ## The caller therefore gets a running domain either way, and the
+  ## difference between the two is exactly the wall-clock WR0 measures.
+  ##
+  ## The saved state is NOT rewritten by a revert: the frozen disk file and
+  ## the memstate image are inputs, and libvirt re-creates the scratch
+  ## overlay above them. That is what makes "prepare once, restore many"
+  ## the cheap direction here.
+  when defined(linux):
+    if not b.domainExists(vmName):
+      raise newVmHarnessError($b.id, lpRevert,
+        "LibvirtBackend.restoreSnapshot: domain '" & vmName &
+        "' is not defined")
+    let args = @["snapshot-revert", "--domain", vmName,
+                 "--snapshotname", snapshotName, "--running"]
+    var r = b.runVirsh(args, timeoutSec = 600)
+    if r.exitCode != 0 and "requires force" in r.stdout:
+      # libvirt classifies "revert a running domain to an active snapshot"
+      # as risky because it replaces the QEMU process, breaking any
+      # attached VNC/SPICE session. For a recycled pool member that is the
+      # intended behaviour, not a surprise — but retry EXPLICITLY (once,
+      # only on this specific refusal) rather than passing --force
+      # unconditionally, so a genuinely incompatible configuration still
+      # fails loudly on the first attempt's message.
+      let firstMsg = r.stdout
+      r = b.runVirsh(args & @["--force"], timeoutSec = 600)
+      if r.exitCode != 0:
+        raise newVmHarnessError($b.id, lpRevert,
+          "virsh snapshot-revert failed for " & vmName & "/" & snapshotName &
+          " even with --force (exit " & $r.exitCode & "): " & r.stdout &
+          " [first attempt: " & firstMsg & "]")
+      return
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpRevert,
+        "virsh snapshot-revert failed for " & vmName & "/" & snapshotName &
+        " (exit " & $r.exitCode & "): " & r.stdout)
+  else:
+    raise newException(BackendUnavailableError,
+      "LibvirtBackend.restoreSnapshot requires a Linux host")
 
 method listSnapshots*(b: LibvirtBackend, vmName: string): seq[string] =
-  raise newException(BackendUnavailableError,
-    "LibvirtBackend.listSnapshots — M4 libvirt slice (Phase B) will " &
-    "wrap `virsh snapshot-list " & vmName & " --name`. Tracked as M4 " &
-    "Phase B.")
+  ## ``virsh snapshot-list <vm> --name``.
+  when defined(linux):
+    let r = b.runVirsh(@["snapshot-list", "--domain", vmName, "--name"],
+                       timeoutSec = 60)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "virsh snapshot-list failed for " & vmName & " (exit " &
+        $r.exitCode & "): " & r.stdout)
+    result = parseSnapshotNames(r.stdout)
+  else:
+    raise newException(BackendUnavailableError,
+      "LibvirtBackend.listSnapshots requires a Linux host")
 
 method removeSnapshot*(b: LibvirtBackend, vmName, snapshotName: string) =
-  raise newException(BackendUnavailableError,
-    "LibvirtBackend.removeSnapshot — M4 libvirt slice (Phase B) will " &
-    "wrap `virsh snapshot-delete " & vmName & " " & snapshotName &
-    "`. Tracked as M4 Phase B.")
+  ## ``virsh snapshot-delete <vm> <snap>``, then the memstate file.
+  ##
+  ## Idempotent per the base contract: a missing domain or a missing
+  ## snapshot is a no-op, so teardown blocks can be re-entered.
+  ##
+  ## The memstate sweep is not belt-and-braces. It is a warm Windows
+  ## member's entire RAM (16 GiB); leaking one per teardown would fill the
+  ## image pool in a handful of pool cycles. Only the path this backend
+  ## generates for this exact (domain, snapshot) pair is ever removed.
+  when defined(linux):
+    if not b.domainExists(vmName): return
+    if snapshotName notin b.listSnapshots(vmName): return
+    let r = b.runVirsh(@["snapshot-delete", "--domain", vmName,
+                         "--snapshotname", snapshotName], timeoutSec = 600)
+    if r.exitCode != 0:
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "virsh snapshot-delete failed for " & vmName & "/" & snapshotName &
+        " (exit " & $r.exitCode & "): " & r.stdout)
+    let memPath = b.memoryStatePathFor(vmName, snapshotName)
+    if fileExists(memPath):
+      try: removeFile(memPath)
+      except CatchableError: discard
+  else:
+    raise newException(BackendUnavailableError,
+      "LibvirtBackend.removeSnapshot requires a Linux host")
+
+# ---------------------------------------------------------------------------
+# exportBaseline / importBaseline remain stubs ON PURPOSE.
+#
+# They are WR3's ("Windows layer-authoring tooling"), not WR0's. WR0 is the
+# in-place capability — snapshot a member, restore it, drop it — which is
+# what a warm pool on ONE host needs. Export/import is the transferable
+# baseline, and it is the operation that would let one warm state (machine
+# name and DHCP lease included) be materialised on N hosts or N domains,
+# which is precisely the identity collision `snapshotRunning` refuses to
+# create locally. Whoever implements it owes that problem an answer, so it
+# is not something to bolt onto this slice.
 
 method exportBaseline*(b: LibvirtBackend, vmName, destDir: string;
                        baselineName: string = "") =
   raise newException(BackendUnavailableError,
-    "LibvirtBackend.exportBaseline — M4 libvirt slice (Phase B) will " &
-    "wrap `virsh dumpxml " & vmName & "` + `qemu-img convert` (reflinks " &
-    "where the destination volume supports them). Tracked as M4 Phase B.")
+    "LibvirtBackend.exportBaseline is not implemented — deferred to WR3 " &
+    "(Windows layer-authoring tooling), which will wrap `virsh dumpxml " &
+    vmName & "` + `qemu-img convert` (reflinks where the destination " &
+    "volume supports them) AND must answer how an exported warm state " &
+    "avoids reproducing one guest identity on many domains. WR0 " &
+    "implements the in-place snapshot/restore surface only.")
 
 method importBaseline*(b: LibvirtBackend, srcDir: string): seq[string] =
   raise newException(BackendUnavailableError,
-    "LibvirtBackend.importBaseline — M4 libvirt slice (Phase B) will " &
-    "consume the dumpxml/qemu-img bundle produced by exportBaseline. " &
-    "Tracked as M4 Phase B.")
+    "LibvirtBackend.importBaseline is not implemented — deferred to WR3 " &
+    "(see exportBaseline). It will consume the dumpxml/qemu-img bundle " &
+    "exportBaseline produces. WR0 implements the in-place snapshot/" &
+    "restore surface only.")
 
 # ---------------------------------------------------------------------------
 # M1.5 — bootFromMedia + serial-stream primitives.

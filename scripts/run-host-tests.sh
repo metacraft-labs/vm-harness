@@ -34,6 +34,13 @@ run_nim r --hints:off tests/e2e/t_vm_harness_lima_revert_under_30s.nim
 
 # Linux host: libvirt and Incus.
 run_nim r --hints:off tests/e2e/t_vmharness_libvirt_ephemeral_run.nim
+# Campaign WR0: the libvirt snapshot surface. Both self-skip loudly when
+# their prerequisites are absent -- the conformance gate needs
+# VMH_LIBVIRT_SCRATCH=1 on a /session URI (it DEFINES a throwaway domain),
+# and the live gate needs an operator-provided running guest in
+# VMH_LIBVIRT_WARM_DOMAIN. See each file's header.
+run_nim r --hints:off tests/e2e/t_libvirt_snapshot_surface_conformance.nim
+run_nim r --hints:off tests/e2e/t_libvirt_live_snapshot_restore.nim
 run_nim r --hints:off tests/e2e/t_windows_golden_jit_boot.nim
 run_nim r --hints:off tests/e2e/t_vmharness_incus_ephemeral_run.nim
 # §7.4 layered base images: snapshot -> publish -> export -> import -> launch.

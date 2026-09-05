@@ -15,6 +15,16 @@
 ##   * A recycle pool is built with `snapshotRunning`, so a backend that
 ##     cannot capture running state fails at CONSTRUCTION rather than
 ##     degrading silently into a slow cold-boot pool.
+##
+## THE HONEST LIMITATION, stated so nobody mistakes a green run here for
+## more than it is: the noop backend's `snapshotRunning` captures nothing.
+## This file proves the algorithm calls the right method at the right
+## moment; it proves NOTHING about whether a real hot checkpoint carries
+## RAM, restores cheaply, or preserves a member's identity. That evidence
+## lives per backend --
+## `docs/per-backend-notes/hyperv-snapshot-benchmarks.md` (measured) and
+## `tests/e2e/t_libvirt_live_snapshot_restore.nim` (the libvirt gate,
+## pending a maintenance window).
 
 import std/[strutils, unittest]
 import vm_harness
@@ -40,7 +50,13 @@ suite "pool: the development-time backend selection":
   test "Hyper-V recycles; measured clone is no better than a cold boot":
     check defaultAlgorithmFor(biHyperv) == paRecycleFromPool
 
-  test "libvirt clones -- forced, because its restore is unimplemented":
+  test "libvirt still clones -- its restore now EXISTS but is unmeasured":
+    # Campaign WR0 implemented the five snapshot primitives, so this is no
+    # longer forced by a raising stub. It stays paClonePerTask because
+    # nobody has yet timed restore-to-ready against boot-to-ready on a
+    # libvirt guest; Hyper-V's 36 s -> 7.2 s is an analogy, not a
+    # measurement of this backend. See the selector's comment for the exact
+    # numbers that would justify flipping it.
     check defaultAlgorithmFor(biLibvirt) == paClonePerTask
 
   test "incus clones pending the ZFS-vs-dir measurement":

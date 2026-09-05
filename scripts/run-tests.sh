@@ -16,6 +16,7 @@ run_nim r --hints:off tests/unit/t_cli_boot.nim
 run_nim r --hints:off tests/unit/t_hyperv_parsers.nim
 run_nim r --hints:off tests/unit/t_hyperv_boot_media.nim
 run_nim r --hints:off tests/unit/t_pool_algorithms.nim
+run_nim r --hints:off tests/unit/t_libvirt_snapshot_args.nim
 run_nim r --hints:off tests/unit/t_wsl_parsers.nim
 run_nim r --hints:off tests/unit/t_utm_parsers.nim
 run_nim r --hints:off tests/unit/t_tart_shared_dirs.nim

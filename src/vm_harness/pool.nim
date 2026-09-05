@@ -121,12 +121,37 @@ proc defaultAlgorithmFor*(backend: BackendId): PoolAlgorithm =
     # RAM resumes in ~5 s. Not a marginal call.
     paRecycleFromPool
   of biLibvirt:
-    # FORCED, not reasoned. Cloning here is already O(1) -- a qcow2 CoW
-    # overlay over the golden -- but snapshot/restoreSnapshot are
-    # unimplemented stubs that raise (M4 Phase B), so recycling cannot be
-    # selected at all. The cost is that every task pays a full guest boot;
-    # for the Windows guest that is the same ~36 s Hyper-V reduces to ~5 s.
-    # Re-measure and revisit if Phase B lands.
+    # NO LONGER FORCED, but still not measured -- and the honest answer to
+    # that pair is "leave it alone".
+    #
+    # What changed (campaign WR0, 2026-09-05): snapshot / snapshotRunning /
+    # restoreSnapshot / listSnapshots / removeSnapshot are implemented, as
+    # EXTERNAL virsh snapshots, so `paRecycleFromPool` would now at least
+    # RUN here. Two of the properties the algorithm depends on were
+    # measured on high-mem-server against real libvirt 11.7 and hold:
+    # restoring does not rewrite the saved state (two restores left the
+    # frozen disk byte-identical, mtime unchanged -- so "prepare once,
+    # restore many" is the cheap direction), and each restore's write is a
+    # fresh disposable overlay, not a copy of the guest.
+    #
+    # What did NOT change: nobody has timed restore-to-ready against
+    # boot-to-ready on a libvirt guest. Hyper-V's 36 s -> 7.2 s is an
+    # ANALOGY (different hypervisor, VHDX not qcow2), and libvirt's cost
+    # profile genuinely differs -- cloning here is already O(1), a qcow2
+    # CoW overlay over the golden, so the recycle win is only the skipped
+    # BOOT, not an avoided file copy the way it was on Hyper-V.
+    #
+    # Flipping on an analogy would put every libvirt Pool -- Linux guests
+    # included, where a boot costs ~1-2 s and recycling buys nothing --
+    # onto a path that has never run against a live guest. So: keep
+    # `paClonePerTask`, which cannot be wrong about isolation.
+    #
+    # WHAT WOULD JUSTIFY THE FLIP, precisely: run
+    # `tests/e2e/t_libvirt_live_snapshot_restore.nim` (or the
+    # tools/bench pair) on the Windows golden in a maintenance window; flip
+    # when restore-to-ready p50 <= 10 s AND >= 4x faster than
+    # boot-to-ready in the same run. Procedure and thresholds:
+    # `docs/per-backend-notes/libvirt-snapshot-benchmarks.md`.
     paClonePerTask
   of biIncus:
     # UNDECIDED upstream, defaulted conservatively. A container has no boot

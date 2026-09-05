@@ -17,6 +17,12 @@ snapshot followed by `startAndAwaitReady` — the inner loop of any
 per-gate revert workflow that uses `snapshotRunning` for cheap
 isolation.
 
+Backends with a `snapshotRunning` implementation today: Hyper-V,
+incus, and **libvirt** (campaign WR0). The libvirt numbers have not
+been produced yet; the maintenance-window procedure that produces
+them, and the targets they are judged against, are in
+`docs/per-backend-notes/libvirt-snapshot-benchmarks.md`.
+
 Build:
 
 ```

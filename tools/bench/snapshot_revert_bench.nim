@@ -64,6 +64,12 @@ import vm_harness/backends/tart
 import vm_harness/backends/utm
 import vm_harness/backends/lima
 import vm_harness/backends/wsl
+# libvirt implements snapshotRunning as of campaign WR0, so `--backend
+# libvirt` must resolve through newBackend(); without this import the
+# backend never registers itself and the bench dies in the factory instead
+# of producing the number WR0 needs.
+import vm_harness/backends/libvirt
+import vm_harness/backends/incus
 {.pop.}
 
 type
