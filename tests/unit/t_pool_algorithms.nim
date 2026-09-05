@@ -50,13 +50,21 @@ suite "pool: the development-time backend selection":
   test "Hyper-V recycles; measured clone is no better than a cold boot":
     check defaultAlgorithmFor(biHyperv) == paRecycleFromPool
 
-  test "libvirt still clones -- its restore now EXISTS but is unmeasured":
+  test "libvirt still clones -- MEASURED, and its restore loses to a boot":
     # Campaign WR0 implemented the five snapshot primitives, so this is no
-    # longer forced by a raising stub. It stays paClonePerTask because
-    # nobody has yet timed restore-to-ready against boot-to-ready on a
-    # libvirt guest; Hyper-V's 36 s -> 7.2 s is an analogy, not a
-    # measurement of this backend. See the selector's comment for the exact
-    # numbers that would justify flipping it.
+    # longer forced by a raising stub -- and as of 2026-09-05 it is no longer
+    # unmeasured either. On the real 16 GiB Windows golden on high-mem-server:
+    # restore + resume -> SSH-ready p50 46.9 s against a <= 10 s budget, and
+    # only 1.57x faster than the cold boot it replaces against a >= 4x bar.
+    # Both thresholds fail by 3-4x. Note recycling is not SLOWER -- it is
+    # 1.26-1.57x faster than the boot it replaces -- it is just nowhere near
+    # faster enough to pay for a member that carries state across jobs. So
+    # paClonePerTask stays on isolation grounds, not on speed grounds.
+    #
+    # The cost is not the guest: resume -> SSH-ready is 1.7 s (better than
+    # Hyper-V's 5.08 s). It is `snapshot-revert --running` re-reading a
+    # 2.61 GiB memory image, at 34.4 s. Flip this only if that changes.
+    # Numbers: docs/per-backend-notes/libvirt-snapshot-benchmarks.md.
     check defaultAlgorithmFor(biLibvirt) == paClonePerTask
 
   test "incus clones pending the ZFS-vs-dir measurement":
