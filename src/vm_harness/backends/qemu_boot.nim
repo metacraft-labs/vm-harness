@@ -53,11 +53,23 @@
 ## put *outside* the run directory precisely so it survives teardown as
 ## a test artifact.
 ##
-## *TPM.* Not wired here. The swtpm lifecycle in
-## ``backends/qemu_windows_arm.nim`` is the model to copy, and
-## ``buildQemuBootArgs`` is a pure function over a value type
-## specifically so adding ``-tpmdev``/``-device tpm-tis`` later is a
-## local change with a unit test rather than a refactor.
+## *TPM.* ``BootMediaSpec.tpmEnabled`` starts a per-VM ``swtpm`` inside
+## the run directory and hands QEMU the ``emulator`` tpmdev trio
+## (``-chardev socket`` → ``-tpmdev emulator`` → ``-device tpm-tis``).
+## Note the device name: x86 uses ``tpm-tis``, where the aarch64 backend
+## in ``backends/qemu_windows_arm.nim`` uses ``tpm-tis-device``. That
+## backend is otherwise the model this lifecycle copies.
+##
+## The swtpm process is the second thing this backend can leak, so it is
+## treated exactly like the QEMU child: its pid lives in the handle, it
+## is killed in ``stopAndCleanup``, it is killed again by the
+## partial-construction guard in ``bootFromMedia``, and its state
+## directory is inside the run directory that teardown removes.
+##
+## *Direct kernel boot.* ``bmkKernel`` boots a kernel + initramfs with no
+## disk, bootloader or partition table (QEMU's ``-kernel``/``-initrd``/
+## ``-append``). That is what makes a guest that reaches userspace in
+## about a second — and therefore an unconditional vTPM gate — possible.
 
 import std/[hashes, options, os, osproc, streams, strutils, tables, times]
 
@@ -83,6 +95,11 @@ const
 
   DefaultQemuBootMemoryMB* = 2048
   DefaultQemuBootCpus* = 2
+  DefaultSwtpmStartTimeoutSec* = 5
+    ## How long ``startSwtpmInBackground`` waits for swtpm's control
+    ## socket. swtpm creates it before it does anything else, so this
+    ## only bounds a pathologically loaded host.
+
   DefaultQemuBootStartTimeoutSec* = 20
     ## How long ``bootFromMedia`` waits for QEMU to still be alive and
     ## for the serial log to exist. A firmware/argv error kills QEMU in
@@ -94,6 +111,7 @@ type
     ## every VM is a child process plus one directory under ``stateDir``.
     qemuCmd*: string           ## ``qemu-system-x86_64`` by default
     qemuImgCmd*: string        ## ``qemu-img`` by default
+    swtpmCmd*: string          ## ``swtpm`` by default; backs ``tpmEnabled``
     stateDir*: string          ## parent of the per-VM run directories
     namePrefix*: string        ## enforced prefix for VM names
     probeTimeoutSec*: int
@@ -110,6 +128,7 @@ proc defaultQemuBootStateDir*(): string =
 
 proc newQemuBootBackend*(qemuCmd = "qemu-system-x86_64",
                          qemuImgCmd = "qemu-img",
+                         swtpmCmd = "swtpm",
                          stateDir = "",
                          namePrefix = QemuBootNamePrefix,
                          probeTimeoutSec = 10): QemuBootBackend =
@@ -122,6 +141,7 @@ proc newQemuBootBackend*(qemuCmd = "qemu-system-x86_64",
     supportedGuests: {goLinux, goWindows},
     qemuCmd: qemuCmd,
     qemuImgCmd: qemuImgCmd,
+    swtpmCmd: swtpmCmd,
     stateDir: (if stateDir.len > 0: stateDir else: defaultQemuBootStateDir()),
     namePrefix: namePrefix,
     probeTimeoutSec: probeTimeoutSec)
@@ -239,6 +259,12 @@ proc serialSocketPathFor*(b: QemuBootBackend, name: string): string =
   ## discovering the limit at bind time.
   getTempDir() / ("vmh-qb-" & $abs(hash(b.runDirFor(name))) & ".sock")
 
+proc tpmSocketPathFor*(b: QemuBootBackend, name: string): string =
+  ## swtpm's control socket. Short-named for the same ``sun_path`` reason
+  ## as the serial socket, and distinct from it so a stale file from one
+  ## can never be mistaken for the other.
+  getTempDir() / ("vmh-qb-tpm-" & $abs(hash(b.runDirFor(name))) & ".sock")
+
 # ---------------------------------------------------------------------------
 # Argument construction. Pure over a value type so it is unit-testable
 # without a QEMU on PATH.
@@ -249,6 +275,10 @@ type
     diskPath*: string          ## boot disk (already an overlay, if any)
     diskFormat*: string        ## "qcow2" / "raw"
     cdromPath*: string         ## optional install ISO
+    kernelPath*: string        ## direct kernel boot: the kernel image
+    initrdPath*: string        ## direct kernel boot: optional initramfs
+    kernelCmdline*: string     ## direct kernel boot: ``-append``
+    tpmSocketPath*: string     ## swtpm control socket; "" => no vTPM
     serialSocketPath*: string
     serialLogPath*: string
     qemuLogPath*: string       ## QEMU's own ``-D`` trace
@@ -298,9 +328,13 @@ proc buildQemuBootArgs*(l: QemuBootLaunch): seq[string] =
     raise newException(ValueError, "QemuBootLaunch.vmName is empty")
   if l.serialLogPath.len == 0:
     raise newException(ValueError, "QemuBootLaunch.serialLogPath is empty")
-  if l.diskPath.len == 0 and l.cdromPath.len == 0:
+  if l.diskPath.len == 0 and l.cdromPath.len == 0 and l.kernelPath.len == 0:
     raise newException(ValueError,
-      "QemuBootLaunch needs at least one of diskPath / cdromPath")
+      "QemuBootLaunch needs at least one of diskPath / cdromPath / kernelPath")
+  if l.kernelPath.len == 0 and
+      (l.initrdPath.len > 0 or l.kernelCmdline.len > 0):
+    raise newException(ValueError,
+      "QemuBootLaunch.initrdPath/kernelCmdline require a kernelPath")
   if (l.ovmfCode.len == 0) != (l.ovmfVars.len == 0):
     raise newException(ValueError,
       "UEFI boot requires both a loader and a writable NVRAM copy")
@@ -341,6 +375,13 @@ proc buildQemuBootArgs*(l: QemuBootLaunch): seq[string] =
   if l.cdromPath.len > 0:
     result.add(@["-cdrom", l.cdromPath])
 
+  if l.kernelPath.len > 0:
+    result.add(@["-kernel", l.kernelPath])
+    if l.initrdPath.len > 0:
+      result.add(@["-initrd", l.initrdPath])
+    if l.kernelCmdline.len > 0:
+      result.add(@["-append", l.kernelCmdline])
+
   # One chardev serves both directions; ``logfile`` is what makes the
   # transcript durable and complete regardless of who is connected.
   var chardev = "socket,id=serial0,path=" & l.serialSocketPath &
@@ -358,6 +399,24 @@ proc buildQemuBootArgs*(l: QemuBootLaunch): seq[string] =
 
   if l.qemuLogPath.len > 0:
     result.add(@["-D", l.qemuLogPath])
+
+  # vTPM, deliberately LAST. QEMU's ``emulator`` backend speaks to swtpm's
+  # CONTROL channel over this chardev and then hands swtpm a socketpair
+  # for the data channel itself, which is why one ``--ctrl`` socket is the
+  # whole wiring. ``tpm-tis`` is the x86 device; aarch64 spells it
+  # ``tpm-tis-device``, and using the wrong one is a QEMU startup error,
+  # not a silently TPM-less guest.
+  #
+  # Appending rather than interleaving keeps a strong invariant that
+  # ``t_tpm_device_args`` asserts: the TPM argv is exactly the TPM-less
+  # argv plus these six entries. Any vTPM change that also perturbed the
+  # machine model or the serial wiring would make the two polarities of
+  # every other boot gate incomparable.
+  if l.tpmSocketPath.len > 0:
+    result.add(@[
+      "-chardev", "socket,id=chrtpm,path=" & l.tpmSocketPath,
+      "-tpmdev", "emulator,id=tpm0,chardev=chrtpm",
+      "-device", "tpm-tis,tpmdev=tpm0"])
 
 proc qemuBootShellCommand*(qemuCmd: string, args: seq[string],
                            qemuStdioLogPath: string): string =
@@ -388,6 +447,76 @@ method probeAvailability*(b: QemuBootBackend): bool =
       false
   else:
     false
+
+proc swtpmAvailable*(b: QemuBootBackend): bool =
+  ## Whether ``tpmEnabled`` can be honoured on this host. Deliberately NOT
+  ## folded into ``probeAvailability``: a TPM-less boot must not become
+  ## unavailable because swtpm is missing, and a TPM-requiring boot must
+  ## fail loudly rather than be skipped.
+  try:
+    let r = runProcessCapture(@[b.swtpmCmd, "--version"],
+                              timeoutSec = b.probeTimeoutSec)
+    # swtpm's banner is "TPM emulator version 0.10.1, Copyright …" — it
+    # does not contain its own program name, so matching on "swtpm"
+    # would reject a perfectly good swtpm.
+    r.exitCode == 0 and "tpm emulator" in r.output.toLowerAscii
+  except CatchableError:
+    false
+
+proc startSwtpmInBackground*(b: QemuBootBackend, runDir, socketPath: string): int =
+  ## Start one ``swtpm socket`` for this VM and return its pid.
+  ##
+  ## The state directory lives INSIDE the run directory, so the same
+  ## ``removeDir`` that proves no disk overlay leaked also proves no TPM
+  ## state leaked. swtpm manufactures a fresh TPM 2.0 into an empty state
+  ## directory on first use, so every run starts from pristine PCRs — a
+  ## gate that inherited a previous run's PCR values would be measuring
+  ## the wrong thing.
+  let tpmStateDir = runDir / "tpm"
+  createDir(tpmStateDir)
+  if pathExists(socketPath):
+    try: removeFile(socketPath)
+    except CatchableError: discard
+  let args = @[
+    "socket",
+    "--tpm2",
+    "--tpmstate", "dir=" & tpmStateDir,
+    # Into the run directory, for the same reason QEMU's own stdout goes
+    # to ``qemu-stdio.log``: swtpm writes to stderr while it runs (it
+    # announces "Data client disconnected" whenever a guest goes away),
+    # and with ``poParentStreams`` that lands in the middle of the
+    # calling test's output.
+    "--log", "file=" & (runDir / "swtpm.log"),
+    "--ctrl", "type=unixio,path=" & socketPath]
+  var p: Process
+  try:
+    p = startProcess(b.swtpmCmd, args = args,
+                     # Keep the direct child pid: poDaemon can detach
+                     # through an intermediate process and leave the real
+                     # swtpm orphaned and impossible to reap.
+                     options = {poUsePath, poParentStreams},
+                     workingDir = runDir)
+  except CatchableError as e:
+    raise newVmHarnessError($b.id, lpStartup,
+      "QemuBootBackend: failed to start " & b.swtpmCmd &
+      " (BootMediaSpec.tpmEnabled is set): " & e.msg)
+  result = p.processID
+  # Readiness is the control socket existing. QEMU's tpm-emulator backend
+  # connects to it during device realisation, so starting QEMU first
+  # would be a race that fails the boot rather than the assertion.
+  let deadline = epochTime() + DefaultSwtpmStartTimeoutSec.float
+  while epochTime() < deadline:
+    if pathExists(socketPath):
+      return
+    if not p.running:
+      raise newVmHarnessError($b.id, lpStartup,
+        "QemuBootBackend: swtpm exited before creating its control " &
+        "socket " & socketPath)
+    sleep(50)
+  stopStartedProcess(result)
+  raise newVmHarnessError($b.id, lpStartup,
+    "QemuBootBackend: swtpm did not create its control socket " &
+    socketPath & " within " & $DefaultSwtpmStartTimeoutSec & "s")
 
 proc prepareOverlay(b: QemuBootBackend, runDir, source, sourceFormat: string):
     tuple[path, format: string] =
@@ -436,7 +565,10 @@ method bootFromMedia*(b: QemuBootBackend, spec: BootMediaSpec): VmHandle =
 
     # Everything below can fail; a half-built VM must not leak a process,
     # an overlay or a socket, so the whole body runs under one guard.
+    # ``swtpmPid`` is tracked alongside ``pid`` because a vTPM boot owns
+    # TWO children and either one can be the one that leaks.
     var pid = 0
+    var swtpmPid = 0
     var handle: VmHandle
     try:
       let serialLogPath =
@@ -464,7 +596,15 @@ method bootFromMedia*(b: QemuBootBackend, spec: BootMediaSpec): VmHandle =
         accel: resolveQemuAccel(spec.acceleration),
         sshForwardPort: spec.sshForwardPort)
 
-      let generation = if spec.generation > 0: spec.generation else: 2
+      # A direct kernel boot has no bootloader to hand control to, so the
+      # firmware generation only decides which stub loads the kernel.
+      # Default it to legacy BIOS: OVMF's fw_cfg kernel loader adds
+      # seconds of firmware initialisation to a guest whose whole point
+      # is to be measured in seconds. An explicit generation still wins.
+      let generation =
+        if spec.generation > 0: spec.generation
+        elif spec.kind == bmkKernel: 1
+        else: 2
       if generation notin [1, 2]:
         raise newException(ValueError,
           "BootMediaSpec.generation must be 1 (BIOS) or 2 (UEFI)")
@@ -509,8 +649,32 @@ method bootFromMedia*(b: QemuBootBackend, spec: BootMediaSpec): VmHandle =
         let overlay = b.prepareOverlay(runDir, spec.mediaPath, sourceFormat)
         launch.diskPath = overlay.path
         launch.diskFormat = overlay.format
+      of bmkKernel:
+        launch.kernelPath = absolutePath(spec.mediaPath)
+        let initrd = spec.extra.getOrDefault("initrdPath")
+        if initrd.len > 0:
+          if not fileExists(initrd):
+            raise newException(IOError,
+              "BootMediaSpec.extra[\"initrdPath\"] does not exist: " & initrd)
+          launch.initrdPath = absolutePath(initrd)
+        launch.kernelCmdline = spec.extra.getOrDefault("kernelCmdline")
       of bmkRootfsTar:
         doAssert false          # guarded above
+
+      # swtpm must be listening before QEMU realises its tpm-emulator
+      # device, so it starts first — and from here on the guard below has
+      # two children to clean up rather than one.
+      var tpmSocketPath = ""
+      if spec.tpmEnabled:
+        if not b.swtpmAvailable():
+          raise newVmHarnessError($b.id, lpStartup,
+            "QemuBootBackend: BootMediaSpec.tpmEnabled requires '" &
+            b.swtpmCmd & "' on PATH (it is pkgs.swtpm, and it is in the " &
+            "vm-harness and reprobuild dev shells). Refusing to boot a " &
+            "guest without the TPM it asked for.")
+        tpmSocketPath = b.tpmSocketPathFor(vmName)
+        swtpmPid = b.startSwtpmInBackground(runDir, tpmSocketPath)
+        launch.tpmSocketPath = tpmSocketPath
 
       let args = buildQemuBootArgs(launch)
       let stdioLog = runDir / "qemu-stdio.log"
@@ -549,6 +713,10 @@ method bootFromMedia*(b: QemuBootBackend, spec: BootMediaSpec): VmHandle =
       extra["serialLogPath"] = serialLogPath
       extra["serialSocketPath"] = socketPath
       extra["qemuStdioLogPath"] = stdioLog
+      if swtpmPid > 0:
+        extra["swtpmPid"] = $swtpmPid
+        extra["tpmSocketPath"] = tpmSocketPath
+        extra["tpmStateDir"] = runDir / "tpm"
       if launch.diskPath.len > 0:
         extra["bootDiskPath"] = launch.diskPath
       if spec.targetDiskPath.len > 0:
@@ -567,9 +735,18 @@ method bootFromMedia*(b: QemuBootBackend, spec: BootMediaSpec): VmHandle =
     except CatchableError:
       if pid > 0:
         stopStartedProcess(pid)
+      # QEMU first, then swtpm: killing the TPM out from under a live
+      # QEMU is a needless way to make a startup failure look like a TPM
+      # failure in the logs.
+      if swtpmPid > 0:
+        stopStartedProcess(swtpmPid)
       try:
         let sock = b.serialSocketPathFor(vmName)
         if pathExists(sock): removeFile(sock)
+      except CatchableError: discard
+      try:
+        let tpmSock = b.tpmSocketPathFor(vmName)
+        if pathExists(tpmSock): removeFile(tpmSock)
       except CatchableError: discard
       try:
         if dirExists(runDir): removeDir(runDir)
@@ -590,9 +767,19 @@ method stopAndCleanup*(b: QemuBootBackend, vm: VmHandle,
     if pidText.len > 0:
       try: stopStartedProcess(parseInt(pidText))
       except ValueError: discard
+    # swtpm outlives its QEMU: it is not a child of QEMU and nothing
+    # makes it exit when the guest powers off, so a run that forgot this
+    # would leave one swtpm per boot behind for as long as the host runs.
+    let swtpmPidText = vm.extra.getOrDefault("swtpmPid", "")
+    if swtpmPidText.len > 0:
+      try: stopStartedProcess(parseInt(swtpmPidText))
+      except ValueError: discard
     let sock = vm.extra.getOrDefault("serialSocketPath", "")
     if sock.len > 0 and pathExists(sock):
       try: removeFile(sock) except CatchableError: discard
+    let tpmSock = vm.extra.getOrDefault("tpmSocketPath", "")
+    if tpmSock.len > 0 and pathExists(tpmSock):
+      try: removeFile(tpmSock) except CatchableError: discard
     if deleteVm:
       let runDir = vm.extra.getOrDefault("runDir", "")
       # A caller-owned install target may live outside the run dir; the
@@ -727,14 +914,54 @@ proc qemuBootProcessesMatching*(namePrefix: string): seq[tuple[pid: int, name: s
   else:
     discard
 
+proc qemuBootSwtpmProcessesMatching*(stateDir, namePrefix: string):
+    seq[tuple[pid: int, stateArg: string]] =
+  ## Every live ``swtpm`` this backend started, found the same way as the
+  ## QEMU children: by an argument only this backend produces. swtpm has
+  ## no ``-name``, so the handle is its ``--tpmstate dir=`` value, which
+  ## is always ``<stateDir>/<namePrefix>…/tpm``.
+  ##
+  ## This exists because swtpm is the one process a boot owns that is NOT
+  ## a child of QEMU: nothing reaps it when the guest powers off, so
+  ## "did teardown run?" has to be answerable from the process table.
+  when defined(linux):
+    let wanted = "dir=" & stateDir / namePrefix
+    for kind, path in walkDir("/proc"):
+      if kind != pcDir:
+        continue
+      let base = extractFilename(path)
+      var pid = 0
+      try: pid = parseInt(base) except ValueError: continue
+      var cmdline = ""
+      try:
+        cmdline = readFile(path / "cmdline")
+      except CatchableError:
+        continue
+      for arg in cmdline.split('\0'):
+        if arg.startsWith(wanted) and arg.endsWith("/tpm"):
+          result.add((pid: pid, stateArg: arg))
+          break
+  else:
+    discard
+
 proc sweepStaleQemuBootProcesses*(b: QemuBootBackend): seq[string] =
-  ## Kill every live QEMU carrying this backend's name prefix and remove
-  ## its run directory. Returns the names swept. Intended for a harness
-  ## to call at start-up, never for a caller to substitute for teardown.
+  ## Kill every live QEMU carrying this backend's name prefix, every
+  ## swtpm holding state under this backend's state directory, and remove
+  ## their run directories. Returns the names swept. Intended for a
+  ## harness to call at start-up, never for a caller to substitute for
+  ## teardown.
   for entry in qemuBootProcessesMatching(b.namePrefix):
     stopStartedProcess(entry.pid)
     result.add(entry.name)
     let runDir = b.runDirFor(entry.name)
+    try:
+      if dirExists(runDir): removeDir(runDir)
+    except CatchableError: discard
+  for entry in qemuBootSwtpmProcessesMatching(b.stateDir, b.namePrefix):
+    stopStartedProcess(entry.pid)
+    result.add(entry.stateArg)
+    # ``dir=<stateDir>/<name>/tpm`` -> ``<stateDir>/<name>``
+    let runDir = parentDir(entry.stateArg[len("dir=") .. ^1])
     try:
       if dirExists(runDir): removeDir(runDir)
     except CatchableError: discard
@@ -744,5 +971,6 @@ registerBackend(biQemuBoot,
     newQemuBootBackend(
       qemuCmd = getEnv("VMH_QEMU_BOOT_QEMU_CMD", "qemu-system-x86_64"),
       qemuImgCmd = getEnv("VMH_QEMU_BOOT_QEMU_IMG_CMD", "qemu-img"),
+      swtpmCmd = getEnv("VMH_QEMU_BOOT_SWTPM_CMD", "swtpm"),
       stateDir = getEnv("VM_HARNESS_QEMU_BOOT_STATE_DIR", ""),
       namePrefix = getEnv("VMH_QEMU_BOOT_NAME_PREFIX", QemuBootNamePrefix)))

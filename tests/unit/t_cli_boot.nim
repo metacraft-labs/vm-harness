@@ -91,6 +91,45 @@ suite "CLI boot media":
     check resolveBootBackendId(opts, bmkQcow2, hpWindows) == biHyperv
     check resolveBootBackendId(opts, bmkQcow2, hpLinux) == biLibvirt
 
+  test "vTPM and secure boot are off unless the caller asks for them":
+    # ``--tpm`` and ``--secure-boot`` are the only way a caller can reach
+    # ``BootMediaSpec.tpmEnabled`` / ``secureBootEnabled`` from the command
+    # line. Both polarities, because a flag that is always on is the same
+    # defect as a spec field no backend reads.
+    let plain = parseCliOpts(@["boot", "--source-image", "reproos.qcow2"])
+    check not plain.tpmEnabled
+    check not plain.secureBootEnabled
+    let armed = parseCliOpts(@["boot", "--source-image", "reproos.qcow2",
+                               "--tpm", "--secure-boot"])
+    check armed.tpmEnabled
+    check armed.secureBootEnabled
+
+  test "the parser records whether a generation was actually requested":
+    # A direct kernel boot defaults to legacy BIOS, which only works if
+    # "nobody said" is distinguishable from "the caller asked for 2".
+    check not parseCliOpts(@["boot", "--source-image", "bzImage"]).generationSet
+    let explicit = parseCliOpts(@["boot", "--source-image", "bzImage",
+                                  "--generation", "2"])
+    check explicit.generationSet
+    check explicit.generation == 2
+
+  test "kernel media must be asked for, never inferred":
+    check parseBootMediaKind("kernel", "bzImage") == bmkKernel
+    expect ValueError:
+      discard parseBootMediaKind("auto", "bzImage")
+
+  test "a kernel boot carries its initramfs and cmdline and picks qemu-boot":
+    # libvirt's bootFromMedia rejects bmkKernel outright, so auto-selection
+    # routing there would turn a supported boot into a hard failure.
+    let opts = parseCliOpts(@["boot", "--source-image", "bzImage",
+                              "--kind", "kernel",
+                              "--initrd", "initramfs.gz",
+                              "--kernel-cmdline", "console=ttyS0 panic=1"])
+    check opts.initrd == "initramfs.gz"
+    check opts.kernelCmdline == "console=ttyS0 panic=1"
+    check resolveBootBackendId(opts, bmkKernel, hpLinux) == biQemuBoot
+    check resolveBootBackendId(opts, bmkQcow2, hpLinux) == biLibvirt
+
   test "content-addressed output directories select their newest image":
     let root = createTempDir("vmh-cli-boot", "")
     defer: removeDir(root)

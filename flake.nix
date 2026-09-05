@@ -28,6 +28,11 @@
       perSystem =
         { pkgs, system, ... }:
         let
+          # The vTPM gate's Linux guest (kernel + busybox initramfs). Only
+          # meaningful on Linux, where the gate runs.
+          guest-linux-tpm =
+            if pkgs.stdenv.isLinux then import ./nix/guest-linux-tpm.nix { inherit pkgs; } else null;
+
           backendTools =
             if pkgs.stdenv.isDarwin then
               [
@@ -125,6 +130,10 @@
             # The fast-booting libvirt test golden needs a Linux kernel,
             # module tree, and qemu-img, so it is not exported on Darwin.
             golden-linux-tiny = import ./nix/golden-linux-tiny.nix { inherit pkgs; };
+            # The vTPM gate's guest: a stock kernel plus a busybox
+            # initramfs that reports what it sees of /dev/tpm0. Same
+            # reason it is Linux-only.
+            inherit guest-linux-tpm;
           };
 
           checks = {
@@ -160,6 +169,12 @@
                 # operator override.
                 export VMH_OVMF_CODE="''${VMH_OVMF_CODE:-${pkgs.OVMF.fd}/FV/OVMF_CODE.fd}"
                 export VMH_OVMF_VARS="''${VMH_OVMF_VARS:-${pkgs.OVMF.fd}/FV/OVMF_VARS.fd}"
+                # The vTPM gate's guest, pinned the same way. Naming the
+                # store path here is what lets
+                # tests/integration/t_guest_sees_tpm_device.nim run with
+                # no network and no build step of its own: entering the
+                # shell realises it once. Respects an operator override.
+                export VMH_TPM_GUEST_DIR="''${VMH_TPM_GUEST_DIR:-${guest-linux-tpm}}"
               ''}
               echo "vm-harness dev shell"
               echo "  nim:    $(nim --version | head -n1)"

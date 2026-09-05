@@ -1,10 +1,15 @@
 ## Ordered serial-console boot assertions over the direct-QEMU backend.
 ##
-## *What it is.* Give it a disk image and an ordered list of regex lines
-## you expect the guest to print on its serial console, and it boots the
-## image under QEMU, matches the lines in order with a per-line timeout,
-## captures the whole serial transcript as an artifact — on success AND
-## on failure — and tears the VM down on every exit path.
+## *What it is.* Give it a disk image (or a kernel + initramfs) and an
+## ordered list of regex lines you expect the guest to print on its serial
+## console, and it boots the image under QEMU, matches the lines in order
+## with a per-line timeout, captures the whole serial transcript as an
+## artifact — on success AND on failure — and tears the VM down on every
+## exit path.
+##
+## ``tpmEnabled`` attaches a virtual TPM 2.0 for the run; the swtpm that
+## backs it is torn down on the same paths as the QEMU process, so a
+## missed line or a timeout cannot leave one behind.
 ##
 ## *Why it lives here.* Everything it does is composed from Tier-1
 ## primitives that already live in this repository:
@@ -51,10 +56,17 @@ type
     caseName*: string             ## used in artifact filenames
     imagePath*: string
     imageFormat*: string          ## "qcow2" (default) or "raw"
-    generation*: int              ## 1 = legacy BIOS, 2 = UEFI/OVMF (default)
+    kernelPath*: string           ## direct kernel boot; mutually exclusive
+                                  ## with ``imagePath``
+    initrdPath*: string           ## optional, direct kernel boot only
+    kernelCmdline*: string        ## optional, direct kernel boot only
+    generation*: int              ## 1 = legacy BIOS, 2 = UEFI/OVMF.
+                                  ## 0 ⇒ the backend's default, which is 2
+                                  ## for a disk image and 1 for a kernel.
     cpus*: int
     memoryMB*: int
     acceleration*: BootAcceleration
+    tpmEnabled*: bool             ## attach a virtual TPM 2.0 (swtpm)
     steps*: seq[BootSmokeStep]
     artifactDir*: string          ## "" ⇒ resolveArtifactDir()
     namePrefix*: string           ## "" ⇒ QemuBootNamePrefix
@@ -246,18 +258,40 @@ proc runBootSmoke*(spec: BootSmokeSpec): BootSmokeResult =
     return
   result.runDir = backend.runDirFor(vmName)
 
+  if spec.kernelPath.len > 0 and spec.imagePath.len > 0:
+    result.failureMessage =
+      "boot-smoke: kernelPath and imagePath are mutually exclusive; " &
+      "a direct kernel boot has no disk to boot from"
+    return
+  if spec.kernelPath.len == 0 and
+      (spec.initrdPath.len > 0 or spec.kernelCmdline.len > 0):
+    result.failureMessage =
+      "boot-smoke: initrdPath/kernelCmdline require a kernelPath"
+    return
+
   var extra = initTable[string, string]()
   if spec.imageFormat.len > 0:
     extra["diskFormat"] = spec.imageFormat
+  if spec.initrdPath.len > 0:
+    extra["initrdPath"] = spec.initrdPath
+  if spec.kernelCmdline.len > 0:
+    extra["kernelCmdline"] = spec.kernelCmdline
+  let directKernel = spec.kernelPath.len > 0
   let media = BootMediaSpec(
     name: vmName,
-    kind: bmkQcow2,
-    mediaPath: spec.imagePath,
+    kind: (if directKernel: bmkKernel else: bmkQcow2),
+    mediaPath: (if directKernel: spec.kernelPath else: spec.imagePath),
     cpus: (if spec.cpus > 0: spec.cpus else: 2),
     memoryMB: (if spec.memoryMB > 0: spec.memoryMB else: 1024),
-    generation: (if spec.generation > 0: spec.generation else: 2),
+    # 0 lets the backend choose: UEFI for a disk image (which needs a
+    # bootloader the firmware can find), legacy BIOS for a kernel (which
+    # needs no bootloader and boots seconds faster without OVMF).
+    generation: (if spec.generation > 0: spec.generation
+                 elif directKernel: 0
+                 else: 2),
     acceleration: spec.acceleration,
     graphics: bgNone,
+    tpmEnabled: spec.tpmEnabled,
     serialLogPath: serialLogPath,
     extra: extra)
 
@@ -294,6 +328,33 @@ proc runBootSmoke*(spec: BootSmokeSpec): BootSmokeResult =
       backend.closeSerial(stream)
     if vm != nil:
       backend.stopAndCleanup(vm, deleteVm = true)
+
+  # A pass whose transcript is not on disk afterwards is not a pass we can
+  # stand behind. The assertions ran against bytes the harness read; if the
+  # artifact those bytes were supposed to be durably recorded in is missing
+  # or empty by the time the run ends, then either QEMU never owned that
+  # file or something else rewrote it — and in both cases the evidence for
+  # the green result no longer exists. Turning that into a loud failure
+  # here is cheap, and it is the difference between a diagnosable report
+  # and a silent inconsistency between a [OK] line and a 0-byte artifact.
+  if result.outcome == bsPassed:
+    var transcriptBytes = -1
+    try:
+      if fileExists(result.serialLogPath):
+        transcriptBytes = int(getFileSize(result.serialLogPath))
+    except CatchableError:
+      transcriptBytes = -1
+    if transcriptBytes <= 0:
+      result.outcome = bsSetupFailed
+      result.failureMessage =
+        "boot-smoke: every expected line matched, but the serial " &
+        "transcript is " &
+        (if transcriptBytes < 0: "missing" else: "empty") & " after the " &
+        "run: " & result.serialLogPath & "\n" &
+        "  The assertions passed against bytes that are no longer on " &
+        "disk, so this result is not reproducible and is reported as a " &
+        "failure rather than a pass."
+
   result.elapsedMs = int((epochTime() - started) * 1000)
 
 proc serialLogExcerpt*(path: string, maxBytes = 4000): string =

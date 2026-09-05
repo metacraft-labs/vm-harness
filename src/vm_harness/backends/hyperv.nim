@@ -644,6 +644,10 @@ proc buildNewBootVmCommand*(b: HyperVBackend, spec: BootMediaSpec,
       raise newException(BackendUnavailableError,
         "HyperVBackend.bootFromMedia: bmkRootfsTar is WSL-specific; " &
         "use WslBackend for tarball boots")
+    of bmkKernel:
+      raise newException(BackendUnavailableError,
+        "HyperVBackend.bootFromMedia: bmkKernel (direct kernel boot) has " &
+        "no Hyper-V equivalent; use the qemu-boot backend")
   let memMB = if spec.memoryMB > 0: spec.memoryMB else: 2048
   let cpus  = if spec.cpus > 0: spec.cpus else: 2
   let generation = if spec.generation > 0: spec.generation else: 2

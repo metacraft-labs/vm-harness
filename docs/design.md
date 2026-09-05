@@ -286,6 +286,7 @@ Tracked as a future vm-harness milestone (not yet numbered).
 - **Revert**: `virsh snapshot-revert <domain> <baseline> --running` (native qcow2 snapshot).
 - **Auth**: cloud-init injects SSH pubkey for Linux; autounattend creates admin user for Windows.
 - **Cleanup**: `virsh shutdown <domain>` then `virsh undefine --remove-all-storage <domain>` (only for ephemeral domains; baseline domains preserved).
+- **TPM**: on the transient `bootFromMedia` path, `BootMediaSpec.tpmEnabled` emits `--tpm emulator,model=tpm-tis,version=2.0` (`transientBootTpmArgs`), and nothing when it is false. `emulator` makes **libvirtd** own the swtpm lifecycle — it starts one per domain, keeps its state under the domain's directory and reaps it when the domain goes away — which is why this backend deliberately does *not* copy `qemu_boot.nim`'s hand-rolled swtpm supervision. `version=2.0` is pinned rather than left to libvirt's default, which is 1.2 on some releases. The `EphemeralCloneSpec` clone path (`buildEphemeralDomainXml`) has no `tpmEnabled` field and therefore nothing to honour; the Windows-golden install argv (`buildVirtInstallArgs`) deliberately emits no TPM at all and relies on the autounattend's `LabConfig` bypass keys instead.
 
 ### 4.6 qemu-boot (HostPlatform: hpLinux; Guests: goLinux, goWindows)
 
@@ -301,11 +302,24 @@ A **daemon-less direct-boot** backend (`backends/qemu_boot.nim`). It implements 
 
 - **Serial device**: one `-chardev socket` carrying QEMU's own `logfile=`, wired to `-serial`. QEMU writes every guest byte to the log from the first firmware byte onward whether or not anything is connected, so reads poll a plain file (no reader thread, no connect race). `serialSend` connects to the socket, writes, drains briefly and disconnects — never holding the connection means the harness cannot back-pressure the guest's console by failing to drain it.
 - **Disk**: always a qcow2 CoW overlay over the caller's image, inside the run directory. The artifact under test is never mutated.
-- **Firmware**: `generation: 2` resolves an OVMF pair and copies the NVRAM *template* to a per-VM writable file; `generation: 1` boots SeaBIOS.
-- **Acceleration**: `baAuto` picks KVM when `/dev/kvm` is openable read-write and TCG otherwise, so the backend works in a container with no `/dev/kvm`.
-- **Naming**: every VM name must start with the backend's configured `namePrefix`, which is what lets `sweepStaleQemuBootProcesses` recognise what the harness owns (it matches the `-name <prefix>…` argv entry, never "is a qemu process").
-- **Cleanup**: `stopAndCleanup` SIGTERMs then SIGKILLs the child and removes the run directory — overlay, NVRAM copy, chardev socket and QEMU's own logs together. Idempotent and safe from a `finally`. Callers should place `BootMediaSpec.serialLogPath` *outside* the run directory so the transcript survives as an artifact.
-- **TPM**: not wired here (see `qemu_windows_arm.nim` for the swtpm lifecycle to copy). `buildQemuBootArgs` is a pure function over a value type so adding the `-tpmdev` trio stays a local, unit-testable change.
+- **Direct kernel boot**: `BootMediaKind.bmkKernel` treats `mediaPath` as a kernel image and takes `extra["initrdPath"]` / `extra["kernelCmdline"]`, emitting `-kernel` / `-initrd` / `-append`. There is no disk, bootloader or partition table, so a purpose-built guest reaches userspace in about a second — which is what makes an unconditional, non-skipping boot gate affordable. It is a qemu-boot capability only: `hyperv` and `libvirt` reject `bmkKernel` explicitly rather than falling through to a disk boot.
+- **Firmware**: `generation: 2` resolves an OVMF pair and copies the NVRAM *template* to a per-VM writable file; `generation: 1` boots SeaBIOS. The default is 2, except for `bmkKernel` where it is 1 — OVMF's fw_cfg kernel loader adds seconds of firmware initialisation to a guest whose whole point is to be measured in seconds.
+- **Acceleration**: `baAuto` picks KVM when `/dev/kvm` is openable read-write and TCG otherwise, so the backend works in a container with no `/dev/kvm`. The existence probe must be `pathExists`, not `fileExists`: `/dev/kvm` is a character device and `fileExists` is `S_ISREG`.
+- **Naming**: every VM name must start with the backend's configured `namePrefix`, which is what lets `sweepStaleQemuBootProcesses` recognise what the harness owns (it matches the `-name <prefix>…` argv entry, never "is a qemu process"). swtpm carries no `-name`, so the sweep matches it on its `--tpmstate dir=<stateDir>/<prefix>…/tpm` argument instead.
+- **Cleanup**: `stopAndCleanup` SIGTERMs then SIGKILLs the child and removes the run directory — overlay, NVRAM copy, chardev socket, swtpm state and QEMU's own logs together. It also kills the swtpm, which is *not* a child of QEMU and is reaped by nothing else. Idempotent and safe from a `finally`. Callers should place `BootMediaSpec.serialLogPath` *outside* the run directory so the transcript survives as an artifact.
+- **TPM**: `BootMediaSpec.tpmEnabled` starts a per-VM `swtpm socket --tpm2` whose state directory lives inside the run directory, waits for its control socket, and appends the QEMU trio:
+
+  ```
+  -chardev socket,id=chrtpm,path=<swtpm ctrl socket>
+  -tpmdev emulator,id=tpm0,chardev=chrtpm
+  -device tpm-tis,tpmdev=tpm0
+  ```
+
+  Three things about that trio are load-bearing. The device is **`tpm-tis`** — `qemu_windows_arm.nim`, the backend this lifecycle is modelled on, emits `tpm-tis-device`, which is aarch64's spelling and does not exist on x86_64. The chardev is swtpm's **control** channel, not a data channel: QEMU's `emulator` backend hands swtpm a socketpair for data itself. And the trio is appended **last**, so the TPM argv is exactly the TPM-less argv plus six entries — an invariant `t_tpm_device_args` asserts, because a vTPM change that also perturbed the machine model or the serial wiring would make the two polarities of every other boot gate incomparable.
+
+  A missing `swtpm` is a hard failure, never a silent TPM-less boot. Availability is deliberately *not* folded into `probeAvailability`: a TPM-less boot must not become unavailable because swtpm is absent, and a TPM-requiring boot must not be skipped because it is.
+
+  Both polarities are gated. `tests/unit/t_tpm_device_args.nim` asserts the argv is present when enabled and absent when not; `tests/integration/t_guest_sees_tpm_device.nim` boots a real Linux guest (`nix/guest-linux-tpm.nix` — a stock nixpkgs `bzImage` plus a busybox initramfs, direct-kernel-booted) and asserts the guest reports `/dev/tpm0` plus a real TPM2_GetCapability(FAMILY_INDICATOR) response of `"2.0"` with the flag, and no TPM device without it.
 
 ## 5. In-guest scripts (Tier-1 only)
 
@@ -405,6 +419,21 @@ REVERT-AND-EXEC (one-shot — provisions if needed, reverts, execs, cleans up):
     [--copy-from guest:host ...] \
     [--install-shim binary:logpath ...] \
     -- <command args>
+
+BOOT (assert on OS bring-up over the serial console):
+  vm-harness boot \
+    --backend <libvirt|hyperv|qemu-boot|auto> \
+    --source-image <path> \
+    [--kind <auto|iso|qcow2|vhdx|rootfs-tar|kernel>] \
+    [--initrd <path>] [--kernel-cmdline <string>] \
+    [--generation <1|2>] [--tpm] [--secure-boot] \
+    [--expect <regex>] [--keep | --viewer | --screenshot <path>]
+
+  `--tpm` sets `BootMediaSpec.tpmEnabled`; `--secure-boot` sets
+  `BootMediaSpec.secureBootEnabled`. Both are threaded through — a spec
+  field no caller can set is the same defect as one no backend reads.
+  `--initrd` / `--kernel-cmdline` are valid only with `--kind kernel`,
+  which auto-selects the `qemu-boot` backend on Linux.
 
 PROBE (capability detection):
   vm-harness probe

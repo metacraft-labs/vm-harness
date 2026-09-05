@@ -30,6 +30,7 @@ import ./backends/wsl
 import ./backends/tart
 import ./backends/utm
 import ./backends/qemu_windows_arm
+import ./backends/qemu_boot
 import ./backends/lima
 import ./backends/libvirt
 import ./backends/incus
@@ -53,6 +54,12 @@ type
     mediaKind*: string
     expectPattern*: string
     generation*: int
+    generationSet*: bool
+      ## Distinguishes "the caller asked for generation 2" from "nobody
+      ## said", so ``bmkKernel``'s legacy-BIOS default is not silently
+      ## overridden by this parser's own default.
+    tpmEnabled*: bool
+    secureBootEnabled*: bool
     acceleration*: string
     graphics*: string
     videoModel*: string
@@ -242,12 +249,19 @@ Common flags:
   --source-image <ref>
   --secondary-iso <path>          `boot`/`install`: attach a second read-only ISO.
   --target-disk <path>            `install`: create and preserve this blank disk.
-  --kind <auto|iso|qcow2|vhdx|rootfs-tar>
+  --kind <auto|iso|qcow2|vhdx|rootfs-tar|kernel>
                                   Media kind for `boot` (default: extension).
+                                  `kernel` direct-boots --source-image as a
+                                  Linux kernel (qemu-boot backend); pair it
+                                  with --initrd and --kernel-cmdline below.
   --expect <regex>                `boot`: wait for a serial-console match.
   --wait-for-shutdown             `boot`: require a clean guest poweroff after
                                   the serial assertion before cleanup.
-  --generation <1|2>             `boot`: legacy BIOS or UEFI (default: 2).
+  --generation <1|2>             `boot`: legacy BIOS or UEFI (default: 2,
+                                  or 1 for --kind kernel).
+  --tpm                          `boot`: attach a virtual TPM 2.0 (swtpm).
+  --secure-boot                  `boot`: request a secure-boot firmware
+                                  profile (needs key-enrolled OVMF vars).
   --acceleration <auto|kvm|tcg> `boot`: execution mode (default: auto).
   --graphics <none|vnc|spice>    `boot`: graphical console (default: none).
   --video <model>                `boot`: video model (default: virtio).
@@ -305,10 +319,10 @@ Common flags:
                                   --ephemeral.
   --kernel <path>                 libvirt-only: optional direct-kernel-boot
                                   bzImage for --ephemeral (tiny Linux golden).
-  --initrd <path>                 libvirt-only: optional initramfs for the
-                                  direct-kernel ephemeral boot.
-  --kernel-cmdline <str>          libvirt-only: optional kernel cmdline for the
-                                  direct-kernel ephemeral boot.
+  --initrd <path>                 Initramfs for a direct-kernel boot: the
+                                  libvirt --ephemeral clone, or `boot --kind
+                                  kernel` on the qemu-boot backend.
+  --kernel-cmdline <str>          Kernel cmdline for the same two paths.
   --output-dir <path>
   --ephemeral-prefix <prefix>     Backend-specific prefix for ephemeral VMs.
   --env KEY=VAL                   (repeatable)
@@ -439,6 +453,13 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       result.generation = parseInt(args[i])
       if result.generation notin [1, 2]:
         raise newException(ValueError, "--generation expects 1 or 2")
+      result.generationSet = true
+      inc i
+    of "--tpm":
+      result.tpmEnabled = true
+      inc i
+    of "--secure-boot":
+      result.secureBootEnabled = true
       inc i
     of "--acceleration":
       inc i
@@ -736,14 +757,15 @@ proc parseBootMediaKind*(value, mediaPath: string): BootMediaKind =
     else:
       raise newException(ValueError,
         "boot: cannot infer media kind from: " & mediaPath &
-        "; pass --kind iso|qcow2|vhdx|rootfs-tar")
+        "; pass --kind iso|qcow2|vhdx|rootfs-tar|kernel")
   of "iso": bmkIso
   of "qcow2": bmkQcow2
   of "vhdx": bmkVhdx
   of "rootfs-tar": bmkRootfsTar
+  of "kernel": bmkKernel
   else:
     raise newException(ValueError,
-      "boot: --kind expects auto|iso|qcow2|vhdx|rootfs-tar, got '" &
+      "boot: --kind expects auto|iso|qcow2|vhdx|rootfs-tar|kernel, got '" &
       value & "'")
 
 proc resolveBootBackendId*(opts: CliOpts; mediaKind: BootMediaKind;
@@ -757,7 +779,9 @@ proc resolveBootBackendId*(opts: CliOpts; mediaKind: BootMediaKind;
     if mediaKind == bmkRootfsTar:
       raise newException(ValueError,
         "boot: rootfs tar media is supported by the Windows WSL backend only")
-    biLibvirt
+    # Direct kernel boot is a qemu-boot capability; libvirt's
+    # bootFromMedia rejects it, so auto-selection must not route there.
+    if mediaKind == bmkKernel: biQemuBoot else: biLibvirt
   of hpMacosArm:
     raise newException(ValueError,
       "boot: no macOS backend currently implements bootFromMedia; " &
@@ -836,6 +860,10 @@ proc cmdBoot(opts: CliOpts; installMode = false): int =
   if opts.targetDiskPath.len > 0 and mediaKind != bmkIso:
     raise newException(ValueError,
       "--target-disk is valid only when booting installer ISO media")
+  if mediaKind != bmkKernel and
+      (opts.initrd.len > 0 or opts.kernelCmdline.len > 0):
+    raise newException(ValueError,
+      "boot: --initrd and --kernel-cmdline are valid only with --kind kernel")
   let id = resolveBootBackendId(opts, mediaKind, detectHostPlatform())
   let backend = newBackend(id, noopFallback = opts.allowNoopFallback)
   if not backend.probeAvailability():
@@ -889,6 +917,10 @@ proc cmdBoot(opts: CliOpts; installMode = false): int =
     extra["uefiLoader"] = absolutePath(opts.uefiLoader)
   if opts.uefiNvramTemplate.len > 0:
     extra["uefiNvramTemplate"] = absolutePath(opts.uefiNvramTemplate)
+  if opts.initrd.len > 0:
+    extra["initrdPath"] = absolutePath(opts.initrd)
+  if opts.kernelCmdline.len > 0:
+    extra["kernelCmdline"] = opts.kernelCmdline
   let requestedGraphics =
     if opts.viewer and opts.graphics == "none": "vnc" else: opts.graphics
   let graphics = case requestedGraphics
@@ -911,8 +943,17 @@ proc cmdBoot(opts: CliOpts; installMode = false): int =
                      else: ""),
     cpus: (if opts.cpus > 0: opts.cpus else: 2),
     memoryMB: (if opts.memoryMB > 0: opts.memoryMB else: 4096),
-    generation: opts.generation,
-    secureBootEnabled: false,
+    # 0 means "backend default"; only bmkKernel has one that differs
+    # from this parser's 2, and only when the caller stayed silent.
+    generation: (if mediaKind == bmkKernel and not opts.generationSet: 0
+                 else: opts.generation),
+    # Both threaded from the CLI. ``secureBootEnabled`` was hardcoded
+    # false here, which made ``BootMediaSpec.secureBootEnabled``
+    # unreachable from the command line even though both the libvirt and
+    # Hyper-V backends honour it; a spec field no caller can set is the
+    # same defect as a spec field no backend reads.
+    secureBootEnabled: opts.secureBootEnabled,
+    tpmEnabled: opts.tpmEnabled,
     acceleration: acceleration,
     graphics: graphics,
     videoModel: opts.videoModel,

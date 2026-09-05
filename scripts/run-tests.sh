@@ -23,6 +23,7 @@ run_nim r --hints:off tests/unit/t_tart_shared_dirs.nim
 run_nim r --hints:off tests/unit/t_qemu_windows_arm_backend.nim
 run_nim r --hints:off tests/unit/t_qemu_windows_arm_overlay.nim
 run_nim r --hints:off tests/unit/t_qemu_boot_backend.nim
+run_nim r --hints:off tests/unit/t_tpm_device_args.nim
 run_nim r --hints:off tests/unit/t_windows_golden_recipe_hardening.nim
 run_nim r --hints:off tests/unit/t_tart_backend.nim
 run_nim r --hints:off tests/unit/t_lima_backend.nim
@@ -45,3 +46,9 @@ run_nim r --hints:off tests/integration/t_cli_libvirt_flags.nim
 # printed reason on non-Linux hosts; on Linux they never skip.
 run_nim r --hints:off tests/integration/t_boot_smoke_harness_fails_on_missing_line.nim
 run_nim r --hints:off tests/integration/t_boot_smoke_harness_tears_down_on_failure.nim
+
+# Live vTPM gate. Boots a real Linux guest (stock nixpkgs kernel + busybox
+# initramfs, `nix/guest-linux-tpm.nix`) with and without a swtpm-backed TPM
+# and asserts what the guest itself reports about /dev/tpm0. Needs
+# $VMH_TPM_GUEST_DIR, which the dev shell exports; on Linux it never skips.
+run_nim r --hints:off tests/integration/t_guest_sees_tpm_device.nim

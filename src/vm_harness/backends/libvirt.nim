@@ -1003,12 +1003,27 @@ proc buildVirtInstallArgs*(b: LibvirtBackend, name: string,
     # Microsoft-signed bootmgr off the Win11 install CD and stalls
     # at ``BdsDxe: No bootable option or device was found``.
     #
-    # Win11's setup-time policy only enforces TPM 2.0 (which the
-    # ``tpm`` block above provides); secure-boot enforcement at
-    # install time is checked but doesn't block installation when
-    # disabled at the firmware level. The runner workload doesn't
-    # need secure-boot post-install either — it's an ephemeral CI
-    # box that reverts to a clean snapshot between jobs.
+    # Win11's setup-time policy enforces TPM 2.0 as well as secure
+    # boot, and THIS ARGV EMITS NEITHER. There is no ``tpm`` block
+    # here — an earlier version of this comment claimed one "above",
+    # and no such block was ever written. What actually gets Setup
+    # past both checks is the autounattend, which writes the
+    # ``HKLM\SYSTEM\Setup\LabConfig`` bypass keys
+    # (``BypassTPMCheck``, ``BypassSecureBootCheck``, and the RAM /
+    # CPU / storage siblings) in its WindowsPE pass; see
+    # ``guest-recipes/windows-x64-base/autounattend.xml``. Secure-boot
+    # enforcement at install time is checked but doesn't block
+    # installation when disabled at the firmware level, and the runner
+    # workload doesn't need secure-boot post-install either — it's an
+    # ephemeral CI box that reverts to a clean snapshot between jobs.
+    #
+    # If this golden ever needs a real vTPM (measured boot, BitLocker,
+    # attestation), the piece to add is ``--tpm
+    # emulator,model=tpm-tis,version=2.0`` — the same string
+    # ``transientBootTpmArgs`` emits for ``BootMediaSpec.tpmEnabled``
+    # on the transient boot path — plus dropping the LabConfig keys.
+    # That is a change to the production Windows golden and is
+    # deliberately not made here.
     "--boot",
     "uefi,firmware.feature0.enabled=no,firmware.feature0.name=secure-boot,loader.secure=no",
     "--features", "smm.state=on",
@@ -2109,6 +2124,29 @@ proc transientBootFirmwareArgs*(spec: BootMediaSpec,
       ",loader.readonly=yes,loader.type=pflash,loader.secure=" & secure &
       ",nvram.template=" & nvramTemplate]
 
+proc transientBootTpmArgs*(spec: BootMediaSpec): seq[string] =
+  ## Translate ``BootMediaSpec.tpmEnabled`` to virt-install.
+  ##
+  ## ``emulator`` makes libvirtd own the swtpm lifecycle — it starts one
+  ## per domain, keeps its state under the domain's own directory, and
+  ## reaps it when the domain goes away. That is the reason this backend
+  ## does NOT copy ``qemu_boot.nim``'s hand-rolled swtpm supervision: a
+  ## second supervisor for a process libvirtd already owns is a way to
+  ## leak one, not a way to avoid leaking one.
+  ##
+  ## ``model=tpm-tis`` is the x86 TIS interface. (aarch64 spells the QEMU
+  ## *device* ``tpm-tis-device``; the libvirt *model* name is the same on
+  ## both, so this string is not architecture-dependent the way the raw
+  ## QEMU argv in ``qemu_boot.nim`` is.)
+  ##
+  ## Returns an empty seq when the field is false — the negative polarity
+  ## is a real requirement here, not an accident: a domain that quietly
+  ## acquired a TPM would let an attestation gate pass against firmware
+  ## the caller never asked for.
+  if not spec.tpmEnabled:
+    return @[]
+  @["--tpm", "emulator,model=tpm-tis,version=2.0"]
+
 proc transientBootGraphicsArgs*(spec: BootMediaSpec): seq[string] =
   ## Graphical consoles listen on loopback only. ``virtio`` is broadly
   ## supported by modern Linux guests while callers can select another model.
@@ -2207,6 +2245,15 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
       raise newException(BackendUnavailableError,
         "LibvirtBackend.bootFromMedia does not support bmkRootfsTar; " &
         "use WslBackend for tarball boots")
+    if spec.kind == bmkKernel:
+      # Not "cannot": ``buildEphemeralDomainXml`` already renders
+      # <kernel>/<initrd>/<cmdline> for the tiny golden, so the capability
+      # exists on the clone path. It is simply not wired to
+      # ``bootFromMedia``'s virt-install argv, and pretending otherwise by
+      # falling through to a disk boot would boot the wrong thing.
+      raise newException(BackendUnavailableError,
+        "LibvirtBackend.bootFromMedia does not support bmkKernel " &
+        "(direct kernel boot); use the qemu-boot backend")
     if spec.targetDiskPath.len > 0 and spec.kind != bmkIso:
       raise newException(ValueError,
         "BootMediaSpec.targetDiskPath is valid only with bmkIso")
@@ -2285,6 +2332,7 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
     argv.add(transientBootNetworkArgs(spec))
     argv.add("--noautoconsole")
     argv.add(transientBootFirmwareArgs(spec, ovmf.loader, ovmf.nvram))
+    argv.add(transientBootTpmArgs(spec))
     argv.add(transientBootGraphicsArgs(spec))
     argv.add(transientBootCompatibilityArgs())
     argv.add(transientBootSerialArgs(serialLogPath))
@@ -2303,7 +2351,7 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
         argv.add("size=" & $diskGB & ",format=qcow2,bus=virtio")
       argv.add("--cdrom")
       argv.add(spec.mediaPath)
-    of bmkRootfsTar:
+    of bmkRootfsTar, bmkKernel:
       doAssert false  # guarded above
     if spec.secondaryIsoPath.len > 0:
       argv.add("--disk")

@@ -189,6 +189,14 @@ type
     bmkVhdx = "vhdx"           ## boot from existing VHDX/VHD (no baseline)
     bmkQcow2 = "qcow2"         ## boot from qcow2 (libvirt/QEMU)
     bmkRootfsTar = "rootfs-tar" ## boot from tarball rootfs (WSL2)
+    bmkKernel = "kernel"       ## direct kernel boot (QEMU ``-kernel``)
+      ## ``mediaPath`` is a kernel image; ``extra["initrdPath"]`` and
+      ## ``extra["kernelCmdline"]`` carry the rest. There is no disk, no
+      ## bootloader and no partition table, so a purpose-built guest
+      ## reaches userspace in about a second — which is what makes an
+      ## unconditional, non-skipping boot gate affordable. Currently
+      ## realised by the ``qemu-boot`` backend only; the others reject it
+      ## explicitly rather than silently booting something else.
 
   BootGraphicsKind* = enum
     bgNone = "none"            ## no graphical console
@@ -221,16 +229,33 @@ type
     graphics*: BootGraphicsKind     ## graphical console; defaults to none
     videoModel*: string             ## backend video model; defaults to virtio
     sshForwardPort*: int            ## loopback host port forwarded to guest SSH
-    tpmEnabled*: bool               ## attach a virtual TPM 2.0 (Gen 2 / UEFI only)
+    tpmEnabled*: bool               ## attach a virtual TPM 2.0
       ## Windows 11 Setup refuses to install without TPM 2.0 — it fails at the
       ## "This PC can't run Windows 11" gate long before the autounattend's
       ## specialize pass runs, so this is not optional for a Win11 guest.
+      ## ReproOS attestation needs it for a different reason: without a TPM
+      ## there is nothing to quote.
       ##
-      ## Backends realise it differently and it is NOT free: on Hyper-V the vTPM
-      ## is backed by a key protector that must be created BEFORE the device is
-      ## added (``Set-VMKeyProtector`` then ``Enable-VMTPM``), which is why this
-      ## is a spec field rather than something a caller can bolt on afterwards.
-      ## libvirt/QEMU back it with swtpm instead.
+      ## Backends realise it differently and it is NOT free:
+      ##
+      ## - ``hyperv``: the vTPM is backed by a key protector that must be
+      ##   created BEFORE the device is added (``Set-VMKeyProtector`` then
+      ##   ``Enable-VMTPM``), which is why this is a spec field rather than
+      ##   something a caller can bolt on afterwards. Generation 2 only —
+      ##   Hyper-V has no vTPM for Generation 1 guests.
+      ## - ``qemu-boot``: the backend starts a per-VM ``swtpm`` in the run
+      ##   directory and passes QEMU an ``emulator`` tpmdev on a
+      ##   ``tpm-tis`` device (the x86 spelling; ``tpm-tis-device`` is
+      ##   aarch64's). Works under both generations, because QEMU publishes
+      ##   the TPM through the ACPI tables it generates itself rather than
+      ##   through the firmware.
+      ## - ``libvirt``: ``virt-install --tpm emulator,model=tpm-tis,
+      ##   version=2.0``; libvirtd owns the swtpm lifecycle.
+      ##
+      ## Backends that cannot honour it must say so rather than drop it: an
+      ## unimplemented vTPM has to be a loud failure, because a guest that
+      ## silently boots without a TPM looks exactly like a guest whose
+      ## attestation is broken.
     diskGB*: int                    ## bmkIso scratch boot disk size; defaults to 8
       ## Only consulted when the boot disk is created by the backend (bmkIso);
       ## for bmkVhdx the media IS the disk and this is ignored. The 8 GB default
