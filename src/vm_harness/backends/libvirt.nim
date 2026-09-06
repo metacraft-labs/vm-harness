@@ -325,10 +325,56 @@ proc domainExists*(b: LibvirtBackend, name: string): bool =
   let r = b.runVirsh(@["dominfo", name], timeoutSec = 30)
   r.exitCode == 0
 
+proc tryListAllDomainNames*(b: LibvirtBackend):
+    tuple[ok: bool; names: seq[string]; message: string] =
+  ## ``virsh list --all --name``, with the FAILURE distinguishable from an
+  ## empty list.
+  ##
+  ## The distinction is not pedantry, it is the whole safety property for any
+  ## caller that DELETES on the strength of the answer. "libvirtd is not
+  ## running", "this user cannot reach ``qemu:///system``" and "the URI is
+  ## wrong" all make ``virsh`` exit non-zero, and every one of them is "I do
+  ## not know which domains exist" — not "no domains exist". A caller that
+  ## cannot tell the two apart sweeps a live domain's disk out from under it
+  ## the first time libvirtd is down.
+  ##
+  ## A MISSING ``virsh`` binary raises ``OSError`` out of ``startProcess``
+  ## instead; callers that must fail closed have to handle both, which is why
+  ## this returns a flag rather than raising: one shape, both failures.
+  var r: ExecResult
+  try:
+    r = b.runVirsh(@["list", "--all", "--name"], timeoutSec = 30)
+  except CatchableError as err:
+    return (false, @[], "could not run " & b.virshCmd & ": " & err.msg)
+  if r.exitCode != 0:
+    let detail = (if r.stdout.strip().len > 0: r.stdout.strip()
+                  else: r.stderr.strip())
+    return (false, @[],
+      b.virshCmd & " --connect " & b.libvirtUri & " list --all --name exited " &
+      $r.exitCode & (if detail.len > 0: ": " & detail else: ""))
+  var names: seq[string] = @[]
+  for line in r.stdout.splitLines():
+    let s = line.strip()
+    if s.len > 0: names.add(s)
+  (true, names, "")
+
 proc listAllDomainNames*(b: LibvirtBackend): seq[string] =
   ## ``virsh list --all --name`` — every defined domain (running or
   ## stopped). Used by the M2 ephemeral gate to assert NO residual
   ## per-job domain survives teardown. Returns an empty seq on error.
+  ##
+  ## That empty-on-error contract is safe for an ASSERTION (an absent list
+  ## reads as "nothing survived", which fails the gate the safe way) and
+  ## unsafe for a DELETION. Anything that removes files on the strength of
+  ## this answer must call ``tryListAllDomainNames`` instead.
+  ##
+  ## NOT written as ``tryListAllDomainNames().names``, deliberately, even
+  ## though the body would then be one line. That variant SWALLOWS the
+  ## missing-``virsh`` ``OSError`` this one propagates, and one of this
+  ## proc's callers — ``domainsSharingWritableDisk``, which backs
+  ## ``snapshotRunning``'s refusal — relies on the raise: turning it into an
+  ## empty list there would let a warm capture proceed as though no other
+  ## domain shared the disk. Two callers, two right answers, so two procs.
   let r = b.runVirsh(@["list", "--all", "--name"], timeoutSec = 30)
   if r.exitCode != 0:
     return @[]
