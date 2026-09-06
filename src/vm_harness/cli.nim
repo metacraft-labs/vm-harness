@@ -36,6 +36,7 @@ import ./backends/libvirt
 import ./backends/incus
 {.pop.}
 import ./prune
+import ./layer_gc
 
 type
   LogFormat* = enum
@@ -224,6 +225,21 @@ Subcommands:
   baseline import <src-dir>
                           Import a previously-exported baseline bundle.
                           Prints the snapshot names now available.
+  layer gc <layer-path> --image-pool-dir <dir> [--dry-run]
+                          Delete a base image / snapshot / backing file --
+                          REFUSING with exit 3, and naming the referent, while
+                          any overlay, defined domain, container or snapshot
+                          still resolves onto it. Deleting a layer under a
+                          live overlay destroys that overlay outright, so
+                          there is no warn-and-continue mode.
+  layer sweep-overlays --image-pool-dir <dir> [--older-than <sec>] [--dry-run]
+                          Remove per-job CoW overlays that no defined instance
+                          owns and that are older than the age guard (default
+                          86400s). A base image has no backing file and is
+                          therefore never a candidate. Reports reclaimed bytes
+                          as BOTH apparent and allocated: a CoW overlay is
+                          sparse and one number alone misstates it by orders
+                          of magnitude.
   prune --ephemeral-prefix <p> [--backend all|tart|qemu-windows-arm]
         [--state-dir <dir>] [--older-than <sec>] [--sweep-tmp] [--dry-run]
                           Reclaim ephemeral instances/clones leaked by
@@ -1632,6 +1648,120 @@ proc cmdPrune(opts: CliOpts): int =
          &"{rep.liveTartClones.len} live tart clone(s)."
   0
 
+proc cmdLayer(opts: CliOpts): int =
+  ## ``vm-harness layer gc <layer-path>`` and
+  ## ``vm-harness layer sweep-overlays``.
+  ##
+  ## The in-use guard is a REFUSAL with a non-zero exit and a named referent,
+  ## not a warning: deleting a base image while an overlay is stacked on it
+  ## does not degrade the overlay, it destroys it, so there is no partial
+  ## outcome to warn about. Exit 3 is reserved for that refusal so a caller
+  ## can tell "in use" from a usage error (2) without parsing text.
+  ##
+  ## Live domains are supplied to the planner as DATA. Populating them here,
+  ## from the resolved backend, keeps the decision procedure a pure function
+  ## of its scope -- which is what lets the gate exercise the real decision
+  ## without a hypervisor.
+  if opts.cmd.len < 1:
+    stderr.writeLine("vm-harness: layer requires <action>")
+    stderr.writeLine("  actions: gc, sweep-overlays")
+    return 2
+  if opts.imagePoolDir.len == 0:
+    stderr.writeLine("vm-harness layer: --image-pool-dir is required " &
+      "(the directory holding the per-job overlays)")
+    return 2
+
+  var scope = LayerScope(
+    imagePoolDir: opts.imagePoolDir,
+    olderThanSec: (if opts.olderThanSet: opts.olderThanSec
+                   else: DefaultStaleOverlayAgeSec),
+    dryRun: opts.dryRun)
+  when defined(linux):
+    # Read-only: `virsh list --all --name`. A domain that is DEFINED owns its
+    # overlay whether or not it is running.
+    #
+    # Fail CLOSED, and note WHICH failures that has to cover. A missing
+    # `virsh` binary raises out of `startProcess`; a present `virsh` that
+    # cannot reach libvirtd (daemon down, no permission on `qemu:///system`,
+    # wrong URI) exits non-zero instead, and the plain `listAllDomainNames`
+    # turns that into an EMPTY list by documented contract. An empty list is
+    # the reading under which `sweep-overlays` deletes every overlay past the
+    # age guard — including the ones live domains are running on. So the
+    # checked variant is used, and both failure shapes end here.
+    try:
+      # `DefaultLibvirtUri` unless the environment overrides it, exactly as
+      # every other libvirt path in this CLI resolves it.
+      let lb = newLibvirtBackend(imagePoolDir = opts.imagePoolDir)
+      let listed = lb.tryListAllDomainNames()
+      if not listed.ok:
+        stderr.writeLine("vm-harness layer: cannot enumerate domains (" &
+          listed.message & "); refusing to act without that list")
+        return 3
+      scope.liveDomains = listed.names
+    except CatchableError as err:
+      # Not knowing which domains exist is not the same as knowing there are
+      # none, and only the second reading deletes anything.
+      stderr.writeLine("vm-harness layer: cannot enumerate domains (" &
+        err.msg & "); refusing to act without that list")
+      return 3
+
+  case opts.cmd[0]
+  of "gc":
+    if opts.cmd.len < 2:
+      stderr.writeLine("vm-harness: layer gc requires <layer-path>")
+      return 2
+    let res = deleteLayer(scope, opts.cmd[1])
+    case opts.logFormat
+    of lfJson:
+      var referents = newJArray()
+      for r in res.referents:
+        referents.add(%*{"kind": $r.kind, "name": r.name, "path": r.path})
+      echo $(%*{
+        "event": "layer-gc",
+        "outcome": $res.outcome,
+        "layer": res.layerPath,
+        "apparentBytes": res.apparentBytes,
+        "allocatedBytes": res.allocatedBytes,
+        "referents": referents,
+        "message": res.message})
+    of lfHuman:
+      if res.outcome == lgoRefused:
+        stderr.writeLine("vm-harness layer gc: " & res.message)
+      else:
+        echo "vm-harness layer gc: " & res.message
+    return layerGcExitCode(res.outcome)
+  of "sweep-overlays":
+    let rep = sweepStaleOverlays(scope)
+    case opts.logFormat
+    of lfJson:
+      echo $(%*{
+        "event": "layer-sweep-overlays",
+        "dryRun": scope.dryRun,
+        "imagePoolDir": scope.imagePoolDir,
+        "olderThanSec": scope.olderThanSec,
+        "scanned": rep.scanned,
+        "removed": rep.removed.mapIt(it.name),
+        "keptLive": rep.keptLive.mapIt(it.name),
+        "keptFresh": rep.keptFresh.mapIt(it.name),
+        # Both axes, always. A CoW overlay is sparse, so one number alone is
+        # wrong by orders of magnitude in whichever direction it is read.
+        "removedApparentBytes": rep.removedApparentBytes,
+        "removedAllocatedBytes": rep.removedAllocatedBytes,
+        "keptApparentBytes": rep.keptApparentBytes,
+        "keptAllocatedBytes": rep.keptAllocatedBytes})
+    of lfHuman:
+      let verb = if scope.dryRun: "would remove" else: "removed"
+      echo &"vm-harness layer sweep-overlays ({scope.imagePoolDir}): " &
+           &"{verb} {rep.removed.len} of {rep.scanned} overlay(s) " &
+           &"(~{rep.removedAllocatedBytes div (1024*1024)} MiB allocated, " &
+           &"~{rep.removedApparentBytes div (1024*1024)} MiB apparent); " &
+           &"kept {rep.keptLive.len} live + {rep.keptFresh.len} fresh."
+    return 0
+  else:
+    stderr.writeLine("vm-harness: unknown layer action '" & opts.cmd[0] & "'")
+    stderr.writeLine("  actions: gc, sweep-overlays")
+    return 2
+
 proc runCli*(args: seq[string]): int =
   var opts: CliOpts
   try:
@@ -1657,6 +1787,7 @@ proc runCli*(args: seq[string]): int =
   of "snapshot":  return cmdSnapshot(opts)
   of "baseline":  return cmdBaseline(opts)
   of "prune":     return cmdPrune(opts)
+  of "layer":     return cmdLayer(opts)
   else:
     stderr.writeLine("vm-harness: unknown subcommand '" & opts.subcommand & "'")
     stderr.writeLine(HelpText)

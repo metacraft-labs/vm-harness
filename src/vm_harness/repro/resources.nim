@@ -5,8 +5,9 @@
 ## This module proves that an EXTERNAL repo can define resource TYPES on
 ## reprobuild's generic external-provider lane (slice 2,
 ## `repro_resources`) without any edit to reprobuild's own source. It
-## declares three native providers — `vm_harness.container`,
-## `vm_harness.exec`, `vm_harness.snapshot` — each via one `resourceType`
+## declares six native providers — `vm_harness.container`,
+## `vm_harness.exec`, `vm_harness.snapshot`, `vm_harness.network`,
+## `vm_harness.nic`, `vm_harness.check` — each via one `resourceType`
 ## block that lowers to the provider registration + attribute marshaller +
 ## typed wrapper + `InterfaceResource` contract + the
 ## `<typeId>.observe/plan/apply` protocol entry points (RP4). Each type
@@ -27,12 +28,29 @@
 ##
 ## Determinism classes (per `Composable-Resource-Types.md` §Determinism +
 ## `Edge-Determinism-And-Soft-Rebuild.md` §7):
+## All SIX are listed here; each class is the one the type's `resourceType`
+## block below declares, so this comment and the code cannot drift apart
+## silently.
 ##   * container — `rdVolatile`: a launched container is a state-transaction
 ##     output, never a cacheable artifact; re-realized whenever a dependency
 ##     changed regardless of its own digest.
 ##   * exec — `rdVolatile`: an in-guest command against a volatile container.
 ##   * snapshot — `rdHostBound`: reusable ON the realizing host; cross-machine
 ##     reuse is an explicit opt-in, not the default.
+##   * network — `rdHostBound`: a managed incus network is reusable on the
+##     realizing host (identity == its name), so a re-reconcile of the same
+##     graph on the same host is a cache-hit no-op once it exists.
+##   * nic — `rdVolatile`: a NIC device lives and dies with its volatile
+##     container (deleting the container removes its devices), so it is a
+##     state-transaction output too, not a cacheable artifact.
+##   * check — `rdVolatile`: a smoke-check probe with no durable observable —
+##     it re-runs every reconcile, and RAISES on a mismatch so the failure
+##     surfaces as a hard error.
+##
+## Composition still applies on top of these: per
+## `Edge-Determinism-And-Soft-Rebuild.md` §1.4 an edge inherits the STRICTEST
+## class on its path, so an `rdHostBound` snapshot of a container this graph
+## just launched is volatile at the composite level.
 
 import std/[options, tables, strutils]
 

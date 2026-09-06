@@ -778,3 +778,178 @@ Per the campaign's autonomous-execution policy, this section commits the answers
 - [cirruslabs/packer-plugin-tart](https://github.com/cirruslabs/packer-plugin-tart) — Tart driving reference.
 - [naveenrajm7/packer-plugin-utm](https://github.com/naveenrajm7/packer-plugin-utm) — UTM driving reference.
 - [naveenrajm7/vagrant_utm](https://github.com/naveenrajm7/vagrant_utm) — utmctl invocation patterns.
+
+## 14. Reprobuild adapter
+
+vm-harness is usable on its own — as the CLI of §6 and the Nim library of §7.
+It is *also* a source of build-graph edges: reprobuild drives guest lifecycle
+through typed wrappers, and every edge those wrappers create has to declare how
+reproducible it is, because that declaration is what decides whether a cached
+result may be reused, for how long, and on which machine.
+
+**The typed model is defined in `Edge-Determinism-And-Soft-Rebuild.md`, not
+here.** That document is normative; this section only records vm-harness's
+defaults against it. The four things worth restating before the table:
+
+  * **Four determinism classes.** `strong` — same declared inputs give
+    bytewise-identical outputs on every machine. `weak` — outputs that are
+    identical after a documented mechanical normalizer is applied to both
+    sides. `host-bound` — stable per host across runs, but different hosts
+    produce different outputs that no normalizer bounds. `volatile` — two runs
+    on the *same* host may differ, because the action consumes implicit state
+    (wall clock, network, randomness, live guest state) that the declared
+    inputs do not capture.
+  * **Retention vocabulary (§2.2).** A `volatile` edge MUST carry a
+    `cacheRetention` clause; one without it is an error. The vocabulary is
+    `max-age = N`, `no-cache`, `no-store`, `this-build`, and
+    `stale-while-revalidate = N`. Non-volatile classes carry no clause — §1's
+    table calls that "cache forever", and for `host-bound`, "cache forever, per
+    host".
+  * **Composition (§1.4).** A composite edge inherits the **strictest** class
+    on its path, under `strong < weak < host-bound < volatile`. Everything
+    below is each edge's *own* declaration; an edge whose upstream is stricter
+    is lifted to the upstream's class. A cold snapshot of a container the same
+    graph just launched is `host-bound` by declaration and `volatile` in the
+    graph.
+  * **Cross-machine substitution (§3).** `host-bound` and `volatile` entries
+    are never substituted across machines. Reusing another machine's baseline
+    or snapshot is an explicit, per-target, logged functional-reproducibility
+    opt-in — never the default.
+
+### 14.1 Default class and retention
+
+The six resource types are declared in `src/vm_harness/repro/resources.nim`;
+the two running-state operations are `LibvirtBackend.snapshotRunning` and
+`LibvirtBackend.restoreSnapshot` in `src/vm_harness/backends/libvirt.nim`. The
+cold libvirt snapshot is listed alongside the warm one because the contrast
+between them is the whole point of the classification.
+
+| Edge | Class | Retention |
+|---|---|---|
+| `vm_harness.container` — launch a container | `volatile` | `this-build` |
+| `vm_harness.nic` — attach a container to a managed network | `volatile` | `this-build` |
+| `vm_harness.exec` — run an argv in a guest | `volatile` | `no-cache` |
+| `vm_harness.check` — run an argv and assert exit code / stdout | `volatile` | `no-cache` |
+| `vm_harness.network` — managed network | `host-bound` | — (cache forever, per host) |
+| `vm_harness.snapshot` — cold container snapshot, optional image publish | `host-bound` | — (cache forever, per host) |
+| libvirt `snapshot` — cold, `--disk-only`; restore *boots* | `host-bound` | — (cache forever, per host) |
+| libvirt `snapshotRunning` — warm; RAM + CPU + device state; restore *resumes* | `volatile` | `max-age = 86400` |
+| libvirt `restoreSnapshot` — revert to a running domain | `volatile` | `this-build` |
+
+**Why those retentions.** A launched container and the NIC attaching it are
+state-transaction outputs, not artifacts; `this-build` keeps one realization
+stable for the rest of the invocation, so ten downstream edges share one
+container, while never handing a *later* invocation a guest that an earlier
+build already mutated. The NIC takes its container's clause because it lives
+and dies with the container — a NIC entry outliving its container would name a
+device on something that no longer exists. `exec` and `check` are `no-cache`:
+re-run on every operator invocation, but only once per invocation so downstream
+stays stable during the build. That is not an aspiration bolted on top of the
+drivers, it is what they already do — neither has a durable observable, so both
+report "absent" from `observe` and are always-needs-apply. `network` and the
+cold snapshots carry no clause at all: each is reusable *on the realizing host*
+by name, so a re-reconcile of the same graph on the same host is a hit.
+
+**Why a running-state snapshot is `volatile` and a cold one is not.** It is
+tempting to file both next to each other as `host-bound` — both are "a saved
+state on this host" — but they fail different tests. Apply §1.3's test: pause
+the wall clock and the network, and take the same snapshot twice on the same
+host. A cold `--disk-only` snapshot freezes disk state, and two runs against
+the same declared inputs agree; that is `host-bound`. `snapshotRunning`
+captures RAM, CPU, and device state of a *live* guest — one whose page cache,
+event log, entropy pool, and service timers keep moving while the capture
+streams. Two captures of one domain are two different guests. That is
+`volatile`, and being `volatile` it must carry a retention clause.
+
+Two further consequences follow from the RAM image, and both are recorded in
+the method's own docstring rather than inferred here. First, the capture
+asserts that the domain is running: a snapshot taken while it is not carries no
+RAM, would look like a success, and would then *boot* on restore — the exact
+cost the primitive exists to remove. Second, **a warm state carries the guest's
+machine name and DHCP lease with it**. That makes it identity-bearing, which is
+strictly stronger than what the class alone forbids: §3 already refuses to
+substitute the entry onto another machine, but a warm state must also not be
+restored into two domains on the *same* machine, because both would come up
+with one hostname and one lease. A warm pool is therefore N distinct warm
+states, never N readers of one — and the capture refuses up front when two
+defined domains share a writable disk, so the problem surfaces as a refusal
+instead of as a name collision on the network some days later.
+
+`max-age = 86400` is one working day: capture streams the guest's entire RAM,
+so it is far too expensive to repeat per build, but the frozen guest's clock,
+leases, and cached credentials all age against wall-clock time, and past about
+a day a fresh capture costs less than reasoning about a stale one.
+`restoreSnapshot` is `this-build` because a revert does not rewrite the saved
+state — the frozen disk and the memory image are *inputs*, and a fresh scratch
+overlay is created above them, so the snapshot stays reusable. It is the
+restored, running domain that is volatile, and it must not outlive the
+invocation that produced it.
+
+### 14.2 The CLI subcommands
+
+§10.11 asks for the subcommand list in compact table form, so here it is; the
+paragraphs after it are the reasoning, not the reference.
+
+| Subcommand | Class | Retention |
+|---|---|---|
+| `provision` | `host-bound` | — (cache forever, per host) |
+| `install` | `volatile` | `max-age = 604800` |
+| `boot` | `volatile` | `no-cache` |
+| `run` | `volatile` | `no-cache` |
+| `instance exec` / `copy-to` / `copy-from` / `start` / `stop` | `volatile` | `no-cache` |
+| `instance wait` | `volatile` | `no-cache` |
+| `snapshot create` | `host-bound` | — (cache forever, per host) |
+| `snapshot create --running` | `volatile` | `max-age = 86400` |
+| `snapshot restore` | `volatile` | `this-build` |
+| `baseline export` / `baseline import` | `host-bound` | — (cache forever, per host) |
+| `ephemeral-destroy` | `volatile` | `no-store` |
+| `probe`, `backends`, `shell`, `prune`, `layer` | *(not a graph edge — no class)* | — |
+
+The subcommands dispatched in `src/vm_harness/cli.nim` map onto the same
+classes. `provision` is `host-bound`: it realizes a baseline on this host and
+is idempotent there, but its bytes are the host's. `install` is `volatile` with
+`max-age = 604800` — an installer stamps run-unique identity (machine
+identifiers, host keys) into the target disk, so two runs differ, and one week
+is the point at which the guest OS's own patch cadence makes a fresh install
+more honest than a cached one. `boot` is `volatile`, `no-cache`: a
+serial-console assertion over a transient VM is a probe, the same posture as
+`vm_harness.check`. `run` (revert, exec, harvest, clean up) and the mutating
+`instance` verbs (`exec`, `copy-to`, `copy-from`, `start`, `stop`) are
+`volatile`, `no-cache` — the `vm_harness.exec` posture; `instance wait` is a
+readiness barrier with no output of its own. `snapshot create` is `host-bound`
+cold and `volatile` with `max-age = 86400` under `--running`; `snapshot
+restore` is `volatile`, `this-build`. `baseline export` and `baseline import`
+are `host-bound`: the bundle is a host-bound baseline plus its snapshot tree,
+and carrying one to another machine is exactly §3's logged opt-in.
+`ephemeral-destroy` is `volatile` with `no-store` — a reclaim has no artifact
+worth caching, and a cached "already destroyed" would become a lie the moment
+anything re-created the instance.
+
+Five subcommands are **not graph edges and therefore carry no class at all**:
+`probe` (capability detection — a pure query over the host), `backends` (a
+listing), `shell` (an interactive operator session), `prune` (an operator
+reclaim tool scoped by an ephemeral-instance prefix) and `layer` (the layer
+in-use guard and stale-overlay sweep, §6). A determinism class describes an
+edge's output in the cache, and none of these produce one, so labelling them
+would be a category error rather than a conservative default.
+`ephemeral-destroy` is the one that looks similar but is not: it is the destroy
+action of a resource whose lifecycle the graph owns, so it belongs to an edge;
+`prune` and `layer` deliberately sweep outside any graph.
+
+### 14.3 Where the typed wrappers live
+
+The wrappers are **reprobuild's, not vm-harness's**. A graph author writes
+`package vm_harness:` from reprobuild's stdlib; vm-harness remains the
+underlying CLI and library that those wrappers drive. This keeps the ownership
+split intact — vm-harness ships generic lifecycle primitives, and gate
+orchestration lives in the consumer above it.
+
+The in-repo adapter that declares the resource types,
+`src/vm_harness/repro/resources.nim`, is deliberately **outside vm-harness's
+core build path**. It imports reprobuild libraries, and it is imported by
+neither `src/vm_harness/cli.nim` nor anything `just build` compiles, so the
+core build stays reprobuild-free and vm-harness acquires no dependency on its
+own consumer. It is compiled only with reprobuild's `--path` set; the same
+module built with `-d:reproProviderMode` serves the driver operations over
+reprobuild's provider protocol from a separate process, so the engine can
+reconcile a container without linking a backend into itself.

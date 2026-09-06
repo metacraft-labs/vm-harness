@@ -28,6 +28,8 @@ run_nim r --hints:off tests/unit/t_windows_golden_recipe_hardening.nim
 run_nim r --hints:off tests/unit/t_tart_backend.nim
 run_nim r --hints:off tests/unit/t_lima_backend.nim
 run_nim r --hints:off tests/unit/t_prune.nim
+run_nim r --hints:off tests/unit/t_layer_gc.nim
+run_nim r --hints:off tests/unit/t_design_reprobuild_adapter_section.nim
 run_nim r --hints:off tests/unit/t_uefi_iso_validator.nim
 
 # Backend-independent lifecycle and CLI coverage.
