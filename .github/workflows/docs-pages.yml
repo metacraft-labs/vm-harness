@@ -9,7 +9,7 @@ name: Docs — GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches: [dev]
     paths:
       - "docs/site/**"
       - "docs/user-guide/**"
