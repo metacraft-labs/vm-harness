@@ -1,7 +1,9 @@
 ## S2 (network-primitive) gate — Incus managed networks + container network
 ## attachment expressed as reprobuild resources, verified on REAL incus.
 ##
-## Offline-Production-Topology-Simulation.milestones.org §S2.
+## S2 of the offline production-topology simulation work: the whole
+## production topology must come up with no network access to anything
+## outside the host.
 ##
 ## Model: network attachment is a SIBLING `vm_harness.nic` resource (a NIC
 ## device that attaches a container to a managed network), NOT a container

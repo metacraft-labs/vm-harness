@@ -2,7 +2,7 @@
 
 **Status**: Design draft — implementation-ready for sub-agent execution.
 **Created**: 2026-06-01.
-**Audience**: implementation agents executing the [Multi-OS VM Automation Campaign](Multi-OS-VM-Automation-Campaign.milestones.org). This document is the canonical design spec; the milestones file tracks per-deliverable progress.
+**Audience**: implementation agents building vm-harness. This document is the canonical design spec; per-deliverable progress is tracked separately, outside this repository.
 
 ## 1. Overview
 
@@ -258,8 +258,7 @@ The harness should expose this through:
   running snapshot + `tart run`. The ephemeral comes up SSH-ready
   with no boot wait.
 
-This pairs with the four-layer image taxonomy described in
-[metacraft/ah-vm-image-templates/docs/layered-image-architecture.md](https://github.com/agent-harbor/ah-vm-image-templates/blob/main/docs/layered-image-architecture.md):
+This pairs with the four-layer image taxonomy the image templates publish:
 every layer is published in two flavors (`<name>` and
 `<name>-running`); vm-harness consumes whichever the caller asks for.
 
@@ -732,7 +731,7 @@ metacraft-labs/vm-harness/
 
 ## 11. Implementation sequence (sub-agent build order)
 
-The milestones file ([Multi-OS-VM-Automation-Campaign.milestones.org](Multi-OS-VM-Automation-Campaign.milestones.org)) defines the dependency graph. The implementation sequence:
+The milestone dependency graph is tracked outside this repository. The implementation sequence:
 
 1. **M0 — scaffold + NoopBackend + envelope writer + CLI shell.** Prerequisite: a fresh `metacraft-labs/vm-harness` repo. Sub-agent reads this doc + M0 deliverables, builds the trait, NoopBackend, envelope writer, CLI dispatcher. Tests: `unit_*` + `integration_noop_*`. Verification: `e2e_vm_harness_smoke` PASSes with NoopBackend.
 
@@ -768,8 +767,6 @@ Per the campaign's autonomous-execution policy, this section commits the answers
 
 ## 13. References
 
-- [Multi-OS-VM-Automation-Campaign.milestones.org](Multi-OS-VM-Automation-Campaign.milestones.org) — the campaign milestones that implement this design.
-- [Tart-Based-macOS-VM-Provisioning.md](Tart-Based-macOS-VM-Provisioning.md) — Tart vs Lima vs UTM research, AVF entitlement handling.
 - `metacraft/reprobuild/tools/hyperv-m69-system/README.md` — reference for the Hyper-V harness pattern wrapped by M1.
 - `metacraft/reprobuild/tools/wsl-m69-posix/README.md` — reference for the WSL harness pattern wrapped by M1.
 - `metacraft/reprobuild/tests/e2e/m69/t_e2e_repro_infra_passwd_user_safe_destroy.nim` — reference gate-file shape that Phase-5 gates (M4–M9) mirror.
@@ -787,8 +784,8 @@ through typed wrappers, and every edge those wrappers create has to declare how
 reproducible it is, because that declaration is what decides whether a cached
 result may be reused, for how long, and on which machine.
 
-**The typed model is defined in `Edge-Determinism-And-Soft-Rebuild.md`, not
-here.** That document is normative; this section only records vm-harness's
+**The typed model is reprobuild's edge-determinism model; reprobuild defines
+it normatively, not this document.** This section only records vm-harness's
 defaults against it. The four things worth restating before the table:
 
   * **Four determinism classes.** `strong` — same declared inputs give

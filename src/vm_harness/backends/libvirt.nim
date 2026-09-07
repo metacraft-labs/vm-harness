@@ -2111,19 +2111,19 @@ method removeSnapshot*(b: LibvirtBackend, vmName, snapshotName: string) =
 method exportBaseline*(b: LibvirtBackend, vmName, destDir: string;
                        baselineName: string = "") =
   raise newException(BackendUnavailableError,
-    "LibvirtBackend.exportBaseline is not implemented — deferred to WR3 " &
-    "(Windows layer-authoring tooling), which will wrap `virsh dumpxml " &
+    "LibvirtBackend.exportBaseline is not implemented — a portable " &
+    "baseline needs layer-authoring tooling that will wrap `virsh dumpxml " &
     vmName & "` + `qemu-img convert` (reflinks where the destination " &
     "volume supports them) AND must answer how an exported warm state " &
-    "avoids reproducing one guest identity on many domains. WR0 " &
+    "avoids reproducing one guest identity on many domains. This backend " &
     "implements the in-place snapshot/restore surface only.")
 
 method importBaseline*(b: LibvirtBackend, srcDir: string): seq[string] =
   raise newException(BackendUnavailableError,
-    "LibvirtBackend.importBaseline is not implemented — deferred to WR3 " &
-    "(see exportBaseline). It will consume the dumpxml/qemu-img bundle " &
-    "exportBaseline produces. WR0 implements the in-place snapshot/" &
-    "restore surface only.")
+    "LibvirtBackend.importBaseline is not implemented — see " &
+    "exportBaseline for why. It will consume the dumpxml/qemu-img bundle " &
+    "exportBaseline produces. This backend implements the in-place " &
+    "snapshot/restore surface only.")
 
 # ---------------------------------------------------------------------------
 # M1.5 — bootFromMedia + serial-stream primitives.

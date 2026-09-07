@@ -692,8 +692,8 @@ method removeSnapshot*(b: IncusBackend, vmName, snapshotName: string) =
     discard
 
 # ---------------------------------------------------------------------------
-# Layered base images — the reprobuild-specs §7.4 "install-once,
-# reuse-everywhere" machinery on the container surface. A base image is a
+# Layered base images — the "install-once, reuse-everywhere" machinery on
+# the container surface. A base image is a
 # chain of snapshot edges: ``publishAsImage`` turns a snapshot (an edge's
 # cached output) into a reusable local base image, and
 # ``exportBaseline``/``importBaseline`` bridge that base image to a

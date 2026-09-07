@@ -162,7 +162,7 @@ suite "docs/design.md Reprobuild adapter section":
       check ("`" & op & "`") in section
 
   test "the section points at the normative spec and names the wrapper home":
-    check "Edge-Determinism-And-Soft-Rebuild.md" in section
+    check "edge-determinism model" in section
     check "package vm_harness:" in section
     # §1.4 composition and §3's substitution rule are the two properties a
     # reader of the table most needs in order not to misread it.

@@ -1,4 +1,4 @@
-## Slice 3 (Composable-Resource-Types.md): vm-harness authors three native
+## Slice 3 (composable resource types): vm-harness authors three native
 ## reprobuild resource providers on slice 2's generic external-provider lane.
 ##
 ## Pins:

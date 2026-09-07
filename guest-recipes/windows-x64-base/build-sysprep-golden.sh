@@ -9,9 +9,8 @@
 # what production needs so fleet-scale ephemeral runners don't collide on a
 # duplicate SID (AD / telemetry / WSUS).
 #
-# This is FU5 (WIN-SYSPREP) in reprobuild-specs/
-# Production-Runners-And-Shared-Store.milestones.org. It encodes the exact
-# procedure — including the component-store repair (`DISM /ResetBase`) that
+# This is FU5 (WIN-SYSPREP) of the production-runner work. It encodes the
+# exact procedure — including the component-store repair (`DISM /ResetBase`) that
 # UNBLOCKS the sysprep — that the M3 recipe notes
 # (cloudbase-init-golden.md §"Sysprep /generalize") documented as the required
 # fix after the first attempt failed at the clone specialize pass.

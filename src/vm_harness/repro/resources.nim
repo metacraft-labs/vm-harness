@@ -1,5 +1,5 @@
 ## Native reprobuild resource providers authored IN vm-harness
-## (`Composable-Resource-Types.md` slice 3, re-authored via the RP4
+## (composable resource types, slice 3 — re-authored via the RP4
 ## `resourceType` macro for RP5c1).
 ##
 ## This module proves that an EXTERNAL repo can define resource TYPES on
@@ -26,8 +26,8 @@
 ## build stays reprobuild-free. It is compiled only with the reprobuild
 ## `--path` set + full harness env (see the RP5c1 test / campaign notes).
 ##
-## Determinism classes (per `Composable-Resource-Types.md` §Determinism +
-## `Edge-Determinism-And-Soft-Rebuild.md` §7):
+## Determinism classes. The class an edge declares is what decides whether a
+## cached result may be reused, for how long, and on which machine:
 ## All SIX are listed here; each class is the one the type's `resourceType`
 ## block below declares, so this comment and the code cannot drift apart
 ## silently.
@@ -47,10 +47,10 @@
 ##     it re-runs every reconcile, and RAISES on a mismatch so the failure
 ##     surfaces as a hard error.
 ##
-## Composition still applies on top of these: per
-## `Edge-Determinism-And-Soft-Rebuild.md` §1.4 an edge inherits the STRICTEST
-## class on its path, so an `rdHostBound` snapshot of a container this graph
-## just launched is volatile at the composite level.
+## Composition still applies on top of these: an edge inherits the STRICTEST
+## class on its path, ordered `rdStrong` < `rdWeak` < `rdHostBound` <
+## `rdVolatile`, so an `rdHostBound` snapshot of a container this graph just
+## launched is volatile at the composite level.
 
 import std/[options, tables, strutils]
 

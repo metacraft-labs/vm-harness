@@ -9,10 +9,10 @@ user guide (overview, getting started, driving a VM, backends, guest recipes)
 plus the CLI and parameters reference.
 
 This repository is the **canonical Nim implementation**; a nearly-identical
-Rust port lives at `agent-harbor/main/crates/ah-vm/` (M17 of the
-[Multi-OS VM Automation Campaign][campaign]).
-
-[campaign]: https://github.com/metacraft-labs/reprobuild-specs/blob/main/Multi-OS-VM-Automation-Campaign.milestones.org
+Rust port lives at `agent-harbor/main/crates/ah-vm/` (M17). The two ports
+implement the same backend trait and the same CLI surface, and are held in
+step by the cross-language reference artifacts under `golden-outputs/`. The
+design both of them follow is [`docs/design.md`](docs/design.md).
 
 > **Need to boot / provision / drive / record a guest OS (Linux, macOS, or
 > Windows incl. Windows-on-ARM)? Use this — don't hand-roll
@@ -144,7 +144,7 @@ vm-harness/
 │   └── e2e/
 ├── golden-outputs/          # M12 cross-language reference artifacts
 └── docs/
-    ├── design.md            # mirror of reprobuild-specs/VM-Harness-Design.md
+    ├── design.md            # canonical architecture reference
     ├── m4-libvirt.md        # M4 Phase A slice scope + Phase B/C plan
     └── per-backend-notes/
 ```

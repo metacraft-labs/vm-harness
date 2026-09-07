@@ -18,7 +18,8 @@
 ##  - ``buildVirtInstallArgs`` produces a stable argv shape — pure
 ##    function, tested by string-match.
 ##  - ``exportBaseline`` / ``importBaseline`` still raise
-##    ``BackendUnavailableError``, naming WR3 as their owner.
+##    ``BackendUnavailableError``, and both explain themselves in the same
+##    words.
 ##  - The snapshot surface (campaign WR0) makes the right DECISIONS —
 ##    which is what the second suite in this file covers, against a fake
 ##    ``virsh`` binary. See the mock justification there.
@@ -216,12 +217,12 @@ suite "LibvirtBackend smoke (no live virsh)":
     check not domainNeedsForceStop("crashed")
     check not domainNeedsForceStop("")
 
-  test "exportBaseline / importBaseline still raise, and say WR3 owns them":
+  test "exportBaseline / importBaseline still raise, and both explain themselves":
     # Deliberately NOT implemented by WR0: a transferable baseline is the
     # operation that could materialise ONE warm state (machine name and DHCP
     # lease included) on many domains, which is the identity collision the
     # in-place surface refuses to create. Whoever implements it owes that an
-    # answer, so the stub names the milestone rather than going quiet.
+    # answer, so the stub explains itself rather than going quiet.
     let b = newLibvirtBackend()
     expect BackendUnavailableError:
       b.exportBaseline("any", "/tmp/x")
@@ -230,15 +231,16 @@ suite "LibvirtBackend smoke (no live virsh)":
     # The sentinel is asserted on BOTH, not just one: the old "M4 Phase B"
     # version of this test checked the marker string on a single method, and
     # a half-renamed pair is exactly how a reader ends up chasing the wrong
-    # milestone.
+    # explanation.
+    const Sentinel = "in-place snapshot/restore surface only"
     try:
       b.exportBaseline("any", "/tmp/x")
     except BackendUnavailableError as e:
-      check "WR3" in e.msg
+      check Sentinel in e.msg
     try:
       discard b.importBaseline("/tmp/x")
     except BackendUnavailableError as e:
-      check "WR3" in e.msg
+      check Sentinel in e.msg
 
 # ---------------------------------------------------------------------------
 # Snapshot surface (campaign WR0) — the decision logic, against a FAKE virsh.

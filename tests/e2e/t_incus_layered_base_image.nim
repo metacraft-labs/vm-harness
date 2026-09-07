@@ -1,4 +1,4 @@
-## t_incus_layered_base_image (reprobuild-specs §7.4 gate).
+## t_incus_layered_base_image — the "install-once, reuse-everywhere" gate.
 ##
 ## Proves the "install-once, reuse-everywhere" layered base-image chain on
 ## the Incus backend against REAL Incus: a base image is a chain of snapshot
