@@ -76,12 +76,17 @@
 ## helpers can run anywhere. Backend *registration* is unconditional,
 ## but ``probeAvailability`` returns false on non-Linux hosts.
 
-import std/[options, os, osproc, streams, strtabs,
-            strutils, tables, times]
+import std/[options, os, strutils, tables, times]
+when not defined(posix):
+  import std/[osproc, streams, strtabs]
 import ../types
 import ../auto
 import ../firmware
 import ../serial
+import ../ssh
+when defined(posix):
+  import ../process_capture
+export ssh
 
 # ---------------------------------------------------------------------------
 # Backend type.
@@ -262,51 +267,54 @@ proc runProcessCapture(cmd: seq[string], cwd: string = "",
                        timeoutSec: int = 0,
                        env: Table[string, string] = initTable[string, string](),
                        stdinData: string = ""): ExecResult =
-  if cmd.len == 0:
-    raise newException(ValueError, "runProcessCapture: empty cmd")
-  let start = epochTime()
-  var procEnv: StringTableRef = nil
-  if env.len > 0:
-    procEnv = newStringTable(modeStyleInsensitive)
-    for k, v in env:
-      procEnv[k] = v
-  var p = startProcess(cmd[0], workingDir = cwd, args = cmd[1 .. ^1],
-                       env = procEnv,
-                       options = {poUsePath, poStdErrToStdOut})
-  defer: p.close()
-  if stdinData.len > 0:
-    try:
-      let s = p.inputStream
-      if s != nil:
-        s.write(stdinData)
-        s.close()
-    except CatchableError: discard
-  let outStream = p.outputStream
-  var stdout = ""
-  let deadline = if timeoutSec > 0: epochTime() + timeoutSec.float else: 0.0
-  while true:
-    var chunk = newString(4096)
-    let n = outStream.readData(addr chunk[0], chunk.len)
-    if n > 0:
-      chunk.setLen(n)
-      stdout.add(chunk)
-    elif n == 0:
-      if not p.running:
-        break
-      if timeoutSec > 0 and epochTime() > deadline:
-        p.terminate()
-        return ExecResult(
-          exitCode: -1,
-          stdout: stdout,
-          stderr: "vm-harness: process timed out after " & $timeoutSec & "s",
-          elapsedMs: int((epochTime() - start) * 1000))
-      sleep(50)
-  let code = p.waitForExit(timeout = -1)
-  ExecResult(
-    exitCode: code,
-    stdout: stdout,
-    stderr: "",
-    elapsedMs: int((epochTime() - start) * 1000))
+  when defined(posix):
+    return captureCommand(cmd, cwd, timeoutSec, env, stdinData)
+  else:
+    if cmd.len == 0:
+      raise newException(ValueError, "runProcessCapture: empty cmd")
+    let start = epochTime()
+    var procEnv: StringTableRef = nil
+    if env.len > 0:
+      procEnv = newStringTable(modeStyleInsensitive)
+      for k, v in env:
+        procEnv[k] = v
+    var p = startProcess(cmd[0], workingDir = cwd, args = cmd[1 .. ^1],
+                         env = procEnv,
+                         options = {poUsePath, poStdErrToStdOut})
+    defer: p.close()
+    if stdinData.len > 0:
+      try:
+        let s = p.inputStream
+        if s != nil:
+          s.write(stdinData)
+          s.close()
+      except CatchableError: discard
+    let outStream = p.outputStream
+    var stdout = ""
+    let deadline = if timeoutSec > 0: epochTime() + timeoutSec.float else: 0.0
+    while true:
+      var chunk = newString(4096)
+      let n = outStream.readData(addr chunk[0], chunk.len)
+      if n > 0:
+        chunk.setLen(n)
+        stdout.add(chunk)
+      elif n == 0:
+        if not p.running:
+          break
+        if timeoutSec > 0 and epochTime() > deadline:
+          p.terminate()
+          return ExecResult(
+            exitCode: -1,
+            stdout: stdout,
+            stderr: "vm-harness: process timed out after " & $timeoutSec & "s",
+            elapsedMs: int((epochTime() - start) * 1000))
+        sleep(50)
+    let code = p.waitForExit(timeout = -1)
+    ExecResult(
+      exitCode: code,
+      stdout: stdout,
+      stderr: "",
+      elapsedMs: int((epochTime() - start) * 1000))
 
 # ---------------------------------------------------------------------------
 # virsh CLI primitives.
@@ -318,7 +326,8 @@ proc virshArgs(b: LibvirtBackend, sub: openArray[string]): seq[string] =
 
 proc runVirsh(b: LibvirtBackend, sub: openArray[string],
               timeoutSec: int = 60): ExecResult =
-  runProcessCapture(b.virshArgs(sub), timeoutSec = timeoutSec)
+  runProcessCapture(b.virshArgs(sub), timeoutSec = timeoutSec,
+                    env = {"LC_ALL": "C"}.toTable())
 
 proc domainExists*(b: LibvirtBackend, name: string): bool =
   ## ``virsh dominfo <name>`` exits 0 if the domain is defined.
@@ -390,6 +399,61 @@ proc domainState*(b: LibvirtBackend, name: string): string =
   if r.exitCode != 0:
     return ""
   result = r.stdout.strip()
+
+proc checkedVirsh*(b: LibvirtBackend, args: openArray[string],
+                   timeoutSec = 30): string =
+  let r = b.runVirsh(args, timeoutSec)
+  if r.exitCode != 0:
+    raise newVmHarnessError($b.id, lpExec,
+      "virsh " & args[0] & " failed (exit " & $r.exitCode & "): " &
+      r.stdout & r.stderr)
+  r.stdout.strip()
+
+type LibvirtDomainObservation* = object
+  present*: bool
+  uuid*: string
+  state*: string
+
+proc inspectDomain*(b: LibvirtBackend, name: string): LibvirtDomainObservation =
+  let listed = b.tryListAllDomainNames()
+  if not listed.ok:
+    raise newException(VmHarnessError, listed.message)
+  if name notin listed.names: return
+  result.uuid = b.checkedVirsh(["domuuid", name]).toLowerAscii()
+  if result.uuid.len == 0:
+    raise newException(VmHarnessError, "virsh returned an empty domain UUID")
+  result.state = b.checkedVirsh(["domstate", result.uuid])
+  if result.state.len == 0:
+    raise newException(VmHarnessError, "virsh returned an empty domain state")
+  result.present = true
+
+proc requireDomainOwner*(b: LibvirtBackend, name, uuid: string):
+    LibvirtDomainObservation =
+  result = b.inspectDomain(name)
+  if result.present and result.uuid != uuid:
+    raise newException(VmHarnessError,
+      "domain ownership mismatch for " & name & ": expected " & uuid &
+      ", observed " & result.uuid)
+
+proc stopOwnedDomain*(b: LibvirtBackend, name, uuid: string,
+                      timeoutSec = 60, force = false) =
+  let observed = b.requireDomainOwner(name, uuid)
+  if not observed.present or observed.state == "shut off": return
+  if force:
+    discard b.checkedVirsh(["destroy", uuid])
+  else:
+    if observed.state != "running":
+      raise newException(VmHarnessError,
+        "cannot gracefully stop domain in state " & observed.state &
+        "; use --force for an explicit power-off")
+    discard b.checkedVirsh(["shutdown", uuid])
+  let deadline = epochTime() + float(timeoutSec)
+  while true:
+    let current = b.requireDomainOwner(name, uuid)
+    if not current.present or current.state == "shut off": return
+    if epochTime() >= deadline:
+      raise newException(TimeoutError, "domain did not stop within the timeout")
+    sleep(100)
 
 proc domainNeedsForceStop*(state: string): bool =
   ## Libvirt may pause a domain after an I/O or watchdog failure. Such a
@@ -872,10 +936,10 @@ proc sshHostKeyArgs*(b: LibvirtBackend): seq[string] =
     ]
   result = @[
     "-o", "StrictHostKeyChecking=accept-new",
-    "-o", "UserKnownHostsFile=" & b.sshKnownHostsPath,
+    "-o", "UserKnownHostsFile=" & quoteSshConfigValue(b.sshKnownHostsPath.replace("%", "%%")),
   ]
   if b.sshHostKeyAlias.len > 0:
-    result.add(@["-o", "HostKeyAlias=" & b.sshHostKeyAlias])
+    result.add(@["-o", "HostKeyAlias=" & quoteSshConfigValue(b.sshHostKeyAlias)])
 
 proc sshBaseArgs*(b: LibvirtBackend, host: string): seq[string] =
   ## Build a non-interactive SSH argv. Callers may opt into persistent
@@ -899,29 +963,6 @@ proc sshpassPrefix*(b: LibvirtBackend): seq[string] =
     return @[]
   result = @[b.sshpassCmd, "-e"]
 
-proc quotePosixShellArg*(arg: string): string =
-  ## Single-quote one argument for a POSIX login shell. Embedded single quotes
-  ## leave and re-enter the quoted region without exposing any argument bytes.
-  "'" & arg.replace("'", "'\"'\"'") & "'"
-
-proc formatSshCommand*(cmd: openArray[string]; guestOs: GuestOs): string =
-  ## OpenSSH servers pass their command payload through the guest's configured
-  ## login shell, so argv must be rendered for that shell rather than merely
-  ## concatenated.
-  case guestOs
-  of goLinux, goMacos:
-    for arg in cmd:
-      if result.len > 0:
-        result.add(' ')
-      result.add(quotePosixShellArg(arg))
-  of goWindows:
-    for arg in cmd:
-      if result.len > 0:
-        result.add(' ')
-      result.add('"')
-      result.add(arg.replace("\"", "\\\""))
-      result.add('"')
-
 proc runSshExec(b: LibvirtBackend, host: string, command: string,
                 env: Table[string, string],
                 timeoutSec: int, stdinData: string = ""): ExecResult =
@@ -929,17 +970,7 @@ proc runSshExec(b: LibvirtBackend, host: string, command: string,
   ## with the supplied env table prefixed (Windows CMD/PowerShell
   ## conventions; the autounattend installs OpenSSH with the default
   ## CMD shell).
-  var prefix = ""
-  for k, v in env:
-    # CMD doesn't have a uniform "set in same line" syntax that
-    # survives an OpenSSH session, so we emit ``set KEY=VAL && ...``
-    # which works under cmd.exe (the default OpenSSH shell on Windows
-    # 11 until the registry override sets PowerShell).
-    prefix.add("set ")
-    prefix.add(k)
-    prefix.add("=")
-    prefix.add(v)
-    prefix.add(" && ")
+  let prefix = formatSshEnvironment(env, b.sshGuestOs)
   let fullCmd = prefix & command
   var argv = b.sshpassPrefix() & b.sshBaseArgs(host) & @[fullCmd]
   var passEnv = initTable[string, string]()
@@ -2237,6 +2268,20 @@ proc transientBootHostForwardHmp*(spec: BootMediaSpec): string =
       "BootMediaSpec.sshForwardPort must be 0 or a TCP port from 1 to 65535")
   "hostfwd_add hostnet0 tcp:127.0.0.1:" & $spec.sshForwardPort & "-:22"
 
+proc ensureSshForward*(b: LibvirtBackend, uuid: string, port: int) =
+  let network = b.checkedVirsh(["qemu-monitor-command", uuid,
+                               "--hmp", "info usernet"])
+  for line in network.splitLines():
+    let fields = line.splitWhitespace()
+    if fields.len >= 6 and fields[0] == "TCP[HOST_FORWARD]" and
+        fields[2] == "127.0.0.1" and fields[3] == $port and fields[5] == "22":
+      return
+  let output = b.checkedVirsh(["qemu-monitor-command", uuid, "--hmp",
+    transientBootHostForwardHmp(BootMediaSpec(sshForwardPort: port))])
+  # HMP errors can be returned in a successful virsh response.
+  if output.len > 0:
+    raise newException(VmHarnessError, "SSH forward was not installed: " & output)
+
 proc resolveTransientOvmf(spec: BootMediaSpec): tuple[loader, nvram: string] =
   ## Resolve OVMF without assuming that libvirt's firmware descriptor search
   ## path includes Nix store packages. Explicit CLI flags and environment
@@ -2309,7 +2354,16 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
       raise newException(IOError,
         "BootMediaSpec.mediaPath does not exist: " & spec.mediaPath)
     let domainName = if spec.name.len > 0: spec.name else: newBootDomainName()
-    if not domainName.startsWith(BootDomainNamePrefix):
+    let durable = spec.instanceId.len > 0
+    if durable:
+      if spec.kind != bmkQcow2 or domainName != "vmh-media-" & spec.instanceId:
+        raise newException(ValueError, "invalid durable libvirt media specification")
+      if b.inspectDomain(domainName).present:
+        raise newException(VmHarnessError, "durable domain already exists")
+      let uuids = b.checkedVirsh(["list", "--all", "--uuid"]).splitLines()
+      if spec.instanceId in uuids:
+        raise newException(VmHarnessError, "libvirt UUID already exists")
+    elif not domainName.startsWith(BootDomainNamePrefix):
       raise newException(ValueError,
         "BootMediaSpec.name must start with '" & BootDomainNamePrefix &
         "' for safety-sweep coverage (got '" & domainName & "')")
@@ -2324,6 +2378,8 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
     if serialLogDir.len > 0:
       createDir(serialLogDir)
     if fileExists(serialLogPath):
+      if durable:
+        raise newException(VmHarnessError, "durable serial log already exists")
       removeFile(serialLogPath)
     writeFile(serialLogPath, "")
     setFilePermissions(serialLogPath, {
@@ -2337,6 +2393,8 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
       createDir(b.imagePoolDir)
       attachedMediaPath = b.domainDiskPath(domainName)
       if fileExists(attachedMediaPath):
+        if durable:
+          raise newException(VmHarnessError, "durable disk already exists")
         removeFile(attachedMediaPath)
       let overlay = runProcessCapture(@[
         b.qemuImgCmd, "create", "-f", "qcow2",
@@ -2374,6 +2432,7 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
       "--memory", $mem,
       "--vcpus", $cpus,
       "--machine", "q35"]
+    if durable: argv.add(@["--uuid", spec.instanceId])
     argv.add(transientBootAccelerationArgs(spec))
     argv.add(transientBootNetworkArgs(spec))
     argv.add("--noautoconsole")
@@ -2381,7 +2440,10 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
     argv.add(transientBootTpmArgs(spec))
     argv.add(transientBootGraphicsArgs(spec))
     argv.add(transientBootCompatibilityArgs())
-    argv.add(transientBootSerialArgs(serialLogPath))
+    if durable:
+      argv.add(@["--serial", "pty,log.file=" & serialLogPath & ",log.append=on"])
+    else:
+      argv.add(transientBootSerialArgs(serialLogPath))
     case spec.kind
     of bmkQcow2, bmkVhdx:
       argv.add("--import")
@@ -2405,6 +2467,9 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
 
     let r = runProcessCapture(argv, timeoutSec = 120)
     if r.exitCode != 0:
+      if durable:
+        raise newVmHarnessError($b.id, lpStartup,
+          "durable virt-install failed: " & r.stdout & r.stderr)
       # Best-effort cleanup of any half-built domain.
       try:
         b.destroyDomain(domainName)
@@ -2416,9 +2481,13 @@ method bootFromMedia*(b: LibvirtBackend, spec: BootMediaSpec): VmHandle =
         $r.exitCode & "): " & r.stdout)
 
     if spec.sshForwardPort > 0:
-      let forward = b.runVirsh(@["qemu-monitor-command", domainName,
+      let forward = b.runVirsh(@["qemu-monitor-command",
+        (if durable: spec.instanceId else: domainName),
         "--hmp", transientBootHostForwardHmp(spec)], timeoutSec = 30)
-      if forward.exitCode != 0:
+      if forward.exitCode != 0 or forward.stdout.strip().len > 0:
+        if durable:
+          raise newVmHarnessError($b.id, lpStartup,
+            "durable SSH forward failed: " & forward.stdout & forward.stderr)
         try:
           b.destroyDomain(domainName)
           b.undefineDomain(domainName)

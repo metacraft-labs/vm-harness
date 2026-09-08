@@ -295,6 +295,11 @@ proc planLayerDeletion*(scope: LayerScope; layerPath: string): LayerGcResult =
   ## unlink, so a ``--dry-run`` and a real run can never disagree about the
   ## decision.
   result.layerPath = layerPath
+  let receipt = parentDir(layerPath) / "instance.json"
+  if fileExists(receipt) or symlinkExists(receipt):
+    result.outcome = lgoRefused
+    result.message = "durable instance data requires instance destroy --purge: " & receipt
+    return
   if not fileExists(layerPath):
     result.outcome = lgoAbsent
     result.message = "layer does not exist: " & layerPath
@@ -370,7 +375,9 @@ proc sweepStaleOverlays*(scope: LayerScope): OverlaySweepReport =
                  else: DefaultStaleOverlayAgeSec
   for overlay in scanOverlays(scope.imagePoolDir):
     inc result.scanned
-    if overlay.name in scope.liveDomains or
+    let receipt = parentDir(overlay.path) / "instance.json"
+    if fileExists(receipt) or symlinkExists(receipt) or
+        overlay.name in scope.liveDomains or
         overlay.name in scope.liveContainers:
       result.keptLive.add(overlay)
       result.keptApparentBytes += overlay.apparentBytes

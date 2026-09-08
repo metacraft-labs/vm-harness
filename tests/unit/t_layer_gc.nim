@@ -117,6 +117,17 @@ proc scopeOf(f: Fixture; liveDomains: seq[string] = @[];
 
 suite "layer GC — the in-use guard":
 
+  test "durable receipts protect stopped or undefined instance files":
+    let f = makeFixture("durable")
+    defer: removeDir(f.root)
+    f.addOverlay("retained")
+    setAgeDays(f.overlayFor("retained"), StaleAgeDays)
+    # Even a damaged receipt must fail closed, not turn data into stale garbage.
+    writeFile(f.pool / "instance.json", "interrupted receipt")
+    check deleteLayer(f.scopeOf(), f.overlayFor("retained")).outcome == lgoRefused
+    check sweepStaleOverlays(f.scopeOf()).removed.len == 0
+    check fileExists(f.overlayFor("retained"))
+
   test "qcow2BackingFile reads a real backing chain, and reports none for a base":
     ## The parser, against files ``qemu-img`` wrote. Everything below depends
     ## on this being right; if it silently returned "" the guard would refuse

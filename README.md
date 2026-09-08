@@ -226,6 +226,14 @@ target paths are rejected. Use `--secondary-iso` when an installer needs a
 separate unattended seed; do not place per-instance secrets on reusable install
 media.
 
+For a named installed Linux VM that survives separate CLI invocations, use
+`boot --keep --name NAME --state-dir ROOT` with libvirt, then
+`instance start|ssh|exec|status|logs|stop|destroy|screenshot NAME --state-dir ROOT`.
+Default destroy preserves the writable disk, firmware, TPM and SSH identity;
+explicit UUID-checked `destroy --purge` permits replacement. See the
+[durable media contract](docs/user-guide/durable-media.md) for JSON fields,
+failure recovery, ownership and platform limits.
+
 `--backend auto` picks per the dispatch table (design doc §6):
 
 | Host                  | Guest    | Backend              |

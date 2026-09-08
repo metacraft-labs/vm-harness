@@ -89,6 +89,7 @@
             version = "0.1.0";
             src = ./.;
             nativeBuildInputs = [ pkgs.nim ];
+            buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.pcre ];
             buildPhase = ''
               runHook preBuild
               # Nix sandboxes HOME to /homeless-shelter. Keep Nim's cache in
@@ -142,6 +143,7 @@
           };
 
           devShells.default = pkgs.mkShell {
+            buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.pcre ];
             packages = [
               pkgs.git
               pkgs.just

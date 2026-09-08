@@ -40,6 +40,10 @@ const portableTestSpecs: seq[VmHarnessTestSpec] = @[
     binary: "t_cli_probe"),
   VmHarnessTestSpec(source: "tests/unit/t_cli_boot.nim",
     binary: "t_cli_boot"),
+  VmHarnessTestSpec(source: "tests/unit/t_ssh_serialization.nim",
+    binary: "t_ssh_serialization"),
+  VmHarnessTestSpec(source: "tests/integration/t_durable_media.nim",
+    binary: "t_durable_media"),
   VmHarnessTestSpec(source: "tests/unit/t_hyperv_parsers.nim",
     binary: "t_hyperv_parsers"),
   VmHarnessTestSpec(source: "tests/unit/t_hyperv_boot_media.nim",
@@ -78,6 +82,8 @@ package vm_harness:
 
   uses:
     "nim >=2.2 <3.0"
+    when defined(linux):
+      "pcre-config >=0"
     when defined(macosx):
       "clang"
     else:
@@ -85,6 +91,7 @@ package vm_harness:
 
   runtimeDeps:
     when defined(linux):
+      "vmHarnessPcre"
       "vmHarnessVirsh"
       "vmHarnessVirtInstall"
       "vmHarnessQemuImg"
@@ -107,12 +114,12 @@ package vm_harness:
     let cliBuild = nim.c(
       source = "src/vm_harness/cli.nim",
       binary = binDir & "vm-harness" & exeSuffix,
-      extraInputs = @["src", "guest-scripts", "guest-recipes"],
+      extraInputs = @["src", "config.nims", "guest-scripts", "guest-recipes"],
       actionId = "vm_harness.cli.build")
     let benchBuild = nim.c(
       source = "tools/bench/snapshot_revert_bench.nim",
       binary = binDir & "vm-harness-bench-snapshot-revert" & exeSuffix,
-      extraInputs = @["src", "tools", "guest-scripts", "guest-recipes"],
+      extraInputs = @["src", "config.nims", "tools", "guest-scripts", "guest-recipes"],
       actionId = "vm_harness.snapshot_revert_bench.build")
     discard collect("default", @[cliBuild, benchBuild])
 
@@ -125,7 +132,7 @@ package vm_harness:
       let edge = buildNimUnittest.build(
         source = spec.source,
         binary = output,
-        extraInputs = @["src", "guest-scripts", "guest-recipes"],
+        extraInputs = @["src", "config.nims", "guest-scripts", "guest-recipes"],
         actionId = "vm_harness.test_build." & spec.binary)
       buildActions.add(edge.action)
       let execute = edge.testBinary.run(
@@ -146,6 +153,14 @@ package vm_harness:
     discard collect("test", testExecuteActions)
 
 when defined(linux):
+  package vmHarnessPcre:
+    provisioning:
+      nixPackage "nixpkgs#pcre.out", executablePath = "lib/libpcre.so",
+        nixpkgsRev = CanonicalNixpkgsRev,
+        nixpkgsNarHash = CanonicalNixpkgsNarHash
+
+    library pcre
+
   package vmHarnessVirsh:
     provisioning:
       nixPackage "nixpkgs#libvirt", executablePath = "bin/virsh",

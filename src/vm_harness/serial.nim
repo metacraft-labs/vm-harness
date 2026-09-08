@@ -18,6 +18,11 @@
 import std/[os, locks, re, streams, times]
 import ./types
 
+when defined(linux):
+  # std/re dlopens PCRE at startup. Retain an ELF dependency so the build
+  # toolchain records its runtime search path without exporting it to virsh.
+  {.passL: "-Wl,--no-as-needed -lpcre -Wl,--as-needed".}
+
 type
   SerialLineBuffer* = ref object
     ## Backend-agnostic serial accumulator. Producer-side ``feed`` may
@@ -233,5 +238,4 @@ proc stopPipeReader*(r: PipeReader) =
     try: dealloc(r.thread)
     except CatchableError: discard
     r.thread = nil
-
 

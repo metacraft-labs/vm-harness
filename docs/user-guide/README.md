@@ -23,6 +23,8 @@ stay here.
 2. **[Getting started](./getting-started.md)** — enter the dev shell, build the
    CLI, and bring a VM up / run your first in-guest assertion.
 3. **Guides (task-oriented)**
+   - **[Durable media instances](./durable-media.md)**: named Linux/libvirt VMs,
+     persistent disk and SSH identity, recovery, JSON status and explicit purge.
    - **[Driving a VM from test / harness code](./driving-a-vm.md)** — the
      library API: `provisionBaseline` → `revertToBaseline` → `execInGuest` →
      `stopAndCleanup`, plus the one-call `runGate` orchestrator.

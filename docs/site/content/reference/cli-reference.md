@@ -28,6 +28,7 @@ ERROR / usage error, `130` INCOMPLETE (interrupted).
 | `run` | One-shot revert + exec + harvest + cleanup (the gate runner). |
 | `run --ephemeral` | libvirt/incus: launch one per-job clone, probe, destroy (no residue). |
 | `ephemeral-destroy` | libvirt/incus: reclaim an instance left by `run --ephemeral --keep`. |
+| `instance start\|ssh\|exec\|status\|logs\|stop\|destroy\|screenshot NAME --state-dir ROOT` | [Durable installed Linux/libvirt VM lifecycle](/guides/durable-media). |
 | `probe` | Print available backends as JSON (capability detection). |
 | `backends` | Tabular listing of every known backend (`*` = registered here). |
 | `shell` | (Placeholder in M0) open an interactive shell into a baseline. |

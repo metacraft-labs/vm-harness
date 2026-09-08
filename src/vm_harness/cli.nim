@@ -37,6 +37,7 @@ import ./backends/incus
 {.pop.}
 import ./prune
 import ./layer_gc
+import ./instances
 
 type
   LogFormat* = enum
@@ -73,6 +74,11 @@ type
     sshPrivateKey*: string
     sshKnownHosts*: string
     sshHostKeyAlias*: string
+    instanceId*: string
+    lockTimeoutSec*: int
+    follow*: bool
+    force*: bool
+    purge*: bool
     cpus*: int
     memoryMB*: int
     diskGB*: int
@@ -205,6 +211,16 @@ Subcommands:
                           Transfer a file or directory through the backend.
   instance start <name>   Start and await an existing Incus container.
   instance stop <name>    Stop an existing Incus container without deleting it.
+  instance <start|ssh|exec|status|logs|stop|destroy|screenshot> <name>
+        --state-dir <root> [--instance-id <uuid>]
+                          Linux/libvirt durable media lifecycle. Start also
+                          restores a default-destroyed instance from saved XML.
+                          Bare ssh is interactive; exec takes argv after --.
+                          status/start emit status with --log-format json.
+                          logs accepts --follow; screenshot requires --screenshot.
+                          stop/destroy accept --force for hard poweroff.
+                          destroy preserves data unless --purge AND --instance-id
+                          are supplied. Purge never removes caller-owned inputs.
   probe                   Print available backends as JSON.
   shell                   (placeholder) Open an interactive shell into a baseline.
   backends                Tabular listing of every known backend.
@@ -258,6 +274,11 @@ Common flags:
   --baseline <name>               Logical baseline tag (== libvirt domain name).
   --name <vm>                     Alias for --baseline (canonical libvirt M4
                                   command shape; see docs/m4-libvirt.md).
+                                  With boot --keep --state-dir, durable name.
+  --state-dir <root>             Durable boot/instance receipts and owned disks.
+  --instance-id <uuid>           Expected actual libvirt UUID (optional ownership
+                                  precondition; required for destroy --purge).
+  --lock-timeout-sec <sec>       Durable operation lock wait, 0..300 (default 10).
   --recipe <id>                   Selects guest-recipes/<id>/ as the source of
                                   per-baseline artifacts (autounattend.xml,
                                   build-autounattend-iso.sh, ...). Required by
@@ -419,6 +440,7 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
   result.acceleration = "auto"
   result.graphics = "none"
   result.videoModel = "virtio"
+  result.lockTimeoutSec = 10
   if args.len == 0 or args[0] in ["-h", "--help", "help"]:
     result.subcommand = "help"
     return
@@ -633,6 +655,19 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i
     of "--state-dir":
       inc i; result.stateDir = args[i]; inc i
+    of "--instance-id":
+      inc i; result.instanceId = args[i]; inc i
+      validateInstanceId(result.instanceId)
+    of "--lock-timeout-sec":
+      inc i; result.lockTimeoutSec = parseInt(args[i]); inc i
+      if result.lockTimeoutSec notin 0..300:
+        raise newException(ValueError, "--lock-timeout-sec expects 0 through 300")
+    of "--follow":
+      result.follow = true; inc i
+    of "--force":
+      result.force = true; inc i
+    of "--purge":
+      result.purge = true; inc i
     of "--older-than":
       inc i; result.olderThanSec = parseInt(args[i]); result.olderThanSet = true
       inc i
@@ -840,7 +875,72 @@ proc resolveBootOutputDir*(requested: string;
   else:
     getTempDir() / ("vm-harness-boot-" & $processId)
 
+proc printInstanceStatus(opts: CliOpts, data: JsonNode) =
+  if opts.logFormat == lfJson: echo $data
+  else:
+    echo data["name"].getStr() & " " & data["state"].getStr() &
+      " " & data["instance_id"].getStr()
+
+proc cmdDurableBoot(opts: CliOpts, b: LibvirtBackend, media: BootMediaSpec): int =
+  var spec = media
+  let instance = beginDurableBoot(opts.stateDir, opts.name, opts.instanceId,
+                                  b, spec, opts.lockTimeoutSec)
+  defer: instance.close()
+  var portLock: InstanceLock
+  defer: portLock.release()
+  var serial: SerialStream
+  var handedOff = false
+  var failure = "durable boot did not complete"
+  try:
+    portLock = acquireInstanceOperationLock(opts.stateDir, "ports", opts.lockTimeoutSec, true)
+    if opts.sshForwardPort == -1:
+      b.sshPort = pickTcpPort(0)
+      spec.sshForwardPort = b.sshPort
+      instance.receipt["ssh"]["port"] = %b.sshPort
+      instance.save("creating")
+    let vm = b.bootFromMedia(spec)
+    portLock.release()
+    instance.preserveDomainXml()
+    if opts.expectPattern.len > 0:
+      serial = b.captureSerial(vm)
+      let timeout = if opts.timeoutSec > 0: opts.timeoutSec else: 180
+      if not b.expectLine(serial, opts.expectPattern, timeout).matched:
+        failure = "boot marker not observed: " & opts.expectPattern
+        return 1
+    let readyTimeout = if opts.sshReadyTimeoutSec > 0: opts.sshReadyTimeoutSec else: 120
+    b.startAndAwaitReady(vm, readyTimeout)
+    if opts.screenshotPath.len > 0:
+      instance.screenshot(opts.screenshotPath, opts.screenshotDelaySec)
+    if opts.cmd.len > 0:
+      let timeout = if opts.timeoutSec > 0: opts.timeoutSec else: 120
+      let r = instance.exec(opts.cmd, opts.envPairs, timeout)
+      stdout.write(r.stdout)
+      stderr.write(r.stderr)
+      if r.exitCode != 0:
+        failure = "boot command failed with exit " & $r.exitCode
+        return r.exitCode
+    instance.save("running")
+    printInstanceStatus(opts, instance.status())
+    handedOff = true
+    return 0
+  except CatchableError as error:
+    failure = error.msg
+    raise
+  finally:
+    try:
+      if serial != nil: b.closeSerial(serial)
+    except:
+      handedOff = false
+      raise
+    finally:
+      if not handedOff: instance.failBoot(failure)
+
 proc cmdBoot(opts: CliOpts; installMode = false): int =
+  let durable = opts.name.len > 0 or opts.stateDir.len > 0 or opts.instanceId.len > 0
+  if durable and (installMode or not opts.keepEphemeral or
+      opts.name.len == 0 or opts.stateDir.len == 0):
+    raise newException(ValueError,
+      "durable boot requires --keep --name NAME --state-dir ROOT")
   if installMode:
     if opts.targetDiskPath.len == 0:
       raise newException(ValueError,
@@ -881,6 +981,15 @@ proc cmdBoot(opts: CliOpts; installMode = false): int =
     raise newException(ValueError,
       "boot: --initrd and --kernel-cmdline are valid only with --kind kernel")
   let id = resolveBootBackendId(opts, mediaKind, detectHostPlatform())
+  if durable:
+    if detectHostPlatform() != hpLinux:
+      raise newException(BackendUnavailableError, "durable media requires Linux/libvirt")
+    if id != biLibvirt or mediaKind != bmkQcow2 or
+        (opts.guestSet and opts.guest != goLinux):
+      raise newException(BackendUnavailableError,
+        "durable media currently supports Linux guests on libvirt with QCOW2 media only")
+    if opts.viewer or opts.waitForShutdown or opts.targetDiskPath.len > 0:
+      raise newException(ValueError, "durable boot does not support viewer, shutdown or install modes")
   let backend = newBackend(id, noopFallback = opts.allowNoopFallback)
   if not backend.probeAvailability():
     raise newException(BackendUnavailableError,
@@ -892,7 +1001,7 @@ proc cmdBoot(opts: CliOpts; installMode = false): int =
   if sshForwardPort != 0 and id != biLibvirt:
     raise newException(BackendUnavailableError,
       "boot: --ssh-forward-port is currently supported by libvirt")
-  if opts.cmd.len > 0:
+  if opts.cmd.len > 0 or durable:
     if id != biLibvirt:
       raise newException(BackendUnavailableError,
         "boot: an SSH guest command is currently supported by libvirt")
@@ -902,6 +1011,8 @@ proc cmdBoot(opts: CliOpts; installMode = false): int =
     if opts.sshUser.len == 0:
       raise newException(ValueError,
         "boot: a guest command requires --ssh-user")
+    if durable and opts.sshPrivateKey.len == 0:
+      raise newException(ValueError, "durable media requires --ssh-private-key")
     if opts.sshPasswordEnv.len == 0 and opts.sshPrivateKey.len == 0:
       raise newException(ValueError,
         "boot: a guest command requires --ssh-password-env or " &
@@ -922,9 +1033,11 @@ proc cmdBoot(opts: CliOpts; installMode = false): int =
       lb.sshKeyPath = ""
     if opts.sshKnownHosts.len > 0:
       lb.sshKnownHostsPath = absolutePath(opts.sshKnownHosts)
-      lb.sshHostKeyAlias = opts.sshHostKeyAlias
+    lb.sshHostKeyAlias = opts.sshHostKeyAlias
     if opts.guestSet:
       lb.sshGuestOs = opts.guest
+    elif durable:
+      lb.sshGuestOs = goLinux
 
   let outputDir = resolveBootOutputDir(opts.outputDir)
   createDir(outputDir)
@@ -979,10 +1092,14 @@ proc cmdBoot(opts: CliOpts; installMode = false): int =
     serialLogPath: outputDir / "boot.serial.log",
     extra: extra)
 
+  if durable:
+    return cmdDurableBoot(opts, LibvirtBackend(backend), spec)
+
   logEvent(opts.logFormat, "info", "booting media",
            {"backend": $id, "media": mediaPath, "kind": $mediaKind})
   var vm: VmHandle
   var serial: SerialStream
+  var keptSuccessfully = false
   try:
     vm = backend.bootFromMedia(spec)
 
@@ -1069,12 +1186,18 @@ proc cmdBoot(opts: CliOpts; installMode = false): int =
       logEvent(opts.logFormat, "info", "VM left running",
                {"backend": $id, "vm": vm.name})
       echo vm.name
+      keptSuccessfully = true
     0
   finally:
-    if serial != nil:
-      backend.closeSerial(serial)
-    if vm != nil and not opts.keepEphemeral:
-      backend.stopAndCleanup(vm, deleteVm = true)
+    try:
+      if serial != nil:
+        backend.closeSerial(serial)
+    except:
+      keptSuccessfully = false
+      raise
+    finally:
+      if vm != nil and not keptSuccessfully:
+        backend.stopAndCleanup(vm, deleteVm = true)
 
 proc cmdProvision(opts: CliOpts): int =
   let (id, backend) = resolveBackend(opts)
@@ -1455,6 +1578,62 @@ proc cmdInstance(opts: CliOpts): int =
       "instance requires <wait|exec|copy-to|copy-from|start|stop> <name>")
   let action = opts.cmd[0]
   let name = opts.cmd[1]
+  if opts.backend.toLowerAscii() != "incus":
+    if opts.backend notin ["", "auto", "libvirt"]:
+      raise newException(BackendUnavailableError, "durable instances require Linux/libvirt")
+    if detectHostPlatform() != hpLinux:
+      raise newException(BackendUnavailableError, "durable instances require Linux/libvirt")
+    if action notin ["start", "ssh", "exec", "status", "logs", "stop", "destroy", "screenshot"]:
+      raise newException(ValueError, "unknown durable instance action: " & action)
+    if action != "exec" and opts.cmd.len != 2:
+      raise newException(ValueError, "instance " & action & " accepts only NAME")
+    if opts.follow and action != "logs":
+      raise newException(ValueError, "--follow requires instance logs")
+    if opts.force and action notin ["stop", "destroy"]:
+      raise newException(ValueError, "--force requires instance stop or destroy")
+    if opts.purge and action != "destroy":
+      raise newException(ValueError, "--purge requires instance destroy")
+    let path = instanceDirectory(opts.stateDir, name) / "instance.json"
+    if action == "status" and not fileExists(path) and not symlinkExists(path):
+      let lock = acquireInstanceOperationLock(opts.stateDir, name, opts.lockTimeoutSec)
+      try:
+        if not fileExists(path) and not symlinkExists(path):
+          if dirExists(parentDir(path)):
+            raise newException(IOError, "instance directory exists but receipt is missing")
+          printInstanceStatus(opts, absentInstanceStatus(opts.stateDir, name))
+          return 0
+      finally: lock.release()
+    let instance = loadInstance(opts.stateDir, name, opts.instanceId, opts.lockTimeoutSec)
+    defer: instance.close()
+    let timeout = if opts.timeoutSec > 0: opts.timeoutSec
+                  elif action in ["stop", "destroy"]: 60 else: 120
+    case action
+    of "status":
+      let data = instance.status()
+      printInstanceStatus(opts, data)
+      return (if data["ownership"].getStr() == "mismatch": 3 else: 0)
+    of "start": instance.start(timeout)
+    of "stop": instance.stop(timeout, opts.force)
+    of "destroy":
+      if opts.purge and opts.instanceId.len == 0:
+        raise newException(ValueError, "--purge requires --instance-id UUID")
+      instance.destroy(timeout, opts.force, opts.purge)
+      if opts.purge:
+        printInstanceStatus(opts, absentInstanceStatus(opts.stateDir, name))
+        return 0
+    of "ssh": return instance.ssh()
+    of "exec":
+      if opts.cmd.len < 3: raise newException(ValueError, "exec requires -- ARGV...")
+      let r = instance.exec(opts.cmd[2..^1], opts.envPairs, timeout)
+      stdout.write(r.stdout)
+      stderr.write(r.stderr)
+      return r.exitCode
+    of "logs": instance.logs(opts.follow); return 0
+    of "screenshot":
+      instance.screenshot(opts.screenshotPath, opts.screenshotDelaySec)
+    else: discard
+    printInstanceStatus(opts, instance.status())
+    return 0
   let (backend, vm) = existingIncusHandle(opts, name)
   let timeout = if opts.timeoutSec > 0: opts.timeoutSec else: 120
 
@@ -1794,4 +1973,10 @@ proc runCli*(args: seq[string]): int =
     return 2
 
 when isMainModule:
-  quit(runCli(commandLineParams()))
+  try: quit(runCli(commandLineParams()))
+  except ValueError as error:
+    stderr.writeLine("vm-harness: " & error.msg)
+    quit(2)
+  except CatchableError as error:
+    stderr.writeLine("vm-harness: " & error.msg)
+    quit(1)

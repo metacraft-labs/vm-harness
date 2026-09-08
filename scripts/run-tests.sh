@@ -13,6 +13,7 @@ run_nim r --hints:off tests/unit/t_auto_selection.nim
 run_nim r --hints:off tests/unit/t_guest_scripts.nim
 run_nim r --hints:off tests/unit/t_cli_probe.nim
 run_nim r --hints:off tests/unit/t_cli_boot.nim
+run_nim r --hints:off tests/unit/t_ssh_serialization.nim
 run_nim r --hints:off tests/unit/t_hyperv_parsers.nim
 run_nim r --hints:off tests/unit/t_hyperv_boot_media.nim
 run_nim r --hints:off tests/unit/t_pool_algorithms.nim
@@ -41,6 +42,7 @@ run_nim r --hints:off tests/e2e/t_vm_harness_auto_backend_selection.nim
 # Backend contracts that do not require a live hypervisor.
 run_nim r --hints:off tests/integration/t_libvirt_backend.nim
 run_nim r --hints:off tests/integration/t_cli_libvirt_flags.nim
+run_nim r --hints:off tests/integration/t_durable_media.nim
 
 # Live boot-smoke falsifiability gates. These really boot QEMU, but under
 # TCG against a 512-byte synthetic guest that halts in under a second, so

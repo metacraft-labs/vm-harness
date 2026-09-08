@@ -214,6 +214,7 @@ type
     ## known-good guest; BootMediaSpec spins up a transient VM around a
     ## specific bootable artifact to capture serial output during boot.
     name*: string                   ## ephemeral VM name (backend-prefixed)
+    instanceId*: string             ## durable libvirt UUID; empty for transient boots
     kind*: BootMediaKind
     mediaPath*: string              ## primary boot media (VHDX/ISO/tar path)
     secondaryIsoPath*: string       ## optional second ISO (e.g. cloud-init seed)

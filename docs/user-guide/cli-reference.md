@@ -115,6 +115,11 @@ named container. The golden/base image is never touched.
 
 ### `instance`
 
+For retained installed Linux VMs, see [Durable media instances](./durable-media.md):
+`boot --keep --name NAME --state-dir ROOT`, followed by
+`instance start|ssh|exec|status|logs|stop|destroy|screenshot NAME --state-dir ROOT`.
+The Incus commands below retain their existing behavior.
+
 ```console
 vm-harness instance wait --backend incus <name>
 vm-harness instance exec --backend incus <name> -- <command...>
