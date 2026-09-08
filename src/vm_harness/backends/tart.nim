@@ -135,11 +135,18 @@ proc newTartBackend*(guestOs: GuestOs = goLinux,
                      sshPort: int = 22,
                      ephemeralPrefix: string = "",
                      bootTimeoutSec: int = 90,
-                     sshReadyTimeoutSec: int = 180): TartBackend =
+                     sshReadyTimeoutSec: int = 180,
+                     useDefaultGolden: bool = true): TartBackend =
   ## Construct a TartBackend. ``guestOs`` selects which of the two
   ## registered IDs (``biTartMacos`` / ``biTartLinuxArm``) the resulting
-  ## backend identifies as; the corresponding default golden image is
-  ## picked when ``goldenImage`` is empty.
+  ## backend identifies as.
+  ##
+  ## When ``goldenImage`` is empty the corresponding cirruslabs default is
+  ## picked, which keeps direct construction convenient for smoke tests and
+  ## local experiments. Set ``useDefaultGolden = false`` to require an
+  ## explicit image instead: callers that are driven by configuration must
+  ## never silently boot a different image than the one they were told to
+  ## use, so the backend registry opts out (see ``registerBackend`` below).
   let id = case guestOs
            of goMacos: biTartMacos
            of goLinux: biTartLinuxArm
@@ -149,6 +156,8 @@ proc newTartBackend*(guestOs: GuestOs = goLinux,
                "(use UtmBackend / biUtmWindowsArm instead)")
   let golden = if goldenImage.len > 0:
                  goldenImage
+               elif not useDefaultGolden:
+                 ""
                else:
                  case guestOs
                  of goMacos: CirrusLabsMacosGolden
@@ -550,9 +559,12 @@ method probeAvailability*(b: TartBackend): bool =
 method provisionBaseline*(b: TartBackend, spec: BaselineSpec) =
   ## *Session* phase. Two responsibilities:
   ##
-  ## 1. Pull the cirruslabs golden into the local OCI cache (idempotent).
+  ## 1. Pull the golden into the local OCI cache (idempotent).
   ##    ``BaselineSpec.sourceImage``, when non-empty, overrides the
-  ##    backend's default ``goldenImage`` for the rest of the session.
+  ##    backend's ``goldenImage`` for the rest of the session. Note that
+  ##    ``--baseline`` does *not* reach this field — ``cli.nim`` routes it to
+  ##    ``BaselineSpec.name`` — so a caller that means "use this image" must
+  ##    pass ``--source-image``.
   ## 2. Reap any stale ``repro-vm-tart-*`` ephemerals left over from
   ##    prior aborted runs. The same cleanup is invoked by
   ##    ``stopAndCleanup`` so the matched-pair contract holds, but doing
@@ -564,8 +576,11 @@ method provisionBaseline*(b: TartBackend, spec: BaselineSpec) =
     b.ephemeralPrefix = spec.backendOptions["ephemeralPrefix"]
   if b.goldenImage.len == 0:
     raise newVmHarnessError($b.id, lpProvisioning,
-      "TartBackend: no golden image configured (set BaselineSpec." &
-      "sourceImage or pass goldenImage to newTartBackend)")
+      "TartBackend: no golden image configured. Pass --source-image " &
+      "(BaselineSpec.sourceImage); --baseline alone sets only the baseline " &
+      "name and does not select an image. Backends built through the " &
+      "registry deliberately have no default golden, so that a configured " &
+      "image can never be silently replaced by another one.")
   # Reap stale ephemerals.
   for v in b.listTartVms():
     if v.startsWith(b.ephemeralPrefix):
@@ -914,7 +929,13 @@ method listSnapshots*(b: TartBackend, vmName: string): seq[string] =
 # guest OS so ``newBackend(biTartMacos)`` produces a macOS-configured
 # instance and ``newBackend(biTartLinuxArm)`` produces the Linux one.
 
+# The registry is what the CLI — and therefore garm-provider-vmharness —
+# resolves a backend through, so these instances are always configuration
+# driven. They opt out of the cirruslabs default: a caller that named an image
+# and got a different one silently is worse than a caller that gets an error.
+# Booting the default here meant macOS CI runners ran an image that appears in
+# no configuration file, unnoticed, for as long as the plumbing was broken.
 registerBackend(biTartMacos,
-  proc(): VmBackend = newTartBackend(goMacos))
+  proc(): VmBackend = newTartBackend(goMacos, useDefaultGolden = false))
 registerBackend(biTartLinuxArm,
-  proc(): VmBackend = newTartBackend(goLinux))
+  proc(): VmBackend = newTartBackend(goLinux, useDefaultGolden = false))

@@ -1,4 +1,5 @@
 import std/[options, os, strutils, tables, tempfiles, unittest]
+import vm_harness/auto
 import vm_harness/backends/tart
 import vm_harness/types
 
@@ -108,3 +109,56 @@ suite "Tart backend commands":
     check result.exitCode == 0
     check "ready" in result.stdout
     check readFile(attempts) == "2"
+
+suite "Tart golden image selection":
+  # A configuration-driven caller that names an image must never be handed a
+  # different one. The cirruslabs default used to apply to registry-built
+  # backends too, so when garm-provider-vmharness passed the configured image
+  # through --baseline (which lands in BaselineSpec.name, not .sourceImage)
+  # the image was quietly discarded and macOS CI ran the default instead.
+
+  test "direct construction keeps the cirruslabs default":
+    check newTartBackend(guestOs = goMacos).goldenImage ==
+      CirrusLabsMacosGolden
+    check newTartBackend(guestOs = goLinux).goldenImage ==
+      CirrusLabsLinuxArmGolden
+
+  test "an explicit golden always wins over the default":
+    let backend = newTartBackend(
+      guestOs = goMacos,
+      goldenImage = "ghcr.io/metacraft-labs/macos-tart-runner:tahoe-nix-v1")
+    check backend.goldenImage ==
+      "ghcr.io/metacraft-labs/macos-tart-runner:tahoe-nix-v1"
+
+  test "opting out of the default leaves no golden configured":
+    check newTartBackend(
+      guestOs = goMacos, useDefaultGolden = false).goldenImage == ""
+    check newTartBackend(
+      guestOs = goLinux, useDefaultGolden = false).goldenImage == ""
+
+  test "registry-built backends have no default golden":
+    for id in [biTartMacos, biTartLinuxArm]:
+      let backend = TartBackend(newBackend(id))
+      check backend.goldenImage == ""
+
+  test "provisionBaseline fails loudly when no image was selected":
+    let backend = newTartBackend(guestOs = goMacos, useDefaultGolden = false)
+    var spec = BaselineSpec(name: "macos-tart-runner")
+    spec.backendOptions = initTable[string, string]()
+    expect VmHarnessError:
+      backend.provisionBaseline(spec)
+
+  test "provisionBaseline adopts sourceImage over a default":
+    let tmp = createTempDir("vmh-tart-unit-", "")
+    defer: removeDir(tmp)
+    let tart = tmp / "tart"
+    writeExecutable(tart, "#!/bin/sh\nexit 0\n")
+
+    let backend = newTartBackend(guestOs = goMacos, tartCmd = tart)
+    var spec = BaselineSpec(
+      name: "macos-tart-runner",
+      sourceImage: "ghcr.io/metacraft-labs/macos-tart-runner:tahoe-nix-v1")
+    spec.backendOptions = initTable[string, string]()
+    backend.provisionBaseline(spec)
+    check backend.goldenImage ==
+      "ghcr.io/metacraft-labs/macos-tart-runner:tahoe-nix-v1"
