@@ -86,9 +86,23 @@ the golden before it is trusted against a real image.
 An ephemeral pool member must be byte-identical to its baseline every cycle.
 A member hand-edited after construction is drift that no rebuild reproduces,
 and the standing rule here is that a fix lives in the recipe, not on a box.
-So the disable is baked into the image every member is built from —
-`build-golden-hyperv.ps1` calls this script on the captured VHDX as its last
-hardening step, alongside the Windows-Update-off and PowerShell-7 steps.
+So the disable is baked into the image every member is built from.
+
+It is **opt-in**, not automatic. `build-golden-hyperv.ps1` runs this script
+as its last hardening step **only when passed `-DisableDefender`**:
+
+```powershell
+build-golden-hyperv.ps1 -WindowsIso ... -AutounattendIso ... -DisableDefender
+```
+
+The default is Defender *enabled*. Stripping AV is not something a golden
+build should do unasked, and this is a product recipe with uses beyond the
+CI pool — so the pool opts in explicitly and a general-purpose golden keeps
+its antivirus. The catch to remember: the pool's PM6 selftest
+(`infra/.github/workflows/pm6-hyperv-pool-selftest.yml`) asserts Defender is
+off, so a pool golden built **without** `-DisableDefender` produces members
+that fail that step. That is the intended failure — it catches a pool golden
+built the wrong way — but it is worth knowing before it surprises you.
 
 ## Layout
 

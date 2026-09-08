@@ -69,7 +69,15 @@ param(
     [string]$GuestUser = 'admin',
     [string]$GuestPassword = 'repro-windows-x64',
     [int]$TimeoutMinutes = 90,
-    [switch]$KeepVm
+    [switch]$KeepVm,
+    # Disable Microsoft Defender in the captured image (offline). OFF by
+    # default: stripping AV from a Windows image is not something a golden
+    # build should do unasked, and this is a product recipe with uses beyond
+    # the CI pool. The ephemeral-runner pool opts in explicitly, because its
+    # members are throwaway and the on-access scanner taxes every build; a
+    # general-purpose golden should keep Defender. See
+    # ../lib/harden-defender.README.md.
+    [switch]$DisableDefender
 )
 
 $ErrorActionPreference = 'Stop'
@@ -354,16 +362,23 @@ if (-not $KeepVm) {
 # because it must NOT be online. No VM references $OutputVhdx at this point
 # (the build VM was removed, or -KeepVm copied rather than moved), so the
 # offline mount is safe.
-$defenderHardener = Join-Path $PSScriptRoot '..\lib\harden-defender.ps1'
-if (Test-Path -LiteralPath $defenderHardener) {
+#
+# Opt-in: only when -DisableDefender was passed. A missing hardener when the
+# caller asked for it is a hard error, not a warning that silently ships an
+# image with Defender still on -- the whole point of asking was to not get
+# that.
+if ($DisableDefender) {
+    $defenderHardener = Join-Path $PSScriptRoot '..\lib\harden-defender.ps1'
+    if (-not (Test-Path -LiteralPath $defenderHardener)) {
+        throw "-DisableDefender was requested but $defenderHardener is missing"
+    }
     Log "disabling Defender in the captured image (offline)"
     # It throws on failure (its own ErrorActionPreference=Stop and a verify
     # pass), which propagates here; no exit-code check -- $LASTEXITCODE after
     # this would be an internal reg.exe call, not the script's verdict.
     & $defenderHardener -VhdxPath $OutputVhdx
 } else {
-    Log "WARNING: ../lib/harden-defender.ps1 not found; image ships WITH Defender enabled."
-    Log "         Every member's on-access scanner will then tax every build."
+    Log "Defender left ENABLED (pass -DisableDefender to strip it, e.g. for the CI pool golden)"
 }
 
 $g = Get-Item -LiteralPath $OutputVhdx
