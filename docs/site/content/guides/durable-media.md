@@ -166,6 +166,19 @@ ELF PCRE dependency; pcre-config supplies its linker path/RUNPATH at build time.
 The Nix package declares PCRE inputs. Runtime does not require inherited
 LD_LIBRARY_PATH, which callers may unset before invoking host libvirt.
 Native Linux builds need PCRE development files (pcre-config) as well as Nim.
+Each Linux compile action selects the canonical pcre-config tool identity and
+its uname dependency (pinned coreutils for Nix provisioning);
+declaring package-level uses alone does not select it for a narrow build.
+Missing or failing pcre-config is a compile error, except during graph-interface
+and provider compilation, which declare the tools before they can be selected.
+The optional diagnostic `python3 tests/integration/test_pcre_native_graph.py`
+runs separate native CLI, benchmark and lifecycle-test builds using pinned Nix
+provisioning from a base environment with Python 3 and Nim, but no pcre-config.
+It launches the CLI and lifecycle fixtures with LD_LIBRARY_PATH unset, checks
+inspection during active SSH/exec, and prints the binary path, hash and evidence
+directory. Set REPRO_BIN to the native repro executable being verified, with its
+bootstrap environment active. This is not in the default test graph: it tests
+graph bootstrapping itself and must not recursively build that graph.
 Libvirt must support keep-nvram/keep-tpm and nvram/tpm undefine flags.
 
 The deterministic lifecycle suite uses fresh CLI processes and executable

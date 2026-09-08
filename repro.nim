@@ -10,6 +10,8 @@ import repro_project_dsl
 import ct_test_nim_unittest
 import repro_dsl_stdlib/nixpkgs_pin
 import repro_resources/run_edge
+when defined(linux):
+  import repro_dsl_stdlib/packages/pcre_config
 
 # TI2 producer-surface declaration: vm-harness's resource providers live in a
 # SEPARATE module (`src/vm_harness/repro/resources.nim`, re-authored via the RP4
@@ -84,6 +86,7 @@ package vm_harness:
     "nim >=2.2 <3.0"
     when defined(linux):
       "pcre-config >=0"
+      "uname"
     when defined(macosx):
       "clang"
     else:
@@ -116,11 +119,15 @@ package vm_harness:
       binary = binDir & "vm-harness" & exeSuffix,
       extraInputs = @["src", "config.nims", "guest-scripts", "guest-recipes"],
       actionId = "vm_harness.cli.build")
+    when defined(linux):
+      appendRegisteredActionToolIdentityRefs(cliBuild.id, ["pcre-config", "uname"])
     let benchBuild = nim.c(
       source = "tools/bench/snapshot_revert_bench.nim",
       binary = binDir & "vm-harness-bench-snapshot-revert" & exeSuffix,
       extraInputs = @["src", "config.nims", "tools", "guest-scripts", "guest-recipes"],
       actionId = "vm_harness.snapshot_revert_bench.build")
+    when defined(linux):
+      appendRegisteredActionToolIdentityRefs(benchBuild.id, ["pcre-config", "uname"])
     discard collect("default", @[cliBuild, benchBuild])
 
     var testBuildActions: seq[BuildActionDef] = @[]
@@ -134,6 +141,9 @@ package vm_harness:
         binary = output,
         extraInputs = @["src", "config.nims", "guest-scripts", "guest-recipes"],
         actionId = "vm_harness.test_build." & spec.binary)
+      when defined(linux):
+        # The unittest adapter does not register Nim's C compiler itself.
+        appendRegisteredActionToolIdentityRefs(edge.action.id, ["pcre-config", "uname", "gcc"])
       buildActions.add(edge.action)
       let execute = edge.testBinary.run(
         actionId = "vm_harness.test_execute." & spec.binary,
@@ -153,6 +163,13 @@ package vm_harness:
     discard collect("test", testExecuteActions)
 
 when defined(linux):
+  # The pinned pcre-config shell script invokes uname even for --libs.
+  package uname:
+    provisioning:
+      nixPackage "nixpkgs#coreutils", executablePath = "bin/uname",
+        nixpkgsRev = CanonicalNixpkgsRev,
+        nixpkgsNarHash = CanonicalNixpkgsNarHash
+
   package vmHarnessPcre:
     provisioning:
       nixPackage "nixpkgs#pcre.out", executablePath = "lib/libpcre.so",

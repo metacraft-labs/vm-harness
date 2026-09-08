@@ -69,13 +69,16 @@
               name = "just lint";
               entry = "${pkgs.writeShellScript "vm-harness-just-lint" ''
                 export PATH=${
-                  pkgs.lib.makeBinPath [
-                    pkgs.bash
-                    pkgs.coreutils
-                    pkgs.just
-                    pkgs.nim
-                    pkgs.nixfmt
-                  ]
+                  pkgs.lib.makeBinPath (
+                    [
+                      pkgs.bash
+                      pkgs.coreutils
+                      pkgs.just
+                      pkgs.nim
+                      pkgs.nixfmt
+                    ]
+                    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.pcre.dev ]
+                  )
                 }:$PATH
                 exec ${pkgs.just}/bin/just lint
               ''}";

@@ -158,10 +158,14 @@ proc setup(): Fixture =
     "HOME": result.root, "PATH": bin & ":" & getEnv("PATH"),
     "LIBVIRT_DEFAULT_URI": "qemu:///session"}.toTable()
 
+proc cliCommand(): seq[string] =
+  let external = getEnv("VMH_TEST_CLI")
+  if external.len > 0: @[external] else: @[getAppFilename(), "cli"]
+
 proc run(f: Fixture, args: seq[string], extra = initTable[string, string]()): ExecResult =
   var env = f.env
   for k, v in extra: env[k] = v
-  captureCommand(@[getAppFilename(), "cli"] & args, env = env,
+  captureCommand(cliCommand() & args, env = env,
                   timeoutSec = 20, mergeStderr = false)
 
 proc bootArgs(f: Fixture): seq[string] =
@@ -396,12 +400,18 @@ suite "durable libvirt CLI (fresh process fixtures)":
         let arguments = f.action(verb, (if verb == "exec": @["--", "true"] else: @[]))
         # env(1) launches the real dispatcher in a separate process.
         let envArgs = f.env.pairs.toSeq().mapIt(it[0] & "=" & it[1]) & @["VMH_FIXTURE_HOLD=yes"]
-        let p = startProcess("env", args = envArgs & @[getAppFilename(), "cli"] & arguments,
+        let p = startProcess("env", args = envArgs & cliCommand() & arguments,
                              options = {poUsePath, poStdErrToStdOut})
         defer: p.close()
         let deadline = epochTime() + 5
         while not fileExists(f.root / "ssh-started") and epochTime() < deadline: sleep(10)
         require fileExists(f.root / "ssh-started")
+        let status = f.run(f.action("status", @["--lock-timeout-sec", "0"]))
+        require status.exitCode == 0
+        check parseJson(status.stdout)["state"].getStr() == "running"
+        let logs = f.run(f.action("logs", @["--lock-timeout-sec", "0"]))
+        check logs.exitCode == 0
+        check logs.stdout == "READY\n"
         let busy = f.run(f.action("stop", @["--lock-timeout-sec", "0"]))
         check busy.exitCode != 0
         check "busy" in busy.stderr
