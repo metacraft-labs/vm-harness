@@ -1595,15 +1595,15 @@ proc cmdInstance(opts: CliOpts): int =
       raise newException(ValueError, "--purge requires instance destroy")
     let path = instanceDirectory(opts.stateDir, name) / "instance.json"
     if action == "status" and not fileExists(path) and not symlinkExists(path):
-      let lock = acquireInstanceOperationLock(opts.stateDir, name, opts.lockTimeoutSec)
-      try:
-        if not fileExists(path) and not symlinkExists(path):
-          if dirExists(parentDir(path)):
-            raise newException(IOError, "instance directory exists but receipt is missing")
-          printInstanceStatus(opts, absentInstanceStatus(opts.stateDir, name))
-          return 0
-      finally: lock.release()
-    let instance = loadInstance(opts.stateDir, name, opts.instanceId, opts.lockTimeoutSec)
+      for dir in [absolutePath(opts.stateDir), parentDir(parentDir(path)), parentDir(path)]:
+        if symlinkExists(dir) or fileExists(dir):
+          raise newException(IOError, "instance state must be directories, not links or files")
+      if dirExists(parentDir(path)):
+        raise newException(IOError, "instance directory exists but receipt is missing")
+      printInstanceStatus(opts, absentInstanceStatus(opts.stateDir, name))
+      return 0
+    let instance = loadInstance(opts.stateDir, name, opts.instanceId, opts.lockTimeoutSec,
+                                readOnly = action in ["status", "logs"])
     defer: instance.close()
     let timeout = if opts.timeoutSec > 0: opts.timeoutSec
                   elif action in ["stop", "destroy"]: 60 else: 120

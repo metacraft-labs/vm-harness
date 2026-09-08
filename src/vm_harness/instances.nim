@@ -90,6 +90,10 @@ proc release*(lock: InstanceLock) =
 proc close*(instance: DurableInstance) =
   if instance != nil: instance.operationLock.release()
 
+proc requireExclusive(instance: DurableInstance) =
+  if instance.operationLock == nil or instance.operationLock.fd < 0:
+    raise newException(VmHarnessError, "instance operation requires an exclusive lock")
+
 proc atomicStateWrite*(path, content: string) =
   when defined(linux):
     if symlinkExists(path): raise newException(IOError, "refusing state symlink: " & path)
@@ -119,6 +123,7 @@ proc atomicStateWrite*(path, content: string) =
     raise newException(BackendUnavailableError, "durable media requires Linux/libvirt")
 
 proc save*(instance: DurableInstance, phase: string, error = "") =
+  instance.requireExclusive()
   instance.receipt["phase"] = %phase
   instance.receipt["last_error"] = %error
   instance.receipt["updated_at"] = %int64(epochTime())
@@ -132,6 +137,7 @@ proc observe*(instance: DurableInstance): LibvirtDomainObservation =
                                       instance.field("instance_id"))
 
 proc preserveDomainXml*(instance: DurableInstance) =
+  instance.requireExclusive()
   if instance.observe().present:
     let xml = instance.backend.checkedVirsh([
       "dumpxml", instance.field("instance_id"), "--inactive"])
@@ -192,11 +198,12 @@ proc beginDurableBoot*(root, name, requestedId: string, b: LibvirtBackend,
     lock.release()
     raise
 
-proc loadInstance*(root, name, expectedId: string, lockTimeoutSec = 10): DurableInstance =
-  let lock = acquireInstanceOperationLock(root, name, lockTimeoutSec)
+proc loadInstance*(root, name, expectedId: string, lockTimeoutSec = 10,
+                   readOnly = false): DurableInstance =
+  let lock = if readOnly: nil else: acquireInstanceOperationLock(root, name, lockTimeoutSec)
   try:
     let dir = instanceDirectory(root, name)
-    if symlinkExists(parentDir(dir)) or symlinkExists(dir):
+    if symlinkExists(absolutePath(root)) or symlinkExists(parentDir(dir)) or symlinkExists(dir):
       raise newException(IOError, "instance state must not be a symlink")
     let path = dir / "instance.json"
     if symlinkExists(path): raise newException(IOError, "receipt must not be a symlink")
@@ -252,6 +259,7 @@ proc handle*(instance: DurableInstance): VmHandle =
     extra: {"serialLogPath": instance.field("serial_log")}.toTable())
 
 proc failBoot*(instance: DurableInstance, message: string) =
+  instance.requireExclusive()
   var failures: seq[string]
   try: instance.save("failed", message)
   except CatchableError as error: failures.add(error.msg)
@@ -379,6 +387,7 @@ proc ensurePurgeUnreferenced(instance: DurableInstance) =
     raise newException(VmHarnessError, "refusing to purge a caller-owned or linked disk")
 
 proc start*(instance: DurableInstance, timeoutSec = 120) =
+  instance.requireExclusive()
   let observed = instance.observe()
   try:
     instance.save("starting")
@@ -397,6 +406,7 @@ proc start*(instance: DurableInstance, timeoutSec = 120) =
     raise
 
 proc stop*(instance: DurableInstance, timeoutSec = 60, force = false) =
+  instance.requireExclusive()
   discard instance.observe()
   try:
     instance.save("stopping")
@@ -409,6 +419,7 @@ proc stop*(instance: DurableInstance, timeoutSec = 60, force = false) =
 
 proc destroy*(instance: DurableInstance, timeoutSec = 60, force = false,
               purge = false) =
+  instance.requireExclusive()
   var observed = instance.observe()
   let root = parentDir(parentDir(parentDir(instance.receiptPath)))
   let registryLock = if purge: acquireInstanceOperationLock(root, "index", 10, true) else: nil
@@ -448,6 +459,7 @@ proc destroy*(instance: DurableInstance, timeoutSec = 60, force = false,
     raise
 
 proc requireRunning(instance: DurableInstance) =
+  instance.requireExclusive()
   let observed = instance.observe()
   if not observed.present or observed.state != "running":
     raise newException(VmHarnessError, "instance is not running; use instance start")

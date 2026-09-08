@@ -365,6 +365,27 @@ suite "durable libvirt CLI (fresh process fixtures)":
       check parseJson(f.run(f.action("status")).stdout)["state"].getStr() == "absent"
       check f.run(f.bootArgs()).exitCode == 0
 
+  test "status and logs remain readable while an exclusive operation lock is held":
+    when defined(linux):
+      let f = setup()
+      defer: removeDir(f.root)
+      require f.run(f.bootArgs()).exitCode == 0
+      let lock = acquireInstanceOperationLock(f.root / "harness", "dev")
+      defer: lock.release()
+      let data = f.run(f.action("status", @["--lock-timeout-sec", "0"]))
+      checkpoint data.stderr
+      require data.exitCode == 0
+      check parseJson(data.stdout)["state"].getStr() == "running"
+      let logs = f.run(f.action("logs", @["--lock-timeout-sec", "0"]))
+      check logs.exitCode == 0
+      check logs.stdout == "READY\n"
+      let busy = f.run(f.action("stop", @["--lock-timeout-sec", "0"]))
+      check busy.exitCode != 0
+      check "busy" in busy.stderr
+      let reader = loadInstance(f.root / "harness", "dev", "", readOnly = true)
+      defer: reader.close()
+      expect VmHarnessError: reader.stop()
+
   test "operation lock is bounded and retained through exec and interactive SSH":
     when defined(linux):
       let f = setup()

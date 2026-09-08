@@ -145,8 +145,11 @@ Receipts are written before boot side effects, atomically replaced, and fsynced.
 Failure preserves a failed receipt and attempts checked owned shutdown.
 Bounded flock locks (`--lock-timeout-sec 0..300`, default 10) serialize operations
 and remain held through exec/interactive SSH. Another command can fail busy;
-it must not destroy an active command's VM. Logs releases its lock before follow
-so it does not block shutdown. Lock files survive purge; OS locks do not survive
+it must not destroy an active command's VM. Status and logs read the atomic receipt
+without taking the operation lock, so inspection works during interactive SSH.
+These are point-in-time observations, not a transaction with libvirt; concurrent
+purge or definition changes can return an I/O/backend error. Read-only library
+handles reject mutating operations. Lock files survive purge; OS locks do not survive
 process exit. They are not lifetime leases.
 
 ## Runtime And Verification
