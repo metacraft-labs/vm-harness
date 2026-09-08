@@ -44,11 +44,12 @@
 ##   open means the harness can never back-pressure the guest's console
 ##   by failing to drain it.
 ##
-## *Ownership and teardown.* Everything a run creates lives under one
-## per-VM run directory: the CoW overlay, the writable NVRAM copy, the
-## chardev socket and QEMU's own log. ``stopAndCleanup`` kills the
-## process and removes that directory, and is safe to call repeatedly
-## and from a ``finally``. The caller-visible serial log is written
+## *Ownership and teardown.* The per-VM run directory holds the CoW
+## overlay, the writable NVRAM copy and
+## QEMU's own log. Sockets use a separate, private, short-path directory.
+## ``stopAndCleanup`` kills the process and removes both directories,
+## and is safe to call repeatedly and from a ``finally``. The
+## caller-visible serial log is written
 ## wherever ``BootMediaSpec.serialLogPath`` points, which callers should
 ## put *outside* the run directory precisely so it survives teardown as
 ## a test artifact.
@@ -252,18 +253,69 @@ proc newQemuBootVmName*(prefix = QemuBootNamePrefix): string =
 proc runDirFor*(b: QemuBootBackend, name: string): string =
   b.stateDir / name
 
+proc socketDirectoryFor(b: QemuBootBackend, name: string): string =
+  # Reserve the NUL byte and the longest socket basename. Nim string
+  # lengths are bytes, including for UTF-8 paths.
+  const pathLimit = when defined(posix):
+                     sizeof(default(Sockaddr_un).sun_path) - 1
+                   else: 103
+  let leaf = "vmh-qb-" & toHex(cast[uint](hash(absolutePath(b.runDirFor(name)))))
+  let temp = absolutePath(getTempDir())
+  if (temp / leaf / "serial.sock").len <= pathLimit:
+    return temp / leaf
+  when defined(posix):
+    let runtime = getEnv("XDG_RUNTIME_DIR")
+    var info: Stat
+    if runtime.isAbsolute and
+        (runtime / leaf / "serial.sock").len <= pathLimit and
+        lstat(runtime.cstring, info) == 0 and S_ISDIR(info.st_mode) and
+        info.st_uid == geteuid() and (info.st_mode and Mode(0o077)) == 0:
+      return runtime / leaf
+    # /tmp is short on POSIX, including macOS where TMPDIR often is not.
+    # The caller must exclusively mkdir this per-run directory with 0700;
+    # a hash collision or pre-existing inode is an error, never an unlink.
+    return "/tmp" / leaf
+  else:
+    raise newException(ValueError, "QemuBootBackend: temporary socket path is too long")
+
 proc serialSocketPathFor*(b: QemuBootBackend, name: string): string =
-  ## Unix sockets have a ~108 byte sun_path limit, which a long
-  ## ``stateDir`` plus a long VM name can exceed. Hash the run directory
-  ## down to a short, stable name under the system temp dir instead of
-  ## discovering the limit at bind time.
-  getTempDir() / ("vmh-qb-" & $abs(hash(b.runDirFor(name))) & ".sock")
+  ## Stable, byte-bounded path inside this run's private socket directory.
+  b.socketDirectoryFor(name) / "serial.sock"
 
 proc tpmSocketPathFor*(b: QemuBootBackend, name: string): string =
-  ## swtpm's control socket. Short-named for the same ``sun_path`` reason
-  ## as the serial socket, and distinct from it so a stale file from one
-  ## can never be mistaken for the other.
-  getTempDir() / ("vmh-qb-tpm-" & $abs(hash(b.runDirFor(name))) & ".sock")
+  ## swtpm's control socket, separate from the serial chardev.
+  b.socketDirectoryFor(name) / "tpm.sock"
+
+proc directoryIdentity(path: string): string =
+  let info = getFileInfo(path, followSymlink = false)
+  if info.kind == pcDir:
+    result = $info.id.device & ":" & $info.id.file
+
+proc removeClaimedDirectory(path, identity: string) =
+  # A retained or partially constructed run can be replaced before cleanup.
+  # Refuse paths whose non-followed directory identity no longer matches.
+  if path.len == 0 or identity.len == 0:
+    return
+  var current: string
+  try:
+    current = directoryIdentity(path)
+  except OSError as e:
+    when defined(posix):
+      if e.errorCode in [ENOENT, ENOTDIR]:
+        return
+    raise
+  if current == identity:
+    removeDir(path)
+
+when defined(posix):
+  proc claimPrivateDirectory(path: string): string =
+    # Unlike createDir, mkdir fails on EVERY existing inode, including
+    # directories and symlinks. Do not adopt or delete another run's state.
+    if posix.mkdir(path.cstring, Mode(0o700)) != 0:
+      raiseOSError(osLastError(), "QemuBootBackend: cannot claim " & path)
+    result = directoryIdentity(path)
+    if result.len == 0:
+      raise newException(IOError, "QemuBootBackend: claimed directory changed: " & path)
 
 # ---------------------------------------------------------------------------
 # Argument construction. Pure over a value type so it is unit-testable
@@ -475,8 +527,8 @@ proc startSwtpmInBackground*(b: QemuBootBackend, runDir, socketPath: string): in
   let tpmStateDir = runDir / "tpm"
   createDir(tpmStateDir)
   if pathExists(socketPath):
-    try: removeFile(socketPath)
-    except CatchableError: discard
+    raise newException(IOError,
+      "QemuBootBackend: swtpm socket already exists: " & socketPath)
   let args = @[
     "socket",
     "--tpm2",
@@ -557,11 +609,24 @@ method bootFromMedia*(b: QemuBootBackend, spec: BootMediaSpec): VmHandle =
       raise newException(ValueError,
         "BootMediaSpec.name must start with '" & b.namePrefix &
         "' so a stale-process sweep can recognise it (got '" & vmName & "')")
+    if vmName != extractFilename(vmName):
+      raise newException(ValueError, "BootMediaSpec.name must be a single path component")
 
     let runDir = b.runDirFor(vmName)
-    if dirExists(runDir):
-      removeDir(runDir)
-    createDir(runDir)
+    let stateParent = parentDir(b.stateDir)
+    if stateParent.len > 0:
+      createDir(stateParent)
+    if posix.mkdir(b.stateDir.cstring, Mode(0o700)) != 0:
+      let code = osLastError()
+      if code != OSErrorCode(EEXIST):
+        raiseOSError(code, "QemuBootBackend: cannot create state directory " & b.stateDir)
+    var stateInfo: Stat
+    if lstat(b.stateDir.cstring, stateInfo) != 0 or
+        not S_ISDIR(stateInfo.st_mode) or stateInfo.st_uid != geteuid() or
+        (stateInfo.st_mode and Mode(0o022)) != 0:
+      raise newException(IOError,
+        "QemuBootBackend: state directory must be owned and not writable by others: " & b.stateDir)
+    let runDirIdentity = claimPrivateDirectory(runDir)
 
     # Everything below can fail; a half-built VM must not leak a process,
     # an overlay or a socket, so the whole body runs under one guard.
@@ -570,7 +635,12 @@ method bootFromMedia*(b: QemuBootBackend, spec: BootMediaSpec): VmHandle =
     var pid = 0
     var swtpmPid = 0
     var handle: VmHandle
+    var socketDir = ""
+    var socketDirIdentity = ""
     try:
+      let candidate = b.socketDirectoryFor(vmName)
+      socketDirIdentity = claimPrivateDirectory(candidate)
+      socketDir = candidate
       let serialLogPath =
         if spec.serialLogPath.len > 0: absolutePath(spec.serialLogPath)
         else: runDir / "serial.log"
@@ -582,9 +652,7 @@ method bootFromMedia*(b: QemuBootBackend, spec: BootMediaSpec): VmHandle =
       if fileExists(serialLogPath):
         removeFile(serialLogPath)
 
-      let socketPath = b.serialSocketPathFor(vmName)
-      if pathExists(socketPath):
-        removeFile(socketPath)
+      let socketPath = socketDir / "serial.sock"
 
       var launch = QemuBootLaunch(
         vmName: vmName,
@@ -672,7 +740,7 @@ method bootFromMedia*(b: QemuBootBackend, spec: BootMediaSpec): VmHandle =
             b.swtpmCmd & "' on PATH (it is pkgs.swtpm, and it is in the " &
             "vm-harness and reprobuild dev shells). Refusing to boot a " &
             "guest without the TPM it asked for.")
-        tpmSocketPath = b.tpmSocketPathFor(vmName)
+        tpmSocketPath = socketDir / "tpm.sock"
         swtpmPid = b.startSwtpmInBackground(runDir, tpmSocketPath)
         launch.tpmSocketPath = tpmSocketPath
 
@@ -709,9 +777,12 @@ method bootFromMedia*(b: QemuBootBackend, spec: BootMediaSpec): VmHandle =
       var extra = initTable[string, string]()
       extra["mediaPath"] = spec.mediaPath
       extra["runDir"] = runDir
+      extra["runDirIdentity"] = runDirIdentity
       extra["qemuPid"] = $pid
       extra["serialLogPath"] = serialLogPath
       extra["serialSocketPath"] = socketPath
+      extra["socketDir"] = socketDir
+      extra["socketDirIdentity"] = socketDirIdentity
       extra["qemuStdioLogPath"] = stdioLog
       if swtpmPid > 0:
         extra["swtpmPid"] = $swtpmPid
@@ -741,15 +812,10 @@ method bootFromMedia*(b: QemuBootBackend, spec: BootMediaSpec): VmHandle =
       if swtpmPid > 0:
         stopStartedProcess(swtpmPid)
       try:
-        let sock = b.serialSocketPathFor(vmName)
-        if pathExists(sock): removeFile(sock)
+        removeClaimedDirectory(socketDir, socketDirIdentity)
       except CatchableError: discard
       try:
-        let tpmSock = b.tpmSocketPathFor(vmName)
-        if pathExists(tpmSock): removeFile(tpmSock)
-      except CatchableError: discard
-      try:
-        if dirExists(runDir): removeDir(runDir)
+        removeClaimedDirectory(runDir, runDirIdentity)
       except CatchableError: discard
       raise
   else:
@@ -761,6 +827,15 @@ method stopAndCleanup*(b: QemuBootBackend, vm: VmHandle,
   ## Unconditional teardown. Never raises, idempotent, and safe from a
   ## ``finally`` reached by timeout, assertion failure or exception.
   if vm == nil:
+    return
+  if vm.extra.getOrDefault("cleanedUp") == "true":
+    # A stop that retained the VM may still be followed by deletion.
+    if deleteVm and vm.extra.getOrDefault("runDirRetained") == "true":
+      try:
+        removeClaimedDirectory(vm.extra.getOrDefault("runDir"),
+                               vm.extra.getOrDefault("runDirIdentity"))
+        vm.extra["runDirRetained"] = "false"
+      except CatchableError: discard
     return
   try:
     let pidText = vm.extra.getOrDefault("qemuPid", "")
@@ -774,18 +849,14 @@ method stopAndCleanup*(b: QemuBootBackend, vm: VmHandle,
     if swtpmPidText.len > 0:
       try: stopStartedProcess(parseInt(swtpmPidText))
       except ValueError: discard
-    let sock = vm.extra.getOrDefault("serialSocketPath", "")
-    if sock.len > 0 and pathExists(sock):
-      try: removeFile(sock) except CatchableError: discard
-    let tpmSock = vm.extra.getOrDefault("tpmSocketPath", "")
-    if tpmSock.len > 0 and pathExists(tpmSock):
-      try: removeFile(tpmSock) except CatchableError: discard
+    removeClaimedDirectory(vm.extra.getOrDefault("socketDir"),
+                           vm.extra.getOrDefault("socketDirIdentity"))
     if deleteVm:
-      let runDir = vm.extra.getOrDefault("runDir", "")
-      # A caller-owned install target may live outside the run dir; the
-      # run dir itself is always ours, overlay included.
-      if runDir.len > 0 and dirExists(runDir):
-        removeDir(runDir)
+      # A caller-owned install target may live outside the run dir.
+      # Remove this path only if it still identifies the claimed directory.
+      removeClaimedDirectory(vm.extra.getOrDefault("runDir"),
+                             vm.extra.getOrDefault("runDirIdentity"))
+    vm.extra["runDirRetained"] = $(not deleteVm)
     vm.extra["cleanedUp"] = "true"
   except CatchableError:
     discard

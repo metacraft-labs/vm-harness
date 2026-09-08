@@ -34,7 +34,7 @@
 ##
 ## On Linux this file has NO skip path. Every case runs or the gate is red.
 
-import std/[os, posix, strutils, tables, unittest]
+import std/[os, posix, strutils, tables, tempfiles, unittest]
 
 when not defined(linux):
   echo "[skip] t_guest_sees_tpm_device: the qemu-boot vTPM path is Linux-only"
@@ -180,6 +180,57 @@ suite "a booted Linux guest sees the vTPM when it is enabled":
     check MarkerPresent in r.failureMessage
 
 suite "a vTPM boot leaves nothing behind":
+  test "deep TMPDIR keeps real TPM state isolated and removes both sockets":
+    let oldTemp = getEnv("TMPDIR")
+    let hadTemp = existsEnv("TMPDIR")
+    let root = createTempDir("vmh-deep-tpm-", "")
+    defer:
+      if hadTemp: putEnv("TMPDIR", oldTemp)
+      else: delEnv("TMPDIR")
+      removeDir(root)
+    let deepTemp = root / repeat("deep-temp-", 16)
+    createDir(deepTemp)
+    putEnv("TMPDIR", deepTemp)
+    let b = newQemuBootBackend(namePrefix = TestNamePrefix)
+    let g = requireGuest()
+    let vm = b.bootFromMedia(BootMediaSpec(
+      name: newQemuBootVmName(TestNamePrefix), kind: bmkKernel,
+      mediaPath: g / "kernel", cpus: 2, memoryMB: 1024,
+      acceleration: baAuto, tpmEnabled: true,
+      serialLogPath: artifactDir() / "tpm-deep-temp.serial.log",
+      extra: {"initrdPath": g / "initramfs.gz",
+              "kernelCmdline": "console=ttyS0 panic=1 loglevel=3"}.toTable))
+    defer: b.stopAndCleanup(vm)
+    let stream = b.captureSerial(vm)
+    defer: b.closeSerial(stream)
+    check vm.extra["tpmStateDir"].startsWith(deepTemp / "")
+    check dirExists(vm.extra["tpmStateDir"])
+    let socketDir = vm.extra["socketDir"]
+    check getFilePermissions(socketDir) == {fpUserRead, fpUserWrite, fpUserExec}
+    for key in ["runDir", "socketDir"]:
+      let id = getFileInfo(vm.extra[key], followSymlink = false).id
+      check vm.extra[key & "Identity"] == $id.device & ":" & $id.file
+    for key in ["serialSocketPath", "tpmSocketPath"]:
+      check vm.extra[key].len < sizeof(default(Sockaddr_un).sun_path)
+      check vm.extra[key].parentDir == socketDir
+      check pathExists(vm.extra[key])
+    check b.expectLine(stream, MarkerPresent, 60).matched
+    check b.expectLine(stream, MarkerGetCapFamily, 60).matched
+    # Cleanup must use the claimed paths, even if the caller changes TMPDIR.
+    putEnv("TMPDIR", root)
+    b.stopAndCleanup(vm)
+    check not pathExists(socketDir)
+    check not dirExists(vm.extra["runDir"])
+    check not processAlive(parseInt(vm.extra["swtpmPid"]))
+    check not processAlive(parseInt(vm.extra["qemuPid"]))
+    check fileExists(vm.extra["serialLogPath"])
+    # Repeating teardown must not delete a replacement at the same path.
+    createDir(socketDir)
+    defer: removeDir(socketDir)
+    writeFile(socketDir / "replacement", "keep")
+    b.stopAndCleanup(vm)
+    check readFile(socketDir / "replacement") == "keep"
+
   test "no swtpm, no QEMU, no run directory survives either polarity":
     # Runs both polarities back to back and then asserts against observed
     # system state. swtpm is the interesting one: it is NOT a child of
@@ -256,6 +307,8 @@ suite "a vTPM boot leaves nothing behind":
     check liveSwtpms().len == 0
     check not dirExists(vm.extra["runDir"])
     check not pathExists(vm.extra["tpmSocketPath"])
+    check not pathExists(vm.extra["serialSocketPath"])
+    check not pathExists(vm.extra["socketDir"])
 
   test "a setup failure after swtpm started still reaps it":
     # The other path with no QEMU to do the reaping: swtpm is up, QEMU
@@ -287,6 +340,7 @@ suite "a vTPM boot leaves nothing behind":
     check liveSwtpms().len == 0
     check not dirExists(b.runDirFor(name))
     check not pathExists(b.tpmSocketPathFor(name))
+    check not pathExists(b.serialSocketPathFor(name).parentDir)
 
   test "a failed run leaves nothing behind either":
     # The path that matters most: an assertion failure, not a clean pass.
