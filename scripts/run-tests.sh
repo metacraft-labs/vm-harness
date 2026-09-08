@@ -32,12 +32,16 @@ run_nim r --hints:off tests/unit/t_prune.nim
 run_nim r --hints:off tests/unit/t_layer_gc.nim
 run_nim r --hints:off tests/unit/t_design_reprobuild_adapter_section.nim
 run_nim r --hints:off tests/unit/t_uefi_iso_validator.nim
+run_nim r --hints:off tests/unit/t_serve_protocol.nim
 
 # Backend-independent lifecycle and CLI coverage.
 run_nim r --hints:off tests/integration/t_noop_lifecycle.nim
 run_nim r --hints:off tests/e2e/t_vm_harness_smoke.nim
 run_nim r --hints:off tests/e2e/t_vm_harness_finally_cleanup_on_panic.nim
 run_nim r --hints:off tests/e2e/t_vm_harness_auto_backend_selection.nim
+# RA1 remoting: a remote client drives provision->run->destroy against a
+# `vm-harness serve` daemon over the authenticated endpoint (noop backend).
+run_nim r --hints:off tests/e2e/t_vmharness_serve_roundtrip.nim
 
 # Backend contracts that do not require a live hypervisor.
 run_nim r --hints:off tests/integration/t_libvirt_backend.nim

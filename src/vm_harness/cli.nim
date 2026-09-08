@@ -38,6 +38,8 @@ import ./backends/incus
 import ./prune
 import ./layer_gc
 import ./instances
+import ./serve/server
+import ./serve/client
 
 type
   LogFormat* = enum
@@ -186,6 +188,30 @@ type
     dryRun*: bool                ## ``--dry-run`` — ``prune`` reports only.
     sweepTmp*: bool              ## ``--sweep-tmp`` — also age-sweep transient
                                  ## ``/tmp`` scratch files during ``prune``.
+    # ``serve`` daemon + ``--remote`` client (RA1 remoting).
+    remote*: string              ## ``--remote <host:port>`` — route this
+                                 ## subcommand to a remote ``vm-harness serve``
+                                 ## daemon instead of running it locally.
+    authToken*: string           ## ``--auth-token <tok>`` — bearer token for
+                                 ## ``serve`` (server side) or ``--remote``
+                                 ## (client side). Prefer ``--auth-token-file``.
+    authTokenFile*: string       ## ``--auth-token-file <path>`` — read the
+                                 ## bearer token from a file (agenix/systemd
+                                 ## ``LoadCredential`` friendly).
+    listen*: string              ## ``serve --listen <host:port>`` — bind
+                                 ## address. Default ``127.0.0.1:8873``. In
+                                 ## production this is a NetBird overlay IP,
+                                 ## NEVER a public interface.
+    workerExe*: string           ## ``serve --worker-exe <path>`` — vm-harness
+                                 ## binary the daemon execs per request.
+                                 ## Default: the daemon's own binary.
+    portFile*: string            ## ``serve --port-file <path>`` — write the
+                                 ## bound port here once listening (readiness
+                                 ## signal for tests + ops health checks).
+    tlsCert*: string             ## ``serve --tls-cert <path>`` (only under
+                                 ## ``-d:ssl``; otherwise rely on NetBird).
+    tlsKey*: string              ## ``serve --tls-key <path>``.
+    quiet*: bool                 ## ``serve --quiet`` — suppress access logs.
 
 const HelpText = """
 vm-harness <subcommand> [flags]
@@ -370,7 +396,26 @@ Common flags:
   --ssh-ready-timeout-sec <int>   Maximum wait for SSH before a boot command.
   --log-format <human|json>
   --allow-noop-fallback           Use NoopBackend if the real one isn't installed.
+  --remote <host:port>            Route this subcommand to a remote
+                                  `vm-harness serve` daemon (drives that host's
+                                  VMs) instead of running it locally. Requires
+                                  a bearer token (--auth-token/--auth-token-file
+                                  or $VMH_SERVE_TOKEN). The daemon's output is
+                                  streamed back live.
+  --auth-token <tok>              Bearer token (serve + --remote). Prefer
+                                  --auth-token-file so the secret is not in argv.
+  --auth-token-file <path>        Read the bearer token from a file.
   --                              End of flags; remainder is the gate command.
+
+serve daemon (RA1 remoting — the authenticated network access point):
+  vm-harness serve --listen <host:port> [--auth-token-file <f> | --auth-token <t>]
+                   [--worker-exe <path>] [--port-file <f>] [--quiet]
+    Expose the vm-harness CLI backend ops over a versioned HTTP/JSON RPC
+    (protocol v1) so a remote controller can drive this host's VMs/containers.
+    Every op runs the SAME local vm-harness binary (a thin network front-end,
+    not a reimplementation). Bind to a NetBird overlay IP only — NEVER a public
+    interface. The bearer token also reads from $VMH_SERVE_TOKEN. See
+    docs/serve.md.
 """
 
 proc parseEnvPair(s: string): tuple[k: string, v: string] =
@@ -676,6 +721,25 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
       inc i
     of "--sweep-tmp":
       result.sweepTmp = true
+      inc i
+    of "--remote":
+      inc i; result.remote = args[i]; inc i
+    of "--auth-token":
+      inc i; result.authToken = args[i]; inc i
+    of "--auth-token-file":
+      inc i; result.authTokenFile = args[i]; inc i
+    of "--listen":
+      inc i; result.listen = args[i]; inc i
+    of "--worker-exe":
+      inc i; result.workerExe = args[i]; inc i
+    of "--port-file":
+      inc i; result.portFile = args[i]; inc i
+    of "--tls-cert":
+      inc i; result.tlsCert = args[i]; inc i
+    of "--tls-key":
+      inc i; result.tlsKey = args[i]; inc i
+    of "--quiet":
+      result.quiet = true
       inc i
     of "-h", "--help":
       result.subcommand = "help"
@@ -1941,7 +2005,152 @@ proc cmdLayer(opts: CliOpts): int =
     stderr.writeLine("  actions: gc, sweep-overlays")
     return 2
 
+proc resolveAuthToken(authToken, authTokenFile: string): string =
+  ## Precedence: ``--auth-token`` > ``--auth-token-file`` > ``$VMH_SERVE_TOKEN``.
+  ## Empty result means "no token configured".
+  if authToken.len > 0:
+    return authToken
+  if authTokenFile.len > 0:
+    if not fileExists(authTokenFile):
+      raise newException(ValueError,
+        "--auth-token-file '" & authTokenFile & "': file not found")
+    return readFile(authTokenFile).strip()
+  getEnv("VMH_SERVE_TOKEN").strip()
+
+proc cmdServe(opts: CliOpts): int =
+  ## Run the remoting daemon. Binds an authenticated HTTP/JSON endpoint and
+  ## front-ends the local vm-harness CLI over it (see serve/server.nim).
+  let token = resolveAuthToken(opts.authToken, opts.authTokenFile)
+  if token.len == 0:
+    stderr.writeLine("vm-harness serve: no auth token configured " &
+      "(--auth-token-file <f>, --auth-token <t>, or $VMH_SERVE_TOKEN)")
+    return 2
+  var host = "127.0.0.1"
+  var port = 8873
+  if opts.listen.len > 0:
+    let idx = opts.listen.rfind(':')
+    if idx < 0:
+      port = try: parseInt(opts.listen)
+             except ValueError:
+               stderr.writeLine("serve: --listen expects host:port")
+               return 2
+    else:
+      if idx > 0: host = opts.listen[0 ..< idx]
+      port = try: parseInt(opts.listen[idx + 1 .. ^1])
+             except ValueError:
+               stderr.writeLine("serve: --listen expects host:port")
+               return 2
+  let cfg = ServeConfig(
+    listenHost: host,
+    listenPort: port,
+    token: token,
+    workerExe: opts.workerExe,
+    workerArgPrefix: @[],
+    portFile: opts.portFile,
+    tlsCertFile: opts.tlsCert,
+    tlsKeyFile: opts.tlsKey,
+    quiet: opts.quiet)
+  try:
+    runServe(cfg)
+  except CatchableError as e:
+    stderr.writeLine("vm-harness serve: " & e.msg)
+    return 1
+  0
+
+proc dispatch*(opts: CliOpts): int =
+  ## Execute a parsed subcommand LOCALLY. Both ``runCli`` (direct use) and
+  ## the ``serve`` daemon's worker (a subprocess re-invoking this same
+  ## binary) reach the backends through here, so the local and remote paths
+  ## are byte-for-byte identical.
+  case opts.subcommand
+  of "help":
+    echo(HelpText)
+    0
+  of "provision": cmdProvision(opts)
+  of "boot":      cmdBoot(opts)
+  of "install":   cmdBoot(opts, installMode = true)
+  of "run":       cmdRun(opts)
+  of "ephemeral-destroy": cmdEphemeralDestroy(opts)
+  of "probe":     cmdProbe(opts)
+  of "backends":  cmdBackends(opts)
+  of "shell":     cmdShell(opts)
+  of "instance":  cmdInstance(opts)
+  of "snapshot":  cmdSnapshot(opts)
+  of "baseline":  cmdBaseline(opts)
+  of "prune":     cmdPrune(opts)
+  of "layer":     cmdLayer(opts)
+  of "serve":     cmdServe(opts)
+  else:
+    stderr.writeLine("vm-harness: unknown subcommand '" & opts.subcommand & "'")
+    stderr.writeLine(HelpText)
+    2
+
+type RemoteScan = object
+  ## Result of pre-scanning raw argv for the client-only flags. These may
+  ## appear BEFORE the subcommand (``vm-harness --remote <addr> run …``),
+  ## which ``parseCliOpts`` cannot handle because it treats the first token
+  ## positionally as the subcommand.
+  remote: string
+  authToken: string
+  authTokenFile: string
+  forwarded: seq[string]   ## argv with the client-only flags removed
+
+proc scanRemoteFlags(args: seq[string]): RemoteScan =
+  ## Extract ``--remote`` / ``--auth-token`` / ``--auth-token-file`` from any
+  ## position, leaving ``forwarded`` as the clean local argv the daemon runs.
+  var i = 0
+  while i < args.len:
+    case args[i]
+    of "--remote":
+      inc i
+      if i < args.len: result.remote = args[i]; inc i
+    of "--auth-token":
+      inc i
+      if i < args.len: result.authToken = args[i]; inc i
+    of "--auth-token-file":
+      inc i
+      if i < args.len: result.authTokenFile = args[i]; inc i
+    else:
+      result.forwarded.add(args[i]); inc i
+
+proc runRemote(remote: string, opts: CliOpts, forwarded: seq[string]): int =
+  ## Forward ``forwarded`` (the local argv minus client-only flags) to the
+  ## remote daemon and relay its streamed output. The remote daemon runs the
+  ## identical CLI, so behaviour matches the local path.
+  let token = resolveAuthToken(opts.authToken, opts.authTokenFile)
+  if token.len == 0:
+    stderr.writeLine("vm-harness --remote: no auth token " &
+      "(--auth-token-file <f>, --auth-token <t>, or $VMH_SERVE_TOKEN)")
+    return 2
+  var client: ServeClient
+  try:
+    client = newServeClient(remote, token)
+  except ValueError as e:
+    stderr.writeLine("vm-harness: " & e.msg)
+    return 2
+  try:
+    return client.execRelay(forwarded, proc(line: string) = echo line)
+  except ServeAuthError:
+    stderr.writeLine("vm-harness --remote: authentication rejected by " &
+      remote & " (check the bearer token)")
+    return 77
+  except CatchableError as e:
+    stderr.writeLine("vm-harness --remote: " & e.msg)
+    return 1
+
 proc runCli*(args: seq[string]): int =
+  # ``--remote`` (and its auth flags) may precede the subcommand, so scan the
+  # raw argv first. When present it reroutes any operational subcommand to a
+  # remote daemon; ``serve`` and ``help`` are never remoted.
+  let scan = scanRemoteFlags(args)
+  if scan.remote.len > 0 and scan.forwarded.len > 0 and
+     scan.forwarded[0] != "serve" and
+     scan.forwarded[0] notin ["-h", "--help", "help"]:
+    var tokenOpts: CliOpts
+    tokenOpts.authToken = scan.authToken
+    tokenOpts.authTokenFile = scan.authTokenFile
+    return runRemote(scan.remote, tokenOpts, scan.forwarded)
+
   var opts: CliOpts
   try:
     opts = parseCliOpts(args)
@@ -1950,27 +2159,10 @@ proc runCli*(args: seq[string]): int =
     stderr.writeLine(HelpText)
     return 2
 
-  case opts.subcommand
-  of "help":
+  if opts.subcommand == "help":
     echo(HelpText)
     return 0
-  of "provision": return cmdProvision(opts)
-  of "boot":      return cmdBoot(opts)
-  of "install":   return cmdBoot(opts, installMode = true)
-  of "run":       return cmdRun(opts)
-  of "ephemeral-destroy": return cmdEphemeralDestroy(opts)
-  of "probe":     return cmdProbe(opts)
-  of "backends":  return cmdBackends(opts)
-  of "shell":     return cmdShell(opts)
-  of "instance":  return cmdInstance(opts)
-  of "snapshot":  return cmdSnapshot(opts)
-  of "baseline":  return cmdBaseline(opts)
-  of "prune":     return cmdPrune(opts)
-  of "layer":     return cmdLayer(opts)
-  else:
-    stderr.writeLine("vm-harness: unknown subcommand '" & opts.subcommand & "'")
-    stderr.writeLine(HelpText)
-    return 2
+  return dispatch(opts)
 
 when isMainModule:
   try: quit(runCli(commandLineParams()))

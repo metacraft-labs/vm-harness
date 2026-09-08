@@ -74,6 +74,16 @@ Shipped milestones:
   `VMH_INCUS_CMD="sudo -n incus"`. Gate:
   `tests/e2e/t_vmharness_incus_ephemeral_run.nim`.
 
+- **Remoting — `vm-harness serve`** (`src/vm_harness/serve/`). An
+  authenticated network front-end (protocol v1, HTTP/JSON) that exposes this
+  host's VM/container lifecycle to a remote controller over a NetBird
+  overlay: `vm-harness serve --listen <overlay-ip>:8873 --auth-token-file
+  <f>`. Any operational subcommand gains `--remote <host:port>` to drive a
+  remote host, and `ServeClient` is the matching library (used later by the
+  GARM provider). It is a thin front-end — every op runs the SAME local
+  vm-harness binary. See `docs/serve.md`. Gate:
+  `tests/e2e/t_vmharness_serve_roundtrip.nim`.
+
 Cross-cutting infrastructure that ships across all of the above:
 
 - The `VmBackend` concept and supporting types (`docs/design.md` §3.2).
