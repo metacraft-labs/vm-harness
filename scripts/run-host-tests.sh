@@ -43,5 +43,8 @@ run_nim r --hints:off tests/e2e/t_libvirt_snapshot_surface_conformance.nim
 run_nim r --hints:off tests/e2e/t_libvirt_live_snapshot_restore.nim
 run_nim r --hints:off tests/e2e/t_windows_golden_jit_boot.nim
 run_nim r --hints:off tests/e2e/t_vmharness_incus_ephemeral_run.nim
+# RA1 remoting against a real backend: remote client drives an ephemeral
+# incus container through `vm-harness serve` (launch -> probe -> destroy).
+run_nim r --hints:off tests/e2e/t_vmharness_serve_roundtrip_incus.nim
 # §7.4 layered base images: snapshot -> publish -> export -> import -> launch.
 run_nim r --hints:off tests/e2e/t_incus_layered_base_image.nim

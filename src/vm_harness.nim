@@ -39,6 +39,10 @@ import ./vm_harness/boot_smoke
 import ./vm_harness/backends/lima
 import ./vm_harness/backends/libvirt
 import ./vm_harness/backends/incus
+import ./vm_harness/serve/protocol
+import ./vm_harness/serve/http
+import ./vm_harness/serve/server
+import ./vm_harness/serve/client
 
 export types
 export pool
@@ -61,3 +65,7 @@ export boot_smoke
 export lima
 export libvirt
 export incus
+export protocol
+export http
+export server
+export client
