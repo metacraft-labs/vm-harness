@@ -30,6 +30,12 @@ run_nim r --hints:off tests/integration/t_tart_lifecycle.nim
 run_nim r --hints:off tests/e2e/t_vm_harness_tart_linux_arm_smoke.nim
 run_nim r --hints:off tests/e2e/t_vm_harness_tart_macos_smoke.nim
 run_nim r --hints:off tests/e2e/t_vm_harness_tart_cleanup_on_failure.nim
+# RA5 remoting on the macOS/tart host (m3): a remote client drives a per-job
+# ephemeral tart guest (clone-from-golden -> boot -> in-guest probe -> destroy,
+# no residue) through `vm-harness serve`. Defaults to the cheap Linux-ARM
+# golden; set VMH_TART_SERVE_MACOS=1 for the macOS golden. Self-skips off-macOS
+# / without tart+sshpass.
+run_nim r --hints:off tests/e2e/t_vmharness_serve_macos_tart.nim
 run_nim r --hints:off tests/integration/t_utm_lifecycle.nim
 run_nim r --hints:off tests/e2e/t_vm_harness_utm_windows_arm_smoke.nim
 run_nim r --hints:off tests/e2e/t_vm_harness_utm_windows_dism_works_under_prism.nim

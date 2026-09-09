@@ -143,3 +143,15 @@ let code = c.execStream(@["run", "--ephemeral", "--backend", "incus",
   golden VHDX → boot → JIT-probe → Remove-VM, no residue). Gate
   `t_vmharness_serve_win_hyperv` (`just test-host`, Windows + Hyper-V + a
   golden VHDX); the clone logic is unit-tested by `t_hyperv_ephemeral_clone`.
+  The macOS/tart deployment (RA5) is implemented: a nix-darwin/launchd module
+  `services.vm-harness-serve`
+  (`nixos-modules/modules/vm-harness-serve/darwin.nix`) runs the daemon as a
+  root launchd job bound to the NetBird overlay only, and drops the per-job
+  tart WORKER to the console user via `--worker-exe` (a `launchctl asuser …
+  sudo -E -u #<uid>` wrapper — Tart links AppKit even under `--no-graphics`
+  and refuses uid 0). The concrete m3 profile is
+  `infra/services/vm-harness-serve-darwin.nix`. Gate
+  `t_vmharness_serve_macos_tart` (`just test-host`, macOS + tart + sshpass):
+  a remote client drives a per-job ephemeral tart clone
+  (`run --backend tart-{linux-arm,macos} --baseline <golden> --ephemeral-prefix
+  <p>` → boot → in-guest probe → destroy, no residue).
