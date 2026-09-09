@@ -29,6 +29,7 @@ the checked-in answer files.
 | Rebuild safety guard (never build in place) | ✓ | `prepareGoldenBuildDir`. |
 | Overlay backing-path symlink resolution | ✓ | Prerequisite for a safe flip; landed early with the guard. |
 | Golden disk allocation | ✓ | `createGoldenDisk`. |
+| Free-space precondition | ✓ | `checkGoldenBuildSpace`; floor refuses, comfort band warns. |
 | Sysprep + generalize | ☐ | Phase 2. |
 | Golden finalize + promote | ☐ | Phase 2. Versioned dir + pointer flip; never in place. |
 | Previous-golden retention + reclaim | ☐ | Phase 2. Gated on the per-instance advisory lock. |
@@ -212,8 +213,10 @@ explicit message** rather than passing quietly.
 - **The install may need more reboots than HVF+UEFI tolerates.** Untested on
   this exact firmware/machine combination; Phase 1 is where that is found
   out.
-- **~8 GB ISO plus a 40–60 GB qcow2** on a host already at 88% disk. Golden
-  builds must run against a checked free-space precondition.
+- **~8 GB ISO plus a 40–60 GB qcow2** on a host already at 88% disk, shared
+  with a live fleet. Addressed by the free-space precondition above, but the
+  50 GB install-peak figure it rests on is an estimate until a build
+  measures it.
 - **A bad recipe change is caught by retention, not by a published copy.**
   Nothing is published, but the previous golden stays on disk until its
   overlays drain, so rollback is a symlink flip. That only holds if
@@ -250,12 +253,39 @@ Two consequences follow, and they are requirements rather than preferences:
 
 The ISO itself remains the one operator-supplied input, pinned by hash.
 
-## Open Questions
+**The build gates on free space, with two thresholds.** ✓ Decided
+2026-09-09. A single threshold would have to choose between blocking builds
+that would have succeeded and permitting ones that cannot, so the check
+separates the two questions:
 
-> **Decision needed:** Should the golden build gate on free disk space, and
-> at what threshold? The ISO plus the qcow2 need room on a host that sits at
-> 88%, and a build that fails at 90% completion costs the better part of an
-> hour. A precondition check is cheap; the threshold is the question.
+| Threshold | Default | Behaviour |
+|---|---|---|
+| Floor — the build cannot finish | `min(diskGB, 50) + 10` = **60 GB** | Refuse |
+| Comfortable — a saturated fleet also fits | floor + **116 GB** = **176 GB** | Warn, proceed |
+
+Derivation, biased pessimistic throughout:
+
+- **50 GB install peak.** A Windows 11 ARM64 install lands around 25 GB, plus
+  the component store before `/ResetBase`, a pagefile sized to guest RAM, the
+  staged toolchain, and sysprep's working set. This is an *estimate* — the
+  golden it would have been measured against was lost — and should be
+  replaced with a real figure after the first successful build.
+- **116 GB fleet peak**, from live scale-set limits and measured instance
+  footprints: 2 macOS at ~36 GB, 3 Linux at ~8 GB, 2 Windows overlays at
+  ~10 GB.
+- The floor scales down with a smaller requested image, since a qcow2 cannot
+  outgrow its requested size, and stops scaling up past the install peak,
+  since the image stays sparse.
+
+`VMH_QEMU_WINDOWS_ARM_MIN_FREE_GB` overrides the floor for an operator who
+knows better than the estimate. An undeterminable free figure warns and
+proceeds — refusing to build because a `statvfs` call failed would be worse
+than the risk it guards.
+
+For calibration: m3 measured 231 GB free with an idle fleet and 156 GB an
+hour later with five instances running, which lands in the warn band. Free
+space on that host moves by roughly the fleet peak over a day, which is the
+reason the second threshold exists at all.
 
 ## Assumptions
 

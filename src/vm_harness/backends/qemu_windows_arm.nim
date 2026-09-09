@@ -60,6 +60,30 @@ const
   QwaDiskModeOverlay* = "overlay"   ## qcow2 backing overlay (default)
   QwaDiskModeClone* = "clone"       ## whole-file clone (clonefile/copy)
 
+  # Golden build space budget. A build that dies at 90% costs the better
+  # part of an hour, and it runs on a host that is also serving CI, so the
+  # numbers below are deliberately pessimistic.
+  QwaDefaultGoldenDiskGB* = 64
+    ## Requested qcow2 size. qcow2 is sparse, so this is a ceiling on
+    ## growth rather than an allocation.
+  QwaGoldenInstallPeakGB* = 50
+    ## Estimated peak *actual* consumption of a golden install: a Windows 11
+    ## ARM64 install lands around 25 GB, plus the pre-``/ResetBase``
+    ## component store, a pagefile sized to guest RAM, the staged toolchain,
+    ## and sysprep's working set. Not measured on this image — the golden it
+    ## replaces was lost before it could be — so it is an estimate biased
+    ## high, and should be replaced with a measurement after the first
+    ## successful build.
+  QwaGoldenBuildSlackGB* = 10
+    ## Logs, firmware vars, TPM state, and room to not wedge the host at
+    ## exactly zero.
+  QwaFleetPeakGB* = 116
+    ## What a saturated fleet holds concurrently on m3, from the live
+    ## scale-set limits and measured instance footprints: 2 macOS at ~36 GB,
+    ## 3 Linux at ~8 GB, 2 Windows overlays at ~10 GB. A golden build shares
+    ## the disk with all of it, and observed free space swings by that much
+    ## over a day.
+
 type
   PortAllocationLock* = object
     held*: bool
@@ -494,6 +518,78 @@ proc createEphemeralCopy*(baselineDir, destDir: string) =
   createDir(destDir)
   cloneOneFile(base / QwaBaseDiskName, destDir / QwaBaseDiskName)
   copyFirmwareAndTpm(base, destDir)
+
+type
+  GoldenSpaceVerdict* = object
+    ## Outcome of the pre-build free-space check. Split into "cannot
+    ## finish" and "can finish but may starve the fleet" because those want
+    ## different answers: the first must stop the build, the second is the
+    ## operator's call.
+    fatal*: bool
+    message*: string
+
+proc qwaGoldenFloorGB*(diskGB: int): int =
+  ## Free space below which a golden build cannot be expected to finish.
+  ##
+  ## A qcow2 cannot outgrow its requested size, so a small requested disk
+  ## lowers the floor; beyond the estimated install peak, extra requested
+  ## size costs nothing because the image stays sparse.
+  ## ``VMH_QEMU_WINDOWS_ARM_MIN_FREE_GB`` overrides the whole computation
+  ## for operators who know better than this estimate.
+  let override = getEnv("VMH_QEMU_WINDOWS_ARM_MIN_FREE_GB").strip()
+  if override.len > 0:
+    try:
+      let v = parseInt(override)
+      if v >= 0:
+        return v
+    except ValueError:
+      discard
+  min(max(diskGB, 1), QwaGoldenInstallPeakGB) + QwaGoldenBuildSlackGB
+
+proc goldenBuildSpaceVerdict*(freeGB, diskGB: int): GoldenSpaceVerdict =
+  ## Pure policy so it can be exercised without a filesystem.
+  let floorGB = qwaGoldenFloorGB(diskGB)
+  let comfortableGB = floorGB + QwaFleetPeakGB
+  if freeGB < floorGB:
+    return GoldenSpaceVerdict(fatal: true, message:
+      "refusing to start a golden build: " & $freeGB & "GB free, need at " &
+      "least " & $floorGB & "GB (estimated install peak for a " & $diskGB &
+      "GB image, plus slack). Reclaim space, or set " &
+      "VMH_QEMU_WINDOWS_ARM_MIN_FREE_GB if this estimate is wrong.")
+  if freeGB < comfortableGB:
+    return GoldenSpaceVerdict(fatal: false, message:
+      "golden build starting with " & $freeGB & "GB free, below the " &
+      $comfortableGB & "GB that leaves room for a saturated fleet (" &
+      $QwaFleetPeakGB & "GB). The build should finish, but concurrent CI " &
+      "instances may exhaust the disk while it runs.")
+  GoldenSpaceVerdict(fatal: false, message: "")
+
+proc freeSpaceGB*(path: string): int =
+  ## Free space available to an unprivileged writer, in whole GB. Returns
+  ## -1 when it cannot be determined, which callers treat as "unknown" and
+  ## must not treat as "full".
+  when defined(posix):
+    var st: Statvfs
+    if statvfs(path.cstring, st) != 0:
+      return -1
+    let avail = uint64(st.f_frsize) * uint64(st.f_bavail)
+    int(avail div (1024'u64 * 1024'u64 * 1024'u64))
+  else:
+    -1
+
+proc checkGoldenBuildSpace*(path: string, diskGB: int): string =
+  ## Raise when a golden build cannot fit; otherwise return a warning to
+  ## surface (empty when there is nothing to say). An undeterminable free
+  ## figure is not treated as a failure — refusing to build because a
+  ## statvfs call failed would be worse than the risk it guards against.
+  let freeGB = freeSpaceGB(path)
+  if freeGB < 0:
+    return "could not determine free space at " & path &
+           "; proceeding without a space precondition"
+  let verdict = goldenBuildSpaceVerdict(freeGB, diskGB)
+  if verdict.fatal:
+    raise newVmHarnessError($biQemuWindowsArm, lpProvisioning, verdict.message)
+  verdict.message
 
 proc prepareGoldenBuildDir*(buildDir: string) =
   ## Create the directory a golden build writes into.

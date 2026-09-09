@@ -759,3 +759,66 @@ suite "QemuWindowsArmBackend golden build":
       check (pointer / "windows.qcow2") notin recorded
     else:
       skip()
+
+suite "Golden build space precondition":
+  ## Pure policy, so the thresholds can be exercised without a filesystem.
+
+  setup:
+    delEnv("VMH_QEMU_WINDOWS_ARM_MIN_FREE_GB")
+
+  test "a build that cannot finish is refused":
+    let v = goldenBuildSpaceVerdict(freeGB = 40, diskGB = QwaDefaultGoldenDiskGB)
+    check v.fatal
+    check "refusing to start a golden build" in v.message
+    check "40GB free" in v.message
+
+  test "a tight but survivable build warns instead of failing":
+    # Enough for the image, not enough to also absorb a saturated fleet.
+    let v = goldenBuildSpaceVerdict(freeGB = 100, diskGB = QwaDefaultGoldenDiskGB)
+    check not v.fatal
+    check "concurrent CI" in v.message
+
+  test "an idle host with room says nothing":
+    let v = goldenBuildSpaceVerdict(
+      freeGB = QwaGoldenInstallPeakGB + QwaGoldenBuildSlackGB +
+               QwaFleetPeakGB + 1,
+      diskGB = QwaDefaultGoldenDiskGB)
+    check not v.fatal
+    check v.message == ""
+
+  test "a smaller requested image lowers the floor":
+    # qcow2 cannot outgrow its requested size, so a 20GB image needs less
+    # than the full install-peak estimate.
+    check qwaGoldenFloorGB(20) == 20 + QwaGoldenBuildSlackGB
+    check qwaGoldenFloorGB(QwaDefaultGoldenDiskGB) ==
+      QwaGoldenInstallPeakGB + QwaGoldenBuildSlackGB
+    check not goldenBuildSpaceVerdict(freeGB = 40, diskGB = 20).fatal
+    check goldenBuildSpaceVerdict(freeGB = 40,
+                                  diskGB = QwaDefaultGoldenDiskGB).fatal
+
+  test "an operator can override the estimate":
+    putEnv("VMH_QEMU_WINDOWS_ARM_MIN_FREE_GB", "5")
+    defer: delEnv("VMH_QEMU_WINDOWS_ARM_MIN_FREE_GB")
+    check qwaGoldenFloorGB(QwaDefaultGoldenDiskGB) == 5
+    check not goldenBuildSpaceVerdict(freeGB = 10,
+                                      diskGB = QwaDefaultGoldenDiskGB).fatal
+
+  test "a garbage override falls back to the computed floor":
+    putEnv("VMH_QEMU_WINDOWS_ARM_MIN_FREE_GB", "not-a-number")
+    defer: delEnv("VMH_QEMU_WINDOWS_ARM_MIN_FREE_GB")
+    check qwaGoldenFloorGB(QwaDefaultGoldenDiskGB) ==
+      QwaGoldenInstallPeakGB + QwaGoldenBuildSlackGB
+
+  test "unknown free space proceeds rather than blocking":
+    # A failed statvfs must not be reported as a full disk.
+    let warning = checkGoldenBuildSpace("/nonexistent-path-for-vmh-test",
+                                        QwaDefaultGoldenDiskGB)
+    check "could not determine free space" in warning
+
+  test "free space on a real path is plausible":
+    let tmp = createTempDir("vmh-qemu-win-arm-space-", "")
+    defer: removeDir(tmp)
+    when defined(posix):
+      check freeSpaceGB(tmp) >= 0
+    else:
+      check freeSpaceGB(tmp) == -1
