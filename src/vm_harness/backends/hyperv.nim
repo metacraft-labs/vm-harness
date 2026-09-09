@@ -1029,6 +1029,280 @@ method closeSerial*(b: HyperVBackend, stream: SerialStream) =
   else:
     discard
 
+# ---------------------------------------------------------------------------
+# Per-job EPHEMERAL clone (host lifecycle) — the Hyper-V analog of libvirt's
+# CoW-overlay ephemeral pattern (`provisionEphemeralClone` in libvirt.nim).
+#
+# Each CI job gets a FRESH Hyper-V VM cloned from a GOLDEN VHDX, booted, JIT-
+# probed, then destroyed leaving NO residue (VM + per-job disk gone, golden
+# untouched). This is the create→boot→probe→destroy lifecycle the central
+# GARM's `garm-provider-vmharness` drives per job (CreateInstance maps onto
+# `provisionEphemeralClone`, DeleteInstance onto `stopAndCleanup`).
+#
+# HOST-lifecycle ops exercised here (all local PowerShell on the Windows
+# host — distinct from PowerShell-Direct guest comms): `New-VHD` (the CoW
+# overlay / clone), `New-VM`, `Set-VMProcessor`/`Set-VMFirmware`/`Enable-VMTPM`,
+# `Start-VM`, and `Remove-VM` (teardown). These are the ops RA4's
+# `t_vmharness_serve_win_hyperv` gate proves against a real Windows host.
+#
+# TWO clone strategies, chosen by `useDifferencing`:
+#   * differencing VHDX (default) — `New-VHD -Differencing -ParentPath
+#     <golden>`: the golden is a READ-ONLY parent, per-job writes land in a
+#     thin child disk. This is the direct analog of libvirt's qcow2 CoW
+#     overlay: the golden backs any number of concurrent jobs untouched.
+#   * full copy — `Copy-Item <golden> <clone>`: on a ReFS Dev Drive this is
+#     the block-clone fast path the win-ci-bare-001 bring-up plan measured
+#     (~1.4 s / ~14 MB for an 80 GiB fixed-size golden). Use this when the
+#     golden must stay fixed-size (Gen-2 Windows 11) and the volume is ReFS.
+#
+# `buildEphemeralCloneCommand` is a PURE function (returns the PowerShell
+# text) so it is unit-testable on any host with no Hyper-V role — the same
+# assert-on-emitted-script strategy `buildNewBootVmCommand` uses, which is
+# the only coverage these paths can get before they run for real on
+# win-ci-bare-001.
+
+const EphemeralVmNamePrefix* = "repro-eph-hyperv-"
+  ## Per-job ephemeral VM names MUST start with this so the create/teardown
+  ## safety guards can never touch a long-lived (baseline / boot) VM.
+
+type
+  HyperVEphemeralCloneSpec* = object
+    ## Inputs for one per-job Hyper-V ephemeral clone.
+    name*: string                ## per-job VM name (unique). Must start with
+                                 ## `EphemeralVmNamePrefix`.
+    goldenVhdx*: string          ## absolute path to the golden VHDX cloned
+                                 ## from (differencing parent, or copy source).
+    clonePath*: string           ## per-job disk path. Empty ⇒ derived next to
+                                 ## the golden as `<name>.vhdx`.
+    useDifferencing*: bool       ## true ⇒ `New-VHD -Differencing` CoW overlay
+                                 ## (default); false ⇒ full `Copy-Item` clone.
+    cpus*: int                   ## vCPUs; defaults to 2 when 0.
+    memoryMB*: int               ## startup RAM MB; defaults to 4096 when 0.
+    generation*: int             ## Hyper-V VM generation; defaults to 2.
+    secureBootEnabled*: bool     ## Gen-2 Secure Boot (Windows 11 golden).
+    tpmEnabled*: bool            ## Gen-2 vTPM (Windows 11 golden).
+    switchName*: string          ## optional vSwitch to connect a NIC to so
+                                 ## cloudbase-init / the JIT bootstrap can
+                                 ## reach the GARM metadata endpoint. Empty ⇒
+                                 ## the VM is network-isolated.
+    configDriveIso*: string      ## optional cloudbase-init ConfigDrive ISO
+                                 ## (JIT bootstrap injection), attached as a
+                                 ## read-only DVD. Empty ⇒ none.
+
+proc ephemeralClonePathFor*(spec: HyperVEphemeralCloneSpec): string =
+  ## Resolve the per-job clone disk path: honour `spec.clonePath` when set,
+  ## else place `<name>.vhdx` beside the golden. Deterministic from the spec
+  ## so teardown reconstructs exactly the same path.
+  ##
+  ## The golden is a Windows path (e.g. ``D:\golden\win11.vhdx``); split on
+  ## the trailing separator directly rather than via `os.parentDir`, which is
+  ## host-dependent (it would not recognise ``\`` when the harness that
+  ## builds the spec runs on a non-Windows controller).
+  if spec.clonePath.len > 0: return spec.clonePath
+  let g = spec.goldenVhdx
+  let bs = g.rfind('\\')
+  let fs = g.rfind('/')
+  let idx = max(bs, fs)
+  if idx < 0:
+    return spec.name & ".vhdx"
+  let sep = if bs >= fs: "\\" else: "/"
+  g[0 ..< idx] & sep & spec.name & ".vhdx"
+
+proc buildEphemeralCloneCommand*(b: HyperVBackend,
+                                 spec: HyperVEphemeralCloneSpec,
+                                 clonePath: string): string =
+  ## Render the PowerShell that CoW-clones (or copies) the golden into a
+  ## per-job disk, creates a fresh Gen-2 UEFI VM around it, wires
+  ## CPU/firmware/TPM/NIC/config-drive, and leaves the VM Off ready for
+  ## `Start-VM`. Pure — no I/O — so it is unit-testable off-Windows.
+  let generation = if spec.generation > 0: spec.generation else: 2
+  let memMB = if spec.memoryMB > 0: spec.memoryMB else: 4096
+  let cpus = if spec.cpus > 0: spec.cpus else: 2
+  let secureBoot = if spec.secureBootEnabled: "On" else: "Off"
+  # A vTPM is a Gen-2/UEFI device; honour the request only where Hyper-V can
+  # satisfy it rather than emitting a cmdlet that always throws (matches
+  # buildNewBootVmCommand).
+  let wantTpm = spec.tpmEnabled and generation == 2
+  let tpmFlag = if wantTpm: "$true" else: "$false"
+  let useDiff = if spec.useDifferencing: "$true" else: "$false"
+  result = &"""$ErrorActionPreference = 'Stop'
+Import-Module Hyper-V -ErrorAction Stop
+$vmName  = '{psQuote(spec.name)}'
+$golden  = '{psQuote(spec.goldenVhdx)}'
+$clone   = '{psQuote(clonePath)}'
+$gen     = {generation}
+$memMB   = {memMB}
+$cpus    = {cpus}
+$secureBoot = '{secureBoot}'
+$wantTpm = {tpmFlag}
+$useDiff = {useDiff}
+$switch  = '{psQuote(spec.switchName)}'
+$configDrive = '{psQuote(spec.configDriveIso)}'
+
+# SAFETY: an ephemeral VM name is namespaced so teardown can force-Remove-VM
+# it without ever risking a long-lived (baseline / boot) VM.
+if (-not $vmName.StartsWith('{psQuote(EphemeralVmNamePrefix)}')) {{
+  throw "SAFETY: refusing to create ephemeral VM $vmName (must start with '{psQuote(EphemeralVmNamePrefix)}')"
+}}
+if (Get-VM -Name $vmName -ErrorAction SilentlyContinue) {{
+  throw "ephemeral VM $vmName already exists; per-job clones require a fresh name"
+}}
+if (-not (Test-Path -LiteralPath $golden)) {{
+  throw "golden VHDX not found: $golden"
+}}
+if (Test-Path -LiteralPath $clone) {{
+  throw "per-job clone disk already exists (refusing to clobber): $clone"
+}}
+$cloneDir = Split-Path -Parent $clone
+if ($cloneDir -and -not (Test-Path $cloneDir)) {{ New-Item -ItemType Directory -Force -Path $cloneDir | Out-Null }}
+
+# Per-job disk: a differencing overlay leaves the golden READ-ONLY (never
+# written — the golden backs concurrent jobs untouched, exactly like the
+# libvirt qcow2 CoW overlay); a full copy is the ReFS block-clone fast path.
+if ($useDiff) {{
+  New-VHD -Path $clone -ParentPath $golden -Differencing | Out-Null
+}} else {{
+  Copy-Item -LiteralPath $golden -Destination $clone -Force
+}}
+
+$mem = [int64]$memMB * 1MB
+New-VM -Name $vmName -Generation $gen -MemoryStartupBytes $mem -VHDPath $clone | Out-Null
+if ($cpus -gt 0) {{ Set-VMProcessor -VMName $vmName -Count $cpus }}
+if ($gen -eq 2) {{
+  try {{ Set-VMFirmware -VMName $vmName -EnableSecureBoot $secureBoot }}
+  catch {{ Write-Warning "Set-VMFirmware -EnableSecureBoot $secureBoot failed: $($_.Exception.Message)" }}
+}}
+
+# vTPM 2.0 (Windows 11 gate). Ordered + both mandatory: Enable-VMTPM fails
+# unless a key protector already exists, so create it first (see the same
+# note in buildNewBootVmCommand).
+if ($wantTpm) {{
+  if ($gen -ne 2) {{ throw "vTPM requires a Generation 2 VM (got generation $gen)" }}
+  Set-VMKeyProtector -VMName $vmName -NewLocalKeyProtector
+  Enable-VMTPM -VMName $vmName
+}}
+
+# Networking: a real Windows golden needs a NIC on a vSwitch so its
+# cloudbase-init / JIT bootstrap can reach the GARM metadata endpoint; an
+# empty switch keeps the guest isolated (matches the boot-from-media path).
+if ($switch -and $switch.Length -gt 0) {{
+  Get-VMNetworkAdapter -VMName $vmName -ErrorAction SilentlyContinue | ForEach-Object {{
+    Connect-VMNetworkAdapter -VMNetworkAdapter $_ -SwitchName $switch -ErrorAction SilentlyContinue
+  }}
+}} else {{
+  try {{ Get-VMNetworkAdapter -VMName $vmName -ErrorAction SilentlyContinue | Remove-VMNetworkAdapter -ErrorAction SilentlyContinue }} catch {{}}
+}}
+
+# Optional cloudbase-init ConfigDrive ISO (JIT bootstrap injection), attached
+# read-only. cloudbase-init in the golden consumes the injected user_data on
+# first boot (the config-drive JIT seam mirrored from the libvirt path).
+if ($configDrive -and $configDrive.Length -gt 0) {{
+  if (-not (Test-Path -LiteralPath $configDrive)) {{ throw "configDriveIso not found: $configDrive" }}
+  Add-VMDvdDrive -VMName $vmName -Path $configDrive
+}}
+Write-Host "EPHEMERAL-CREATED $vmName"
+"""
+
+proc destroyEphemeralClone(b: HyperVBackend, vm: VmHandle) =
+  ## Force-stop + `Remove-VM` the per-job ephemeral VM and delete its per-job
+  ## clone disk, leaving NO residue. The golden (differencing parent / copy
+  ## source) is never touched. Safe to call from a `finally` — swallows all
+  ## errors.
+  when defined(windows):
+    let clonePath = vm.extra.getOrDefault("clonePath")
+    let psBlock = &"""try {{
+  Import-Module Hyper-V -ErrorAction Stop
+  $vm = Get-VM -Name '{psQuote(vm.name)}' -ErrorAction SilentlyContinue
+  if ($vm) {{
+    if ($vm.State -ne 'Off') {{ Stop-VM -Name '{psQuote(vm.name)}' -TurnOff -Force -ErrorAction SilentlyContinue | Out-Null }}
+    Remove-VM -Name '{psQuote(vm.name)}' -Force -ErrorAction SilentlyContinue | Out-Null
+  }}
+}} catch {{ Write-Host "destroyEphemeralClone swallowed: $_" }}
+"""
+    let cmd = @[$b.powershellLauncher, "-NoLogo", "-NoProfile",
+                "-ExecutionPolicy", "Bypass", "-Command", psBlock]
+    try:
+      discard runProcessCapture(cmd, timeoutSec = 120)
+    except CatchableError: discard
+    if clonePath.len > 0 and fileExists(clonePath):
+      try: removeFile(clonePath)
+      except CatchableError: discard
+  else:
+    discard
+
+proc provisionEphemeralClone*(b: HyperVBackend,
+                              spec: HyperVEphemeralCloneSpec): VmHandle =
+  ## Materialise ONE fresh per-job VM: CoW-clone (or copy) the golden into a
+  ## per-job disk, create a transient Gen-2 VM on it, and `Start-VM`. The
+  ## returned handle carries `clonePath` + `goldenVhdx` in `extra` and the
+  ## `<ephemeral-clone>` baseline sentinel, so `stopAndCleanup` (the
+  ## DeleteInstance path) removes the VM AND the per-job disk, no residue.
+  when defined(windows):
+    if spec.name.len == 0:
+      raise newException(ValueError, "provisionEphemeralClone: spec.name is empty")
+    if not spec.name.startsWith(EphemeralVmNamePrefix):
+      raise newException(ValueError,
+        "provisionEphemeralClone: spec.name must start with '" &
+        EphemeralVmNamePrefix & "' (got '" & spec.name & "')")
+    if spec.goldenVhdx.len == 0:
+      raise newException(ValueError,
+        "provisionEphemeralClone: spec.goldenVhdx is empty")
+    if not fileExists(spec.goldenVhdx):
+      raise newException(IOError,
+        "provisionEphemeralClone: golden VHDX does not exist: " &
+        spec.goldenVhdx)
+    let clonePath = ephemeralClonePathFor(spec)
+    let psCreate = buildEphemeralCloneCommand(b, spec, clonePath)
+    let createCmd = @[$b.powershellLauncher, "-NoLogo", "-NoProfile",
+                      "-ExecutionPolicy", "Bypass", "-Command", psCreate]
+    let cr = runProcessCapture(createCmd, timeoutSec = 300)
+    if cr.exitCode != 0:
+      # Best-effort teardown of any half-built VM + clone disk.
+      try:
+        let psCleanup = &"""try {{ Remove-VM -Name '{psQuote(spec.name)}' -Force -ErrorAction SilentlyContinue | Out-Null }} catch {{}}"""
+        discard runProcessCapture(@[$b.powershellLauncher, "-NoLogo",
+          "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCleanup],
+          timeoutSec = 60)
+      except CatchableError: discard
+      if fileExists(clonePath):
+        try: removeFile(clonePath) except CatchableError: discard
+      raise newVmHarnessError($b.id, lpProvisioning,
+        "HyperVBackend.provisionEphemeralClone: VM creation failed (exit " &
+        $cr.exitCode & "): " & cr.stdout)
+
+    var extra = initTable[string, string]()
+    extra["ephemeral"] = "true"
+    extra["clonePath"] = clonePath
+    extra["goldenVhdx"] = spec.goldenVhdx
+    var vm = VmHandle(
+      backend: b,
+      name: spec.name,
+      baseline: "<ephemeral-clone>",
+      ipAddress: none(string),
+      sshPort: 0,
+      sshUser: "",
+      sshAuth: SshAuth(kind: saNone),
+      extra: extra)
+
+    # Boot it. On failure tear the half-started VM down so no residue leaks.
+    let psStart = &"""$ErrorActionPreference = 'Stop'
+Import-Module Hyper-V -ErrorAction Stop
+Start-VM -Name '{psQuote(spec.name)}'
+Write-Host "EPHEMERAL-STARTED {psQuote(spec.name)}"
+"""
+    let sr = runProcessCapture(@[$b.powershellLauncher, "-NoLogo",
+      "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psStart],
+      timeoutSec = 300)
+    if sr.exitCode != 0:
+      destroyEphemeralClone(b, vm)
+      raise newVmHarnessError($b.id, lpStartup,
+        "HyperVBackend.provisionEphemeralClone: Start-VM failed (exit " &
+        $sr.exitCode & "): " & sr.stdout)
+    result = vm
+  else:
+    raise newException(BackendUnavailableError,
+      "HyperVBackend.provisionEphemeralClone requires a Windows host")
+
 # stopAndCleanup override specifically for boot-from-media handles: when
 # the VmHandle was created by ``bootFromMedia`` we need to tear down the
 # TRANSIENT VM (whose name is the per-call generated ``repro-test-boot-
@@ -1076,6 +1350,11 @@ method stopAndCleanup*(b: HyperVBackend, vm: VmHandle, deleteVm: bool = true) =
   when defined(windows):
     if vm.baseline == "<boot-from-media>":
       destroyBootVm(b, vm)
+    elif vm.baseline == "<ephemeral-clone>":
+      # Per-job ephemeral clone: force-stop + Remove-VM the transient VM and
+      # delete its per-job clone disk (the golden is never touched). This is
+      # the GARM DeleteInstance path.
+      destroyEphemeralClone(b, vm)
     else:
       try:
         let psBlock = &"""try {{
@@ -1093,6 +1372,48 @@ method stopAndCleanup*(b: HyperVBackend, vm: VmHandle, deleteVm: bool = true) =
         discard
   else:
     discard
+
+proc runEphemeralHyperVJob*(b: HyperVBackend, spec: HyperVEphemeralCloneSpec,
+                            probeArgv: seq[string] = @[],
+                            probeEnv: Table[string, string] =
+                              initTable[string, string](),
+                            timeoutSec: int = 300,
+                            keep: bool = false): int =
+  ## Drive the full per-job ephemeral lifecycle:
+  ## `provisionEphemeralClone` (New-VHD/New-VM/Start-VM) → optional in-guest
+  ## JIT probe (PowerShell Direct `execInGuest`) → `stopAndCleanup`
+  ## (Remove-VM + delete the clone), guaranteeing teardown in a `finally`.
+  ## This is the create→boot→probe→destroy cycle `vm-harness serve` forwards
+  ## for the RA4 `t_vmharness_serve_win_hyperv` gate and the future GARM
+  ## provider drives. Returns the probe's exit code (0 when no probe is
+  ## requested and the clone booted + tore down cleanly).
+  ##
+  ## `--keep` leaves the VM RUNNING for an out-of-band probe and returns 0
+  ## after echoing the VM name (mirrors the libvirt `run --ephemeral --keep`
+  ## path); the caller reclaims it via `ephemeral-destroy`.
+  when defined(windows):
+    var vm = b.provisionEphemeralClone(spec)
+    if keep:
+      echo spec.name
+      return 0
+    var verdict = 0
+    try:
+      # A JIT probe runs in-guest via PowerShell Direct, which needs the
+      # credential cache. When either is absent, reaching a booted+destroyable
+      # clone (New-VM/Start-VM/Remove-VM all succeeded) is itself the success
+      # signal — the host-lifecycle ops RA4 proves.
+      if probeArgv.len > 0 and b.credentialCachePath.len > 0:
+        b.startAndAwaitReady(vm, timeoutSec)
+        let r = b.execInGuest(vm, probeEnv, probeArgv, timeoutSec = timeoutSec)
+        verdict = r.exitCode
+    except CatchableError:
+      verdict = 1
+    finally:
+      b.stopAndCleanup(vm, deleteVm = true)
+    return verdict
+  else:
+    raise newException(BackendUnavailableError,
+      "runEphemeralHyperVJob requires a Windows host")
 
 # ---------------------------------------------------------------------------
 # Reprobuild script-wrapper convenience helpers.

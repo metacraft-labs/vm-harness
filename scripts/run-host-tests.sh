@@ -19,6 +19,11 @@ run_nim r --hints:off tests/e2e/t_vm_harness_hyperv_m69_feature_capability_passe
 run_nim r --hints:off tests/e2e/t_vm_harness_wsl_m69_passwd_user_passes.nim
 run_nim r --hints:off --threads:on tests/e2e/t_vm_harness_wsl_systemd_boot.nim
 run_nim r --hints:off --threads:on tests/e2e/t_vm_harness_hyperv_systemd_boot.nim
+# RA4 remoting on a SECOND Windows host: a remote client drives a per-job
+# ephemeral Hyper-V VM (New-VHD/New-VM-from-golden -> boot -> JIT-probe ->
+# Remove-VM, no residue) through `vm-harness serve`. Needs a golden VHDX in
+# $VMH_HYPERV_GOLDEN; self-skips off-Windows / without Hyper-V / without it.
+run_nim r --hints:off tests/e2e/t_vmharness_serve_win_hyperv.nim
 
 # macOS host: Tart, UTM, and Lima.
 run_nim r --hints:off tests/integration/t_tart_lifecycle.nim

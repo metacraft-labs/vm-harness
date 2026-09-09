@@ -369,17 +369,22 @@ Common flags:
                                   guest's FirstLogonCommands installs it in
                                   authorized_keys before first boot.
                                   Requires --recipe.
-  --ephemeral                     libvirt-only: run ONE per-job CoW-clone VM
-                                  (fresh overlay from --golden-image, boot on
-                                  KVM, then destroy + remove overlay — no
-                                  residue). The M2 per-job reset the GARM
-                                  provider drives. A positional arg after --
-                                  is treated as an expected serial boot marker.
-  --keep                          Leave a `boot` VM running, or keep a libvirt
+  --ephemeral                     run ONE per-job clone VM then destroy it, no
+                                  residue (the per-job reset the GARM provider
+                                  drives). libvirt: CoW overlay from
+                                  --golden-image booted on KVM. incus: fresh
+                                  container from --base-image. hyperv (RA4):
+                                  New-VHD/New-VM clone of the --golden-image
+                                  VHDX, boot, JIT-probe, Remove-VM (see the
+                                  VMH_HYPERV_* env seams). A positional arg
+                                  after -- is a serial marker (libvirt) or the
+                                  in-guest probe command (incus/hyperv).
+  --keep                          Leave a `boot` VM running, or keep an
                                   ephemeral clone after startup.
-  --golden-image <path>           libvirt-only: golden qcow2 the ephemeral
-                                  overlay is CoW-cloned from. Requires
-                                  --ephemeral.
+  --golden-image <path>           libvirt/hyperv: the golden image the
+                                  ephemeral clone is derived from (libvirt: a
+                                  qcow2 CoW backing file; hyperv: a golden
+                                  VHDX). Requires --ephemeral.
   --kernel <path>                 libvirt-only: optional direct-kernel-boot
                                   bzImage for --ephemeral (tiny Linux golden).
   --initrd <path>                 Initramfs for a direct-kernel boot: the
@@ -1342,6 +1347,57 @@ proc cmdRunEphemeralIncus(opts: CliOpts): int =
              {"name": opts.baseline})
   verdict
 
+proc cmdRunEphemeralHyperV(opts: CliOpts): int =
+  ## Hyper-V per-job ephemeral VM (RA4): CoW-clone (or ReFS block-copy) a
+  ## GOLDEN VHDX into a fresh Gen-2 VM (`New-VHD`/`New-VM`/`Start-VM`), run an
+  ## optional in-guest JIT probe over PowerShell Direct, then `Remove-VM` +
+  ## delete the per-job disk — no residue, golden untouched. The Windows-host
+  ## analog of the libvirt CoW-overlay ephemeral path; `vm-harness serve`
+  ## forwards exactly this invocation for the `t_vmharness_serve_win_hyperv`
+  ## gate on win-ci-bare-001.
+  ##
+  ## Flags: `--baseline` names the per-job VM (must start with the ephemeral
+  ## prefix); `--golden-image` the golden VHDX. Env seams keep the CLI
+  ## surface small and match how the reprobuild-declared serve service is
+  ## configured: `VMH_HYPERV_SWITCH` (vSwitch for the JIT metadata NIC),
+  ## `VMH_HYPERV_CRED_CACHE` (PowerShell-Direct credential cache for the
+  ## in-guest probe), `VMH_HYPERV_FULL_COPY=1` (ReFS block-copy instead of a
+  ## differencing overlay), `VMH_HYPERV_CONFIG_DRIVE` (a prebuilt
+  ## cloudbase-init ConfigDrive ISO). Args after `--` are the in-guest probe.
+  if opts.baseline.len == 0:
+    raise newException(ValueError,
+      "run --ephemeral --backend hyperv: --baseline (VM name) is required")
+  if opts.goldenImage.len == 0:
+    raise newException(ValueError,
+      "run --ephemeral --backend hyperv: --golden-image (golden VHDX) is required")
+  let credCache = getEnv("VMH_HYPERV_CRED_CACHE")
+  let hb = HyperVBackend(newBackend(biHyperv))
+  if credCache.len > 0:
+    hb.credentialCachePath = credCache
+  let spec = HyperVEphemeralCloneSpec(
+    name: opts.baseline,
+    goldenVhdx: opts.goldenImage,
+    useDifferencing: getEnv("VMH_HYPERV_FULL_COPY") == "",
+    cpus: opts.cpus,
+    memoryMB: opts.memoryMB,
+    generation: 2,
+    secureBootEnabled: true,
+    tpmEnabled: true,
+    switchName: getEnv("VMH_HYPERV_SWITCH"),
+    configDriveIso: getEnv("VMH_HYPERV_CONFIG_DRIVE"))
+  logEvent(opts.logFormat, "info", "ephemeral hyperv: clone+boot",
+           {"backend": $biHyperv, "name": opts.baseline,
+            "golden": opts.goldenImage})
+  let timeoutSec = if opts.timeoutSec > 0: opts.timeoutSec else: 300
+  let code = runEphemeralHyperVJob(hb, spec,
+    probeArgv = opts.cmd,
+    timeoutSec = timeoutSec,
+    keep = opts.keepEphemeral)
+  if not opts.keepEphemeral:
+    logEvent(opts.logFormat, "info", "ephemeral hyperv: destroyed",
+             {"name": opts.baseline, "exit": $code})
+  code
+
 proc cmdRunEphemeral(opts: CliOpts): int =
   ## M2 per-job ephemeral CoW clone: clone a fresh overlay from the
   ## golden, boot it on KVM, harvest the serial console (boot-marker
@@ -1360,6 +1416,8 @@ proc cmdRunEphemeral(opts: CliOpts): int =
   ## ``incus``.
   if opts.backend == $biIncus:
     return cmdRunEphemeralIncus(opts)
+  if opts.backend == $biHyperv:
+    return cmdRunEphemeralHyperV(opts)
   let id = biLibvirt
   let backend = newBackend(id)
   if opts.baseline.len == 0:

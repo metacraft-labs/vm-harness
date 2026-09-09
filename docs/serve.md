@@ -134,4 +134,12 @@ let code = c.execStream(@["run", "--ephemeral", "--backend", "incus",
 - mTLS client-cert auth + the enrollment/identity model + a richer capability
   manifest (campaign RA6).
 - Per-OS deployment of the daemon (systemd / launchd / reprobuild-Windows) is
-  campaign RA2–RA5.
+  campaign RA2–RA5. The reprobuild-Windows/Hyper-V deployment (RA4) is
+  implemented: the reusable recipe is
+  [serve-windows-reprobuild.md](serve-windows-reprobuild.md), the concrete
+  profile is `infra/machines/server/_win-ci-bare-001/system_windows_runner.nim`,
+  and the per-job Hyper-V ephemeral clone the daemon drives is
+  `run --ephemeral --backend hyperv` (host-lifecycle: New-VHD/New-VM from a
+  golden VHDX → boot → JIT-probe → Remove-VM, no residue). Gate
+  `t_vmharness_serve_win_hyperv` (`just test-host`, Windows + Hyper-V + a
+  golden VHDX); the clone logic is unit-tested by `t_hyperv_ephemeral_clone`.
