@@ -34,6 +34,9 @@ run_nim r --hints:off tests/unit/t_layer_gc.nim
 run_nim r --hints:off tests/unit/t_design_reprobuild_adapter_section.nim
 run_nim r --hints:off tests/unit/t_uefi_iso_validator.nim
 run_nim r --hints:off tests/unit/t_serve_protocol.nim
+# RA6 enrollment/identity + capability manifest: pure crypto vectors, the
+# capability deciders against fixtures, and the sign/verify state machine.
+run_nim r --hints:off tests/unit/t_serve_enrollment.nim
 
 # Backend-independent lifecycle and CLI coverage.
 run_nim r --hints:off tests/integration/t_noop_lifecycle.nim
@@ -43,6 +46,10 @@ run_nim r --hints:off tests/e2e/t_vm_harness_auto_backend_selection.nim
 # RA1 remoting: a remote client drives provision->run->destroy against a
 # `vm-harness serve` daemon over the authenticated endpoint (noop backend).
 run_nim r --hints:off tests/e2e/t_vmharness_serve_roundtrip.nim
+# RA6 enrollment gate: a remote client reads the daemon's SIGNED identity +
+# capability manifest over /v1/manifest and verifies it against a trust store;
+# unenrolled/expired/revoked/tampered identities are rejected. Hermetic (noop).
+run_nim r --hints:off tests/e2e/t_vmharness_serve_enrollment.nim
 
 # Backend contracts that do not require a live hypervisor.
 run_nim r --hints:off tests/integration/t_libvirt_backend.nim

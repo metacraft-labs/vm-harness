@@ -58,6 +58,20 @@ proc info*(c: ServeClient): JsonNode =
       "info: unexpected status " & $resp.status & ": " & resp.body)
   parseJson(resp.body)
 
+proc manifest*(c: ServeClient): JsonNode =
+  ## ``GET /v1/manifest`` — the daemon's SIGNED identity + capability manifest
+  ## (RA6). Returns the raw ``{identity, sig}`` JSON; the controller verifies
+  ## it with ``enrollment.verify`` against its trust store. Raises
+  ## ``ServeAuthError`` on 401 and ``ServeError`` on 503 (no enrollment secret)
+  ## or any other non-200.
+  let resp = httpRequest(c.host, c.port, "GET", PathManifest, c.authHeaders())
+  if resp.status == 401:
+    raise newException(ServeAuthError, "daemon rejected credentials (401)")
+  if resp.status != 200:
+    raise newException(ServeError,
+      "manifest: unexpected status " & $resp.status & ": " & resp.body)
+  parseJson(resp.body)
+
 proc shutdown*(c: ServeClient) =
   ## ``POST /v1/shutdown`` — ask the daemon to stop. Raises
   ## ``ServeAuthError`` on 401.

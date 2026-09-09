@@ -212,6 +212,17 @@ type
                                  ## ``-d:ssl``; otherwise rely on NetBird).
     tlsKey*: string              ## ``serve --tls-key <path>``.
     quiet*: bool                 ## ``serve --quiet`` — suppress access logs.
+    # RA6 enrollment / signed capability manifest.
+    enrollSecret*: string        ## ``serve --enroll-secret <s>`` (prefer file).
+    enrollSecretFile*: string    ## ``serve --enroll-secret-file <path>`` —
+                                 ## per-host enrollment secret (agenix/systemd
+                                 ## ``LoadCredential`` friendly). Also
+                                 ## ``$VMH_ENROLL_SECRET``; else self-bootstrapped
+                                 ## under ``--state-dir``.
+    identityTtlSec*: int         ## ``serve --identity-ttl-sec <n>`` — signed
+                                 ## identity lifetime (default 3600).
+    hostId*: string              ## ``serve --host-id <name>`` — identity host
+                                 ## label; default the OS hostname.
 
 const HelpText = """
 vm-harness <subcommand> [flags]
@@ -248,6 +259,9 @@ Subcommands:
                           destroy preserves data unless --purge AND --instance-id
                           are supplied. Purge never removes caller-owned inputs.
   probe                   Print available backends as JSON.
+  manifest                Print THIS host's capability manifest as JSON (RA6).
+                          With --remote <addr>, fetch the remote daemon's
+                          SIGNED identity + manifest over GET /v1/manifest.
   shell                   (placeholder) Open an interactive shell into a baseline.
   backends                Tabular listing of every known backend.
   snapshot create [--running] <vm> <name>
@@ -415,12 +429,26 @@ Common flags:
 serve daemon (RA1 remoting — the authenticated network access point):
   vm-harness serve --listen <host:port> [--auth-token-file <f> | --auth-token <t>]
                    [--worker-exe <path>] [--port-file <f>] [--quiet]
+                   [--enroll-secret-file <f>] [--identity-ttl-sec <n>]
+                   [--host-id <name>]
     Expose the vm-harness CLI backend ops over a versioned HTTP/JSON RPC
     (protocol v1) so a remote controller can drive this host's VMs/containers.
     Every op runs the SAME local vm-harness binary (a thin network front-end,
     not a reimplementation). Bind to a NetBird overlay IP only — NEVER a public
     interface. The bearer token also reads from $VMH_SERVE_TOKEN. See
     docs/serve.md.
+
+  RA6 enrollment / signed capability manifest (GET /v1/manifest):
+  --enroll-secret-file <path>     Per-host enrollment secret (prefer over
+                                  --enroll-secret; agenix/LoadCredential
+                                  friendly). Also $VMH_ENROLL_SECRET; else a
+                                  secret is self-bootstrapped under --state-dir.
+                                  The daemon prints its keyId at startup — enroll
+                                  that keyId on the controller. See
+                                  docs/serve-enrollment.md.
+  --enroll-secret <s>             The secret inline (avoid — visible in argv).
+  --identity-ttl-sec <n>          Signed-identity lifetime (default 3600).
+  --host-id <name>                Identity host label (default: OS hostname).
 """
 
 proc parseEnvPair(s: string): tuple[k: string, v: string] =
@@ -746,6 +774,16 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
     of "--quiet":
       result.quiet = true
       inc i
+    of "--enroll-secret":
+      inc i; result.enrollSecret = args[i]; inc i
+    of "--enroll-secret-file":
+      inc i; result.enrollSecretFile = args[i]; inc i
+    of "--identity-ttl-sec":
+      inc i; result.identityTtlSec = parseInt(args[i]); inc i
+      if result.identityTtlSec < 0:
+        raise newException(ValueError, "--identity-ttl-sec must be >= 0")
+    of "--host-id":
+      inc i; result.hostId = args[i]; inc i
     of "-h", "--help":
       result.subcommand = "help"
       inc i
@@ -2107,12 +2145,25 @@ proc cmdServe(opts: CliOpts): int =
     portFile: opts.portFile,
     tlsCertFile: opts.tlsCert,
     tlsKeyFile: opts.tlsKey,
-    quiet: opts.quiet)
+    quiet: opts.quiet,
+    enrollSecret: opts.enrollSecret,
+    enrollSecretFile: opts.enrollSecretFile,
+    stateDir: opts.stateDir,
+    identityTtlSec: opts.identityTtlSec,
+    hostId: opts.hostId)
   try:
     runServe(cfg)
   except CatchableError as e:
     stderr.writeLine("vm-harness serve: " & e.msg)
     return 1
+  0
+
+proc cmdManifest(opts: CliOpts): int =
+  ## Print THIS host's UNSIGNED capability manifest (RA6) as JSON. The signed,
+  ## enrolled form is served over ``GET /v1/manifest`` by a running daemon and
+  ## fetched with ``vm-harness --remote <addr> manifest``. This local form is
+  ## the same payload, for introspection + the RC1 label-derivation source.
+  echo hostCapabilityManifest().pretty()
   0
 
 proc dispatch*(opts: CliOpts): int =
@@ -2138,6 +2189,7 @@ proc dispatch*(opts: CliOpts): int =
   of "prune":     cmdPrune(opts)
   of "layer":     cmdLayer(opts)
   of "serve":     cmdServe(opts)
+  of "manifest":  cmdManifest(opts)
   else:
     stderr.writeLine("vm-harness: unknown subcommand '" & opts.subcommand & "'")
     stderr.writeLine(HelpText)
@@ -2186,6 +2238,20 @@ proc runRemote(remote: string, opts: CliOpts, forwarded: seq[string]): int =
   except ValueError as e:
     stderr.writeLine("vm-harness: " & e.msg)
     return 2
+  # `manifest` is a control-plane read, not a worker exec: fetch the daemon's
+  # SIGNED identity + capability manifest over GET /v1/manifest (RA6), so the
+  # controller sees the signed envelope it must verify — not a local reprint.
+  if forwarded.len == 1 and forwarded[0] == "manifest":
+    try:
+      echo client.manifest().pretty()
+      return 0
+    except ServeAuthError:
+      stderr.writeLine("vm-harness --remote: authentication rejected by " &
+        remote & " (check the bearer token)")
+      return 77
+    except CatchableError as e:
+      stderr.writeLine("vm-harness --remote manifest: " & e.msg)
+      return 1
   try:
     return client.execRelay(forwarded, proc(line: string) = echo line)
   except ServeAuthError:
