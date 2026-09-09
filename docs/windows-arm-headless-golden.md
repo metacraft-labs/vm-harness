@@ -23,12 +23,16 @@ the checked-in answer files.
 | Component | Status | Notes |
 |---|---|---|
 | `provisionBaseline` (validate existing golden) | ✓ | Already shipped; unchanged by this work. |
-| Headless install boot | ☐ | Phase 1. |
+| Headless install boot — argument vector | ✓ | `buildQemuWindowsArmInstallArgs`. |
+| Headless install boot — orchestration | ☐ | Phase 1 remainder: launch, then wait. |
 | Install-completion detection | ☐ | Phase 1. |
+| Rebuild safety guard (never build in place) | ✓ | `prepareGoldenBuildDir`. |
+| Overlay backing-path symlink resolution | ✓ | Prerequisite for a safe flip; landed early with the guard. |
+| Golden disk allocation | ✓ | `createGoldenDisk`. |
 | Sysprep + generalize | ☐ | Phase 2. |
-| Golden finalize + promote | ☐ | Phase 2. Versioned dir + symlink flip; never in place. |
-| Overlay backing-path symlink resolution | ☐ | Phase 2. Prerequisite for a safe flip. |
+| Golden finalize + promote | ☐ | Phase 2. Versioned dir + pointer flip; never in place. |
 | Previous-golden retention + reclaim | ☐ | Phase 2. Gated on the per-instance advisory lock. |
+| Build manifest | ☐ | Phase 2. Identifies a golden's provenance. |
 | `vm-harness provision --backend qemu-windows-arm` entrypoint | ☐ | Phase 3. |
 | Nix-side golden provisioning on m3 | ☐ | Phase 3; `metacraft-labs/infra`. |
 | Retire the UTM recipe path | ☐ | Phase 4, once Phase 3 has produced a golden twice. |
