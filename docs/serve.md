@@ -36,11 +36,20 @@ Versioned under the `/v1` URL prefix; every message also carries a `v` field;
 All routes require `Authorization: Bearer <token>`; a missing/wrong token is
 rejected with **401 before any work runs** (constant-time token comparison).
 
-| Method + path      | Body                              | Response                          |
-| ------------------ | --------------------------------- | --------------------------------- |
-| `GET  /v1/info`    | —                                 | JSON: protocol, host, backends[]  |
-| `POST /v1/exec`    | `{v, argv[], stdin?, timeoutSec?}`| chunked NDJSON event stream       |
-| `POST /v1/shutdown`| `{}`                              | `{ok:true}`                       |
+| Method + path       | Body                              | Response                          |
+| ------------------- | --------------------------------- | --------------------------------- |
+| `GET  /v1/info`     | —                                 | JSON: protocol, host, backends[]  |
+| `GET  /v1/manifest` | —                                 | signed identity + capability manifest (RA6) |
+| `POST /v1/exec`     | `{v, argv[], stdin?, timeoutSec?}`| chunked NDJSON event stream       |
+| `POST /v1/shutdown` | `{}`                              | `{ok:true}`                       |
+
+`GET /v1/manifest` (RA6) returns a **signed identity** wrapping a
+machine-checkable **capability manifest** (os, arch, `x86-64-vN` level, gpu,
+nested-virt, docker/podman, rr-hw-counters, the hypervisor backends this daemon
+can drive). It is the source for the Phase-C runner labels. See
+[serve-enrollment.md](serve-enrollment.md) for the schema, the per-field
+detection rules, the enrollment/identity/revocation model, and the RC1
+label-derivation contract.
 
 `argv` is a full vm-harness CLI invocation *without* the program name, e.g.
 `["run","--backend","incus","--baseline","job-42","--ephemeral", ...]`. The
@@ -131,8 +140,13 @@ let code = c.execStream(@["run", "--ephemeral", "--backend", "incus",
 - Framed stdout/stderr separation in the exec stream (RA1 merges them).
 - Per-op daemon-side timeout enforcement (RA1 relies on the CLI's own
   `--timeout-sec`; the `timeoutSec` field is carried but advisory).
-- mTLS client-cert auth + the enrollment/identity model + a richer capability
-  manifest (campaign RA6).
+- The enrollment/identity model + the richer signed capability manifest
+  (campaign RA6) is IMPLEMENTED: `GET /v1/manifest`, per-host enrollment
+  secret + signed identity, controller-side verify/expiry/revocation, and the
+  capability-detection module. See [serve-enrollment.md](serve-enrollment.md).
+  Gate `t_vmharness_serve_enrollment` (hermetic, `--backend noop`). Remaining
+  follow-up: an asymmetric (Ed25519) signature upgrade (the wire format
+  reserves an `alg` field) and mTLS client-cert transport auth.
 - Per-OS deployment of the daemon (systemd / launchd / reprobuild-Windows) is
   campaign RA2–RA5. The reprobuild-Windows/Hyper-V deployment (RA4) is
   implemented: the reusable recipe is

@@ -43,6 +43,9 @@ import ./vm_harness/serve/protocol
 import ./vm_harness/serve/http
 import ./vm_harness/serve/server
 import ./vm_harness/serve/client
+import ./vm_harness/serve/hmac
+import ./vm_harness/serve/capability
+import ./vm_harness/serve/enrollment
 
 export types
 export pool
@@ -69,3 +72,6 @@ export protocol
 export http
 export server
 export client
+export hmac
+export capability
+export enrollment

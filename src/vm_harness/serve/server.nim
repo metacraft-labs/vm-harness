@@ -22,8 +22,8 @@
 ## token is carried inside WireGuard; an optional ``-d:ssl`` TLS wrap is a
 ## documented follow-up hook.
 
-import std/[json, net, osproc, os, streams, strutils, tables]
-import ./protocol, ./http
+import std/[json, net, osproc, os, streams, strutils, tables, times]
+import ./protocol, ./http, ./capability, ./enrollment
 import ../types, ../auto
 
 # Import the backend modules so ``registeredBackends`` / ``newBackend`` see
@@ -56,22 +56,42 @@ type
     tlsCertFile*: string          ## optional (only honored under -d:ssl)
     tlsKeyFile*: string
     quiet*: bool                  ## suppress daemon stderr access logs
+    # RA6 enrollment / signed capability manifest.
+    enrollSecret*: string         ## per-host enrollment secret (prefer file)
+    enrollSecretFile*: string     ## agenix / LoadCredential friendly
+    stateDir*: string             ## where a self-bootstrapped secret persists
+    identityTtlSec*: int          ## signed-identity lifetime; 0 ⇒ TTL default
+    hostId*: string               ## identity ``host`` label; "" ⇒ hostname
 
   ServeContext = ref object
     cfg: ServeConfig
     running: bool
+    enrollSecret: string          ## resolved once at startup (may be "")
+    keyId: string                 ## derived from the secret; "" if none
 
 proc daemonLog(ctx: ServeContext, msg: string) =
   if not ctx.cfg.quiet:
     stderr.writeLine("[vm-harness serve] " & msg)
 
-proc infoJson(): JsonNode =
-  ## Build the ``/v1/info`` capability report: the protocol version, the
-  ## host platform, and every registered backend with a probed
-  ## availability flag + its supported guests. This is the seed the RA6
-  ## capability manifest grows from.
-  let host = try: $detectHostPlatform() except CatchableError: "unknown"
-  var backends = newJArray()
+proc hostnameOrUnknown(): string =
+  ## Best-effort host name for the identity ``host`` label. Nim's stdlib has no
+  ## portable ``getHostname``; try ``$HOSTNAME``, then ``/proc/sys/kernel/hostname``
+  ## (Linux) / ``/etc/hostname``, else "unknown".
+  let env = getEnv("HOSTNAME").strip()
+  if env.len > 0: return env
+  for p in ["/proc/sys/kernel/hostname", "/etc/hostname"]:
+    try:
+      if fileExists(p):
+        let h = readFile(p).strip()
+        if h.len > 0: return h
+    except CatchableError: discard
+  "unknown"
+
+proc probeHypervisors(): seq[tuple[id: string, available: bool,
+                                   guests: seq[string]]] =
+  ## Probe every registered backend once: id, availability, supported guests.
+  ## Shared by the ``/v1/info`` seed and the RA6 ``/v1/manifest`` (so both
+  ## report the SAME hypervisor set this daemon can drive).
   for id in registeredBackends():
     var available = false
     var guests: seq[string] = @[]
@@ -81,12 +101,45 @@ proc infoJson(): JsonNode =
       for g in b.supportedGuests: guests.add($g)
     except CatchableError:
       discard
-    backends.add(%*{"id": $id, "available": available, "guests": guests})
+    result.add((id: $id, available: available, guests: guests))
+
+proc infoJson(): JsonNode =
+  ## Build the ``/v1/info`` capability report: the protocol version, the
+  ## host platform, and every registered backend with a probed
+  ## availability flag + its supported guests. This is the seed the RA6
+  ## capability manifest grows from (the FULL, signed manifest is
+  ## ``/v1/manifest``).
+  let host = try: $detectHostPlatform() except CatchableError: "unknown"
+  var backends = newJArray()
+  for h in probeHypervisors():
+    backends.add(%*{"id": h.id, "available": h.available, "guests": h.guests})
   result = %*{
     "service": ServiceName,
     "protocol": ProtocolVersion,
     "host": host,
     "backends": backends}
+
+proc hostCapabilityManifest*(): JsonNode =
+  ## THIS host's UNSIGNED capability manifest (the ``manifest`` payload the
+  ## signed identity carries). Exposed for ``vm-harness manifest`` (local
+  ## introspection + the RC1 label-derivation source) without needing a
+  ## running daemon or an enrollment secret.
+  toJson(detectHostCapabilities(probeHypervisors()))
+
+proc manifestJson(ctx: ServeContext): JsonNode =
+  ## Build the RA6 signed identity + capability manifest served by
+  ## ``GET /v1/manifest``. The capability manifest is self-reported from the
+  ## host (``capability.detectHostCapabilities``); the identity is signed with
+  ## the host's enrollment secret (``enrollment.sign``) and is SHORT-LIVED
+  ## (``identityTtlSec``) so a controller re-fetches after expiry.
+  let caps = detectHostCapabilities(probeHypervisors())
+  let host = if ctx.cfg.hostId.len > 0: ctx.cfg.hostId
+             else: hostnameOrUnknown()
+  let ttl = if ctx.cfg.identityTtlSec > 0: ctx.cfg.identityTtlSec
+            else: DefaultIdentityTtlSec
+  let id = buildIdentity(ctx.enrollSecret, host, toJson(caps),
+                         getTime().toUnix(), ttl)
+  toJson(sign(ctx.enrollSecret, id))
 
 proc authorized(ctx: ServeContext, req: HttpRequest): bool =
   ## Constant-time bearer-token check. A missing header, wrong scheme, or
@@ -159,6 +212,16 @@ proc handleConnection(ctx: ServeContext, client: Socket) =
       client.sendResponse(405, $(%*{"error": "use GET"}))
     else:
       client.sendResponse(200, $infoJson())
+  of PathManifest:
+    if req.httpMethod != "GET":
+      client.sendResponse(405, $(%*{"error": "use GET"}))
+    elif ctx.enrollSecret.len == 0:
+      # No enrollment material ⇒ the daemon cannot present a signed identity.
+      client.sendResponse(503, $(%*{"error":
+        "serve daemon has no enrollment secret; " &
+        "provide --enroll-secret-file / --enroll-secret / $VMH_ENROLL_SECRET"}))
+    else:
+      client.sendResponse(200, $manifestJson(ctx))
   of PathExec:
     if req.httpMethod != "POST":
       client.sendResponse(405, $(%*{"error": "use POST"}))
@@ -185,6 +248,16 @@ proc runServe*(cfg: ServeConfig) =
       "vm-harness serve: a non-empty auth token is required " &
       "(--auth-token / --auth-token-file / $VMH_SERVE_TOKEN)")
   let ctx = ServeContext(cfg: cfg, running: true)
+  # Resolve the enrollment secret ONCE at startup so the daemon's identity is
+  # stable for its lifetime. Missing material is non-fatal: /v1/exec + /v1/info
+  # still work (RA1 back-compat); only /v1/manifest requires it (503 otherwise).
+  ctx.enrollSecret =
+    try:
+      resolveEnrollmentSecret(cfg.enrollSecret, cfg.enrollSecretFile, cfg.stateDir)
+    except CatchableError as e:
+      raise newException(ValueError, "vm-harness serve: " & e.msg)
+  if ctx.enrollSecret.len > 0:
+    ctx.keyId = keyIdFor(ctx.enrollSecret)
   var server = newSocket()
   server.setSockOpt(OptReuseAddr, true)
   let host = if cfg.listenHost.len > 0: cfg.listenHost else: "127.0.0.1"
@@ -196,6 +269,12 @@ proc runServe*(cfg: ServeConfig) =
   daemonLog(ctx, "listening on " & host & ":" & $(boundPort.int) &
             " (worker " &
             (if cfg.workerExe.len > 0: cfg.workerExe else: "self") & ")")
+  if ctx.keyId.len > 0:
+    # The keyId is the non-secret identity to ENROLL centrally (operator step).
+    daemonLog(ctx, "identity keyId " & ctx.keyId &
+              " (enroll this keyId on the controller)")
+  else:
+    daemonLog(ctx, "no enrollment secret — /v1/manifest disabled")
   when defined(ssl):
     if cfg.tlsCertFile.len > 0 and cfg.tlsKeyFile.len > 0:
       # Optional TLS wrap (compile with -d:ssl). Over NetBird the WireGuard

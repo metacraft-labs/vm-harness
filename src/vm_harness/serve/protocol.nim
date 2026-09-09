@@ -58,6 +58,7 @@ const
 
   ApiPrefix* = "/v" & ProtocolVersion
   PathInfo* = ApiPrefix & "/info"
+  PathManifest* = ApiPrefix & "/manifest"   ## RA6 signed identity + manifest
   PathExec* = ApiPrefix & "/exec"
   PathShutdown* = ApiPrefix & "/shutdown"
 
