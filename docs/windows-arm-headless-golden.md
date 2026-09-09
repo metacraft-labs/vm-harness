@@ -26,7 +26,9 @@ the checked-in answer files.
 | Headless install boot | ☐ | Phase 1. |
 | Install-completion detection | ☐ | Phase 1. |
 | Sysprep + generalize | ☐ | Phase 2. |
-| Golden finalize + promote | ☐ | Phase 2. |
+| Golden finalize + promote | ☐ | Phase 2. Versioned dir + symlink flip; never in place. |
+| Overlay backing-path symlink resolution | ☐ | Phase 2. Prerequisite for a safe flip. |
+| Previous-golden retention + reclaim | ☐ | Phase 2. Gated on the per-instance advisory lock. |
 | `vm-harness provision --backend qemu-windows-arm` entrypoint | ☐ | Phase 3. |
 | Nix-side golden provisioning on m3 | ☐ | Phase 3; `metacraft-labs/infra`. |
 | Retire the UTM recipe path | ☐ | Phase 4, once Phase 3 has produced a golden twice. |
@@ -77,6 +79,51 @@ the macOS/ARM host, minus libvirt, which does not exist on Darwin.
 - Replacing the x64 libvirt path on `high-mem-server`, which already works.
 - UTM parity. The UTM recipe is retired by Phase 4, not preserved.
 
+## Golden lifecycle: a read-only base under live overlays
+
+The golden is not a template that gets copied. In the default disk mode
+(`overlay`, see `qwaDiskMode`) `createEphemeralOverlay` creates a thin
+`overlay.qcow2` whose **qcow2 backing file is the golden's
+`windows.qcow2`**. The golden is never copied; it is shared read-only by
+every concurrent instance, and only the overlay records guest writes. Clone
+mode — a full per-instance copy — is a fallback behind
+`VMH_QEMU_WINDOWS_ARM_DISK_MODE=clone`.
+
+That makes one thing a hard constraint on this work:
+
+> **A golden must never be rebuilt in place.** qcow2 does not validate that a
+> backing file still holds the content an overlay was created against. Writing
+> a new `windows.qcow2` at a path some overlay still references does not fail
+> — the guest silently reads a different disk underneath its own writes.
+> Every live instance, and every orphaned instance directory, is exposed.
+
+So a rebuild is an *addition*, not a replacement:
+
+1. Build into a **new versioned directory**, `golden/win-arm-runner-<build-id>/`,
+   which is inert until anything points at it.
+2. Flip `golden/win-arm-runner` — a symlink — to the new build. This selects
+   what *subsequent* instances get; it must not disturb existing overlays.
+3. Retain the previous golden until no overlay references it. The existing
+   per-instance advisory lock (`qwaInstanceLockPath`, which `prune` already
+   uses to distinguish a live instance from an orphan) is the signal for
+   when that is true.
+
+Two consequences worth stating plainly:
+
+- **Overlays must record the resolved versioned path, not the symlink.**
+  `validateWindowsArmVmDir` returns `absolutePath(dir)`, which does not
+  resolve symlinks, so an overlay created through the pointer would record
+  the pointer — and flipping it would corrupt exactly the instances this
+  scheme exists to protect. Instance creation has to resolve the symlink
+  before handing a backing path to `qemu-img create`.
+- **This supplies the rollback the "no fallback" risk asked for.** Retaining
+  the previous golden for the lifetime of its overlays means the
+  last-known-good build is already on disk. Reverting a bad recipe change is
+  a symlink flip, not a rebuild.
+
+Periodic refreshes — Windows updates, a newer runner toolchain — are the
+normal case for this path, not an exceptional one.
+
 ## Design
 
 A new `buildBaseline` capability on the `qemu-windows-arm` backend, driven by
@@ -92,7 +139,9 @@ vm-harness provision --backend qemu-windows-arm \
   --autounattend-iso <path>
 ```
 
-1. `qemu-img create -f qcow2 <golden-dir>/windows.qcow2 <size>`.
+1. `qemu-img create -f qcow2 <golden-dir>/windows.qcow2 <size>`, where
+   `<golden-dir>` is a fresh versioned directory — never an existing golden
+   (see the lifecycle constraint above).
 2. Stage UEFI vars from the firmware template, as `revertToBaseline`
    already does.
 3. Start `swtpm`, then QEMU with `qemuBaseArgs` plus both ISOs as
@@ -159,27 +208,50 @@ explicit message** rather than passing quietly.
 - **The install may need more reboots than HVF+UEFI tolerates.** Untested on
   this exact firmware/machine combination; Phase 1 is where that is found
   out.
-- **~8 GB ISO plus a 40–60 GB qcow2** on a host already at 86% disk. Golden
+- **~8 GB ISO plus a 40–60 GB qcow2** on a host already at 88% disk. Golden
   builds must run against a checked free-space precondition.
+- **A bad recipe change is caught by retention, not by a published copy.**
+  Nothing is published, but the previous golden stays on disk until its
+  overlays drain, so rollback is a symlink flip. That only holds if
+  retention is actually implemented; without it a regressed build is a lane
+  outage until the recipe is fixed. The host e2e gate remains the thing that
+  should catch it first.
+- **Silent corruption if the versioning is got wrong.** Rebuilding over a
+  golden that still backs an overlay does not error — it produces guests
+  reading a disk that no longer matches their writes. This is the highest
+  severity failure mode in this work and the reason the build refuses to
+  write into an existing golden directory at all.
 - **Long feedback loop.** A full cycle is 30–60 minutes, so Phase 1 should
   land the argument construction behind unit tests before any host run.
 
+## Decisions
+
+**The recipe is the artifact.** ✓ Decided 2026-09-09. A golden is rebuilt by
+applying the recipe to a base ISO; the built golden is never published or
+pulled. There is no cached copy to fall back on, so the build path is the
+*only* path and has to be dependable enough to be run on demand.
+
+Two consequences follow, and they are requirements rather than preferences:
+
+- The build must be **re-runnable**, which the versioned-directory scheme
+  gives for free: each run writes a fresh directory and a failed run simply
+  leaves one that nothing ever points at. A partially built golden is never
+  adopted, because adoption only happens by an explicit pointer flip after
+  validation.
+- Each golden carries a **manifest** — ISO SHA-256, recipe commit, answer
+  file digests, build timestamp, vm-harness version. Not for reproducibility,
+  which the recipe provides, but so that a golden of unknown provenance is
+  identifiable as one. The artifact that was lost had no way to say what it
+  was built from.
+
+The ISO itself remains the one operator-supplied input, pinned by hash.
+
 ## Open Questions
 
-> **Decision needed:** Where does the golden's provenance live? Options:
-> - A. A plain text manifest in the golden dir recording ISO SHA-256,
->   recipe commit, and build timestamp. Cheap, no infrastructure.
-> - B. Publish the golden as an OCI artifact so hosts pull it like the tart
->   images, making the m3 rebuild a download rather than a 60-minute build.
-> - C. Both — A now, B when a second ARM host needs one.
->
-> B is what makes this durable against a second loss; A is what makes the
-> loss *detectable*. Recommend C.
-
 > **Decision needed:** Should the golden build gate on free disk space, and
-> at what threshold? m3 currently carries 121 GB of stale ephemeral VM
-> directories, which is the kind of thing that makes a build fail at 90%
-> completion.
+> at what threshold? The ISO plus the qcow2 need room on a host that sits at
+> 88%, and a build that fails at 90% completion costs the better part of an
+> hour. A precondition check is cheap; the threshold is the question.
 
 ## Assumptions
 
