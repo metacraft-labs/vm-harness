@@ -331,20 +331,22 @@ proc qemuFirmwareArgs(vmDir: string): seq[string] =
     return @["-bios", code]
   @[]
 
-proc buildQemuWindowsArmArgs*(vmDir: string, sshPort: int,
-                              cpus: int = 4, memoryMB: int = 8192): seq[string] =
-  let disk = qwaDiskImagePath(vmDir)
+proc qwaMachineArgs(vmDir, disk: string, sshPort, cpus, memoryMB,
+                    diskBootIndex: int): seq[string] =
+  ## The machine shape shared by the per-job boot and the golden install
+  ## boot. Everything here is headless already — that is what makes an
+  ## unattended install possible without UTM or a console session.
   let tpmSock = shortSocketPath("vmh-qwa-tpm", vmDir)
   let serialLog = vmDir / "serial.log"
   let monitorSock = shortSocketPath("vmh-qwa-mon", vmDir)
-  result = @[
+  @[
     "-accel", "hvf",
     "-machine", "virt,highmem=on",
     "-cpu", "host",
     "-m", $memoryMB,
     "-smp", $cpus,
     "-drive", "id=disk0,file=" & disk & ",format=qcow2,if=none,cache=writeback,discard=unmap",
-    "-device", "nvme,drive=disk0,serial=winarm0,bootindex=1",
+    "-device", "nvme,drive=disk0,serial=winarm0,bootindex=" & $diskBootIndex,
     "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:" & $sshPort & "-:22",
     "-device", "virtio-net-pci,netdev=net0,id=net0,mac=52:54:00:c9:18:27",
     "-chardev", "socket,id=chrtpm,path=" & tpmSock,
@@ -356,9 +358,41 @@ proc buildQemuWindowsArmArgs*(vmDir: string, sshPort: int,
     "-serial", "file:" & serialLog,
     "-monitor", "unix:" & monitorSock & ",server=on,wait=off",
     "-D", vmDir / "qemu.log",
-    "-rtc", "base=utc",
-    "-no-reboot"
+    "-rtc", "base=utc"
   ]
+
+proc buildQemuWindowsArmArgs*(vmDir: string, sshPort: int,
+                              cpus: int = 4, memoryMB: int = 8192): seq[string] =
+  ## Per-job boot: one guest command, then teardown. ``-no-reboot`` turns a
+  ## guest-initiated reboot into an exit, which is what the one-shot
+  ## lifecycle wants.
+  result = qwaMachineArgs(vmDir, qwaDiskImagePath(vmDir), sshPort, cpus,
+                          memoryMB, diskBootIndex = 1)
+  result.add("-no-reboot")
+  result.add(qemuFirmwareArgs(vmDir))
+
+proc buildQemuWindowsArmInstallArgs*(vmDir, windowsIso, autounattendIso: string,
+                                     sshPort: int, cpus: int = 4,
+                                     memoryMB: int = 8192): seq[string] =
+  ## Golden install boot. Three deliberate differences from the per-job boot:
+  ##
+  ## * ``-no-reboot`` is omitted. Windows setup reboots several times between
+  ##   media boot and OOBE, and exiting on the first one leaves a half
+  ##   installed disk that looks like a hung build.
+  ## * Both ISOs are attached over xHCI, since the aarch64 ``virt`` machine
+  ##   has no built-in USB or IDE controller to hang a CD-ROM off.
+  ## * The install media takes boot priority and the target disk goes last,
+  ##   so the firmware boots the ISO while the empty NVMe disk is still
+  ##   unbootable, and prefers the disk once Windows is installed on it.
+  result = qwaMachineArgs(vmDir, vmDir / QwaBaseDiskName, sshPort, cpus,
+                          memoryMB, diskBootIndex = 2)
+  result.add(@[
+    "-device", "qemu-xhci,id=usb",
+    "-drive", "id=installcd,file=" & windowsIso & ",media=cdrom,readonly=on,if=none",
+    "-device", "usb-storage,bus=usb.0,drive=installcd,bootindex=0",
+    "-drive", "id=unattendcd,file=" & autounattendIso & ",media=cdrom,readonly=on,if=none",
+    "-device", "usb-storage,bus=usb.0,drive=unattendcd,bootindex=1"
+  ])
   result.add(qemuFirmwareArgs(vmDir))
 
 proc powershellLiteral*(s: string): string =
@@ -461,6 +495,38 @@ proc createEphemeralCopy*(baselineDir, destDir: string) =
   cloneOneFile(base / QwaBaseDiskName, destDir / QwaBaseDiskName)
   copyFirmwareAndTpm(base, destDir)
 
+proc prepareGoldenBuildDir*(buildDir: string) =
+  ## Create the directory a golden build writes into.
+  ##
+  ## Refuses to reuse one that already holds a golden disk. In overlay mode a
+  ## live instance's ``overlay.qcow2`` names the golden's ``windows.qcow2`` as
+  ## its qcow2 backing store, and qcow2 does not verify that a backing file
+  ## still holds what the overlay was created against. Rebuilding over one
+  ## therefore does *not* fail — every running guest silently continues
+  ## against a different disk than the one its writes were taken from. So a
+  ## rebuild is an addition: a fresh versioned directory, adopted by moving
+  ## the pointer once it validates, never an overwrite.
+  if dirExists(buildDir) and fileExists(buildDir / QwaBaseDiskName):
+    raise newVmHarnessError($biQemuWindowsArm, lpProvisioning,
+      "refusing to build a golden into " & buildDir & ": it already holds " &
+      QwaBaseDiskName & ". Live overlays may name that file as their qcow2 " &
+      "backing store, and replacing it corrupts them with no error. Build " &
+      "into a new versioned directory and move the pointer instead.")
+  createDir(buildDir)
+
+proc createGoldenDisk*(qemuImgCmd, buildDir: string, diskGB: int) =
+  ## Allocate the empty qcow2 the Windows installer writes into.
+  if diskGB <= 0:
+    raise newVmHarnessError($biQemuWindowsArm, lpProvisioning,
+      "golden disk size must be positive, got " & $diskGB & "GB")
+  let disk = buildDir / QwaBaseDiskName
+  let createArgs = @[qemuImgCmd, "create", "-f", "qcow2", disk, $diskGB & "G"]
+  let r = runProcessCapture(createArgs, timeoutSec = 120)
+  if r.exitCode != 0:
+    raise newVmHarnessError($biQemuWindowsArm, lpProvisioning,
+      "qemu-img create (golden disk " & disk & ") failed (exit " &
+      $r.exitCode & "): " & r.stdout & r.stderr)
+
 proc createEphemeralOverlay*(baselineDir, destDir, qemuImgCmd: string) =
   ## Overlay mode (default): create a thin ``overlay.qcow2`` whose qcow2
   ## backing file is the immutable golden ``windows.qcow2``. The golden is
@@ -471,7 +537,15 @@ proc createEphemeralOverlay*(baselineDir, destDir, qemuImgCmd: string) =
   if dirExists(destDir):
     removeDir(destDir)
   createDir(destDir)
-  let backing = base / QwaBaseDiskName   # ``base`` is already absolutePath'd
+  # Resolve symlinks, not just relative segments. ``base`` comes from
+  # validateWindowsArmVmDir, which uses absolutePath and so preserves a
+  # symlink in the path. qcow2 stores the backing path as given, so an
+  # overlay created through a `golden/win-arm-runner -> win-arm-runner-<id>`
+  # pointer would record the pointer — and repointing it at the next build
+  # would corrupt exactly the live instances the versioned scheme exists to
+  # protect. Recording the resolved path makes a pointer flip affect only
+  # instances created after it.
+  let backing = expandFilename(base / QwaBaseDiskName)
   let overlay = destDir / QwaOverlayDiskName
   let createArgs = @[qemuImgCmd, "create",
     "-f", "qcow2",
