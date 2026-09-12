@@ -73,3 +73,20 @@ suite "unit_serve_protocol":
     check PathInfo.startsWith("/v1/")
     check PathExec == "/v1/exec"
     check ApiPrefix == "/v" & ProtocolVersion
+
+  test "chunkSizeHex preserves trailing zeros (multiples of 16)":
+    # Regression: a size that is a multiple of 16 (hex ending in 0) must keep
+    # its trailing zero. A bug that stripped trailing zeros too turned 0x40 into
+    # "4", understating the chunk body and desyncing the NDJSON /v1/exec stream
+    # ("malformed chunked encoding" on the reader). Every value here round-trips
+    # back to the byte length via parseHexInt.
+    check chunkSizeHex(64) == "40" # 0x40 — the exact byte length that broke it
+    check chunkSizeHex(16) == "10"
+    check chunkSizeHex(112) == "70"
+    check chunkSizeHex(256) == "100"
+    check chunkSizeHex(75) == "4b" # a non-multiple that always worked
+    check chunkSizeHex(1) == "1"
+    check chunkSizeHex(0) == "0"
+    # Property: the emitted token parses back to the original length.
+    for n in [1, 15, 16, 17, 32, 48, 64, 100, 112, 255, 256, 4096, 65536]:
+      check parseHexInt(chunkSizeHex(n)) == n

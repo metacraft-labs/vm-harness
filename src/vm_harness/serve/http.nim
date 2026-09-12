@@ -126,16 +126,26 @@ proc beginChunked*(client: Socket, status = 200,
   msg.add("\r\n")
   client.send(msg)
 
+proc chunkSizeHex*(n: int): string =
+  ## The HTTP/1.1 chunk-size token for a body of ``n`` bytes: minimal
+  ## lower-case hex with no leading zeros.
+  ##
+  ## `toHex` left-pads to a fixed width, so the leading zeros must be stripped —
+  ## but `strip` defaults ``trailing = true``, and stripping the trailing zeros
+  ## too corrupts every size that is a multiple of 16 (e.g. 0x40 -> "4", 0x70 ->
+  ## "7"). The header then understates the body length, the reader desyncs, and
+  ## the client reports "malformed chunked encoding" / a truncated NDJSON event.
+  ## Strip ONLY the leading padding.
+  if n <= 0:
+    return "0"
+  n.toHex.strip(leading = true, trailing = false, chars = {'0'}).toLowerAscii
+
 proc writeChunk*(client: Socket, data: string) =
   ## Write one chunk. Empty ``data`` is ignored (a zero-length chunk would
   ## be misread as the terminator).
   if data.len == 0:
     return
-  # Minimal lower-case hex size, no leading zeros.
-  var sizeHex = data.len.toHex.strip(leading = true, chars = {'0'}).toLowerAscii
-  if sizeHex.len == 0:
-    sizeHex = "0"
-  client.send(sizeHex & "\r\n")
+  client.send(chunkSizeHex(data.len) & "\r\n")
   client.send(data)
   client.send("\r\n")
 
