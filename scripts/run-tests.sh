@@ -46,6 +46,11 @@ run_nim r --hints:off tests/e2e/t_vm_harness_auto_backend_selection.nim
 # RA1 remoting: a remote client drives provision->run->destroy against a
 # `vm-harness serve` daemon over the authenticated endpoint (noop backend).
 run_nim r --hints:off tests/e2e/t_vmharness_serve_roundtrip.nim
+# Concurrency gate: a slow /v1/exec must NOT serialize other connections
+# (the central-GARM driver fires many simultaneous calls). Fails against the
+# old serial accept loop, passes against the thread-pool loop. Hermetic (the
+# worker is a trivial self-exec sleep/quick role — no backend).
+run_nim r --hints:off tests/e2e/t_vmharness_serve_concurrency.nim
 # RA6 enrollment gate: a remote client reads the daemon's SIGNED identity +
 # capability manifest over /v1/manifest and verifies it against a trust store;
 # unenrolled/expired/revoked/tampered identities are rejected. Hermetic (noop).

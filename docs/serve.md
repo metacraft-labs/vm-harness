@@ -89,10 +89,15 @@ vm-harness serve --listen 100.72.0.5:8873 --auth-token-file /run/creds/vmh
 # readiness / health: the bound port is written to --port-file when listening.
 ```
 
-The daemon handles one connection at a time: it drives long-running,
-host-mutating VM ops, and serial handling avoids interleaved host mutations
-(coordinated *placement* across hosts is the central GARM's job, not this
-daemon's).
+The daemon handles connections CONCURRENTLY via a small pool of accept-loop
+threads (`--serve-threads <n>`, default `max(4, CPU count)` capped at 32), each
+looping accept → handle → close on the shared listening socket. This is
+required by the control driver (a central GARM), which fires many simultaneous
+create/delete/retry calls: a single long-running `/v1/exec` must not stall
+unrelated connections past the client's response-header timeout. Each request
+already runs in its own isolated child process and touches no shared mutable
+state, so coordinating *placement* across hosts remains the central GARM's job,
+not this daemon's. A `/v1/shutdown` clears an atomic flag that drains the pool.
 
 ## Driving a remote host
 

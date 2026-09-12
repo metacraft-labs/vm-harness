@@ -22,7 +22,8 @@
 ## token is carried inside WireGuard; an optional ``-d:ssl`` TLS wrap is a
 ## documented follow-up hook.
 
-import std/[json, net, osproc, os, streams, strutils, tables, times]
+import std/[json, net, osproc, os, streams, strutils, tables, times,
+            locks, atomics]
 import ./protocol, ./http, ./capability, ./enrollment
 import ../types, ../auto
 
@@ -62,16 +63,43 @@ type
     stateDir*: string             ## where a self-bootstrapped secret persists
     identityTtlSec*: int          ## signed-identity lifetime; 0 ⇒ TTL default
     hostId*: string               ## identity ``host`` label; "" ⇒ hostname
+    serveThreads*: int            ## accept-loop worker threads; 0 ⇒ auto
+                                  ## (``max(4, countProcessors())`` capped at
+                                  ## ``MaxServeThreads``). See ``runServe``.
 
   ServeContext = ref object
+    ## Shared across every accept-loop thread by reference. ``cfg``,
+    ## ``enrollSecret`` and ``keyId`` are written ONCE at startup and read-only
+    ## thereafter, so they are safe to share unsynchronized. ``running`` and
+    ## ``activeThreads`` are the only mutable-after-startup fields and are
+    ## therefore ``Atomic`` (see ``runServe`` for the shutdown protocol).
     cfg: ServeConfig
-    running: bool
-    enrollSecret: string          ## resolved once at startup (may be "")
+    running: Atomic[bool]         ## cleared by /v1/shutdown; polled by workers
+    activeThreads: Atomic[int]    ## workers still inside their accept loop
+    enrollSecret: string          ## resolved once at startup (may = "")
     keyId: string                 ## derived from the secret; "" if none
 
-proc daemonLog(ctx: ServeContext, msg: string) =
-  if not ctx.cfg.quiet:
-    stderr.writeLine("[vm-harness serve] " & msg)
+const MaxServeThreads = 32
+  ## Ceiling on the auto-sized accept-loop pool. Each worker only parks in
+  ## ``accept`` or forwards to an isolated child process, so the pool exists to
+  ## overlap request *latency* (a long-running exec must not stall unrelated
+  ## connections), not to saturate CPU — a modest ceiling is plenty.
+
+var serveLogLock: Lock
+  ## Serializes ``daemonLog`` stderr writes so whole access-log lines from
+  ## concurrent accept-loop threads do not interleave. Initialized in
+  ## ``runServe`` before any worker is spawned.
+
+proc daemonLog(ctx: ServeContext, msg: string) {.gcsafe.} =
+  ## Emit one access-log line to stderr. Callable from every accept-loop
+  ## thread. ``{.gcsafe.}`` is asserted because the body touches only the
+  ## passed-in ``ctx``, the process-global (thread-safe) ``stderr`` handle, and
+  ## a plain, non-GC ``Lock`` — no GC-managed globals.
+  if ctx.cfg.quiet:
+    return
+  {.cast(gcsafe).}:
+    withLock serveLogLock:
+      stderr.writeLine("[vm-harness serve] " & msg)
 
 proc hostnameOrUnknown(): string =
   ## Best-effort host name for the identity ``host`` label. Nim's stdlib has no
@@ -232,22 +260,117 @@ proc handleConnection(ctx: ServeContext, client: Socket) =
       client.sendResponse(405, $(%*{"error": "use POST"}))
     else:
       client.sendResponse(200, $(%*{"ok": true}))
-      ctx.running = false
+      ctx.running.store(false)
       daemonLog(ctx, "shutdown requested")
   else:
     client.sendResponse(404, $(%*{"error": "unknown path", "path": req.path}))
 
+type
+  Acceptor = object
+    ## Immutable bundle handed (by ``ptr``) to every accept-loop thread. A
+    ## SINGLE instance is shared by all workers: ``ctx`` is a ref whose mutable
+    ## fields are atomic, and ``server`` is the ONE listening socket every
+    ## worker calls ``accept`` on concurrently (see ``acceptLoop``).
+    ctx: ServeContext
+    server: Socket
+
+proc resolveThreadCount(cfg: ServeConfig): int =
+  ## The accept-loop pool size. An explicit ``--serve-threads`` wins (clamped
+  ## to ``MaxServeThreads``); otherwise auto-size to ``max(4, countProcessors())``
+  ## capped at ``MaxServeThreads``. Four is a floor so even a single-core host
+  ## can overlap a slow exec with unrelated short requests.
+  if cfg.serveThreads > 0:
+    return min(cfg.serveThreads, MaxServeThreads)
+  result = max(4, countProcessors())
+  if result > MaxServeThreads:
+    result = MaxServeThreads
+
+proc acceptLoop(arg: ptr Acceptor) {.thread.} =
+  ## One worker's accept loop, run by every thread in the pool against the
+  ## SAME listening socket. Concurrency safety:
+  ##
+  ## * ``accept(2)`` on one listening fd is safe to call from multiple threads
+  ##   — the kernel hands each a distinct connected socket. Nim's ``Socket``
+  ##   read/write buffering only ever touches the per-connection ``client``
+  ##   socket (owned by this thread), never the shared listening socket, so
+  ##   sharing the ``server`` object is sound.
+  ## * ``handleConnection``/``handleExec`` use only local variables, the
+  ##   thread-owned ``client`` socket, an isolated child PROCESS, and read-only
+  ##   ``ctx`` fields — no shared mutable state between connections.
+  ## * ``ctx.running`` (atomic) is polled so a ``/v1/shutdown`` on any thread
+  ##   drains all of them.
+  ##
+  ## The ``{.cast(gcsafe).}`` covers the read-only-after-startup backend
+  ## registry (``/v1/info`` / ``/v1/manifest``) whose closure table Nim
+  ## conservatively flags; the reasoning above is the justification.
+  let ctx = arg.ctx
+  let server = arg.server
+  {.cast(gcsafe).}:
+    while ctx.running.load():
+      var client: Socket
+      var accepted = false
+      try:
+        server.accept(client)
+        accepted = true
+      except CatchableError:
+        discard
+      if not accepted:
+        continue
+      # A shutdown may have landed while we were parked in accept (including a
+      # self-connect wakeup, below). Drop the connection without dispatch.
+      if not ctx.running.load():
+        try: client.close() except CatchableError: discard
+        break
+      try:
+        handleConnection(ctx, client)
+      except CatchableError as e:
+        daemonLog(ctx, "connection error: " & e.msg)
+      finally:
+        try: client.close() except CatchableError: discard
+    discard ctx.activeThreads.fetchSub(1)
+
+proc selfConnectHost(listenHost: string): string =
+  ## The address to connect to in order to wake a parked ``accept`` on THIS
+  ## daemon's listening socket. Wildcard binds are reached via loopback.
+  case listenHost
+  of "", "0.0.0.0": "127.0.0.1"
+  of "::", "[::]": "::1"
+  else: listenHost
+
+proc wakeOnce(host: string, port: int) =
+  ## Open and immediately close one connection to unblock a worker parked in
+  ## ``accept``. Best-effort: any failure is ignored (the worker may already
+  ## have left its loop).
+  try:
+    let s = dial(host, Port(port))
+    s.close()
+  except CatchableError:
+    discard
+
 proc runServe*(cfg: ServeConfig) =
-  ## Bind, listen, and serve connections until a ``/v1/shutdown`` is
-  ## received. One connection is handled at a time (a control daemon drives
-  ## long-running, host-mutating VM ops; serial handling avoids interleaved
-  ## host mutations — coordinated placement is the central GARM's job, not
-  ## this daemon's).
+  ## Bind, listen, and serve connections until a ``/v1/shutdown`` is received.
+  ##
+  ## Connections are handled CONCURRENTLY by a small pool of accept-loop
+  ## threads (``resolveThreadCount``), each looping ``accept`` → ``handle`` →
+  ## ``close`` on the shared listening socket. This is required by the control
+  ## driver (a central GARM) which fires many concurrent create/delete/retry
+  ## calls: a single long-running ``/v1/exec`` must not stall unrelated
+  ## connections past the client's response-header timeout. Per-host mutation
+  ## ordering is the driver's concern, not this daemon's — each request already
+  ## runs in an isolated child process.
+  ##
+  ## Shutdown protocol: the ``/v1/shutdown`` handler clears the atomic
+  ## ``running`` flag. The main thread polls it, then wakes any workers still
+  ## parked in ``accept`` by self-connecting once per still-active worker until
+  ## the pool drains, and finally joins. Shutdown is prompt but not
+  ## instantaneous — a worker mid-exec finishes that exec first.
   if cfg.token.len == 0:
     raise newException(ValueError,
       "vm-harness serve: a non-empty auth token is required " &
       "(--auth-token / --auth-token-file / $VMH_SERVE_TOKEN)")
-  let ctx = ServeContext(cfg: cfg, running: true)
+  let ctx = ServeContext(cfg: cfg)
+  ctx.running.store(true)
+  initLock(serveLogLock)
   # Resolve the enrollment secret ONCE at startup so the daemon's identity is
   # stable for its lifetime. Missing material is non-fatal: /v1/exec + /v1/info
   # still work (RA1 back-compat); only /v1/manifest requires it (503 otherwise).
@@ -282,17 +405,31 @@ proc runServe*(cfg: ServeConfig) =
       let sslCtx = newContext(certFile = cfg.tlsCertFile,
                               keyFile = cfg.tlsKeyFile)
       wrapSocket(sslCtx, server)
-  while ctx.running:
-    var client: Socket
-    try:
-      server.accept(client)
-    except CatchableError:
-      continue
-    try:
-      handleConnection(ctx, client)
-    except CatchableError as e:
-      daemonLog(ctx, "connection error: " & e.msg)
-    finally:
-      try: client.close() except CatchableError: discard
+
+  # Spawn the accept-loop pool. All workers share the one ``Acceptor`` (and
+  # thus the one listening socket + ctx); ``acc`` outlives them because we join
+  # before returning.
+  let threadCount = resolveThreadCount(cfg)
+  daemonLog(ctx, "accept-loop pool: " & $threadCount & " threads")
+  ctx.activeThreads.store(threadCount)
+  var acc = Acceptor(ctx: ctx, server: server)
+  var threads = newSeq[Thread[ptr Acceptor]](threadCount)
+  for i in 0 ..< threadCount:
+    createThread(threads[i], acceptLoop, addr acc)
+
+  # Wait for a /v1/shutdown (which clears ``running`` on some worker thread).
+  while ctx.running.load():
+    sleep(100)
+
+  # Unblock workers still parked in ``accept``: self-connect once per active
+  # worker, repeatedly, until the pool drains. A worker mid-exec finishes it
+  # first, then observes ``running == false`` and leaves without accepting.
+  let wakeHost = selfConnectHost(host)
+  while ctx.activeThreads.load() > 0:
+    wakeOnce(wakeHost, boundPort.int)
+    sleep(20)
+
+  for t in threads.mitems:
+    joinThread(t)
   server.close()
   daemonLog(ctx, "stopped")

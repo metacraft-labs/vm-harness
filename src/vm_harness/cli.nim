@@ -223,6 +223,9 @@ type
                                  ## identity lifetime (default 3600).
     hostId*: string              ## ``serve --host-id <name>`` — identity host
                                  ## label; default the OS hostname.
+    serveThreads*: int           ## ``serve --serve-threads <n>`` — accept-loop
+                                 ## worker threads; 0 ⇒ auto-size (see
+                                 ## serve/server.nim ``resolveThreadCount``).
 
 const HelpText = """
 vm-harness <subcommand> [flags]
@@ -429,14 +432,17 @@ Common flags:
 serve daemon (RA1 remoting — the authenticated network access point):
   vm-harness serve --listen <host:port> [--auth-token-file <f> | --auth-token <t>]
                    [--worker-exe <path>] [--port-file <f>] [--quiet]
+                   [--serve-threads <n>]
                    [--enroll-secret-file <f>] [--identity-ttl-sec <n>]
                    [--host-id <name>]
     Expose the vm-harness CLI backend ops over a versioned HTTP/JSON RPC
     (protocol v1) so a remote controller can drive this host's VMs/containers.
     Every op runs the SAME local vm-harness binary (a thin network front-end,
     not a reimplementation). Bind to a NetBird overlay IP only — NEVER a public
-    interface. The bearer token also reads from $VMH_SERVE_TOKEN. See
-    docs/serve.md.
+    interface. The bearer token also reads from $VMH_SERVE_TOKEN. Connections
+    are served CONCURRENTLY by a pool of accept-loop threads (--serve-threads,
+    default: max(4, CPU count) capped at 32) so one slow op cannot stall others.
+    See docs/serve.md.
 
   RA6 enrollment / signed capability manifest (GET /v1/manifest):
   --enroll-secret-file <path>     Per-host enrollment secret (prefer over
@@ -784,6 +790,10 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
         raise newException(ValueError, "--identity-ttl-sec must be >= 0")
     of "--host-id":
       inc i; result.hostId = args[i]; inc i
+    of "--serve-threads":
+      inc i; result.serveThreads = parseInt(args[i]); inc i
+      if result.serveThreads < 0:
+        raise newException(ValueError, "--serve-threads must be >= 0")
     of "-h", "--help":
       result.subcommand = "help"
       inc i
@@ -2150,7 +2160,8 @@ proc cmdServe(opts: CliOpts): int =
     enrollSecretFile: opts.enrollSecretFile,
     stateDir: opts.stateDir,
     identityTtlSec: opts.identityTtlSec,
-    hostId: opts.hostId)
+    hostId: opts.hostId,
+    serveThreads: opts.serveThreads)
   try:
     runServe(cfg)
   except CatchableError as e:
