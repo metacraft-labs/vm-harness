@@ -5,7 +5,7 @@
 ## layer that both the daemon and the client depend on. Runs in the
 ## universal test layer (design doc §9.3).
 
-import std/[json, strutils, unittest]
+import std/[json, os, strutils, unittest]
 import vm_harness
 
 suite "unit_serve_protocol":
@@ -25,12 +25,20 @@ suite "unit_serve_protocol":
   test "ExecRequest round-trips through JSON":
     let req = ExecRequest(v: ProtocolVersion,
                           argv: @["run", "--backend", "noop", "--", "echo"],
-                          stdin: "hi", timeoutSec: 42)
+                          stdin: "hi", timeoutSec: 42,
+                          userData: "#cloud-config\nruncmd: [echo hi]\n")
     let decoded = parseExecRequest($toJson(req))
     check decoded.v == ProtocolVersion
     check decoded.argv == req.argv
     check decoded.stdin == "hi"
     check decoded.timeoutSec == 42
+    check decoded.userData == req.userData
+
+  test "userData defaults to empty when absent (backward compatible)":
+    # A client that predates the field omits it; the server must not fail.
+    let decoded = parseExecRequest($(%*{"v": ProtocolVersion,
+                                        "argv": @["provision"]}))
+    check decoded.userData == ""
 
   test "parseExecRequest rejects a version mismatch":
     let body = $(%*{"v": "999", "argv": @["probe"]})
@@ -90,3 +98,36 @@ suite "unit_serve_protocol":
     # Property: the emitted token parses back to the original length.
     for n in [1, 15, 16, 17, 32, 48, 64, 100, 112, 255, 256, 4096, 65536]:
       check parseHexInt(chunkSizeHex(n)) == n
+
+  test "applyUserData materializes a 0600 seed file and appends --user-data":
+    let dir = getTempDir() / "vmh-serve-userdata-test"
+    let secret = "#!/bin/bash\n./config.sh --jitconfig TOKEN\n"
+    let baseArgv = @["run", "--ephemeral", "--backend", "incus",
+                     "--baseline", "job-1"]
+    let (argv, path) = applyUserData(baseArgv, secret, dir)
+    check path.len > 0
+    defer:
+      removeFile(path)
+      try: removeDir(dir) except CatchableError: discard
+    # The seed file exists and carries the EXACT bytes (nothing truncated).
+    check fileExists(path)
+    check readFile(path) == secret
+    # --user-data <path> was appended, preserving the original argv order.
+    check argv[0 ..< baseArgv.len] == baseArgv
+    check argv[^2] == "--user-data"
+    check argv[^1] == path
+    when defined(posix):
+      # Owner-only: the file carries a runner registration token.
+      check getFilePermissions(path) == {fpUserRead, fpUserWrite}
+
+  test "applyUserData is a no-op on empty user-data":
+    let baseArgv = @["provision", "--backend", "noop"]
+    let (argv, path) = applyUserData(baseArgv, "", getTempDir())
+    check argv == baseArgv
+    check path == ""
+
+  test "applyUserData does not double-append when argv already has --user-data":
+    let baseArgv = @["run", "--ephemeral", "--user-data", "/pinned/path"]
+    let (argv, path) = applyUserData(baseArgv, "some bytes", getTempDir())
+    check argv == baseArgv     # untouched — caller pinned its own file
+    check path == ""           # nothing materialized ⇒ nothing to clean up

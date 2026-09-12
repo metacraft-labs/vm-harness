@@ -23,7 +23,7 @@
 ## documented follow-up hook.
 
 import std/[json, net, osproc, os, streams, strutils, tables, times,
-            locks, atomics]
+            locks, atomics, tempfiles]
 import ./protocol, ./http, ./capability, ./enrollment
 import ../types, ../auto
 
@@ -178,6 +178,48 @@ proc authorized(ctx: ServeContext, req: HttpRequest): bool =
   # Authorization header is rejected in (near) constant time too.
   constantTimeEq(ctx.cfg.token, presented)
 
+proc userDataTempDir(): string =
+  ## Daemon-owned directory holding per-request user-data seed files. Created
+  ## lazily; individual files are unique (``createTempFile``) and removed as
+  ## soon as their worker exits, so this only ever holds in-flight seeds.
+  getTempDir() / "vm-harness-serve" / "userdata"
+
+proc applyUserData*(argv: seq[string], userData: string,
+                    dir: string): tuple[argv: seq[string], path: string] =
+  ## Bridge the wire ``userData`` bytes to the local ``--user-data <path>`` CLI
+  ## contract without a new backend-specific code path:
+  ##
+  ##   * When ``userData`` is empty, or ``argv`` ALREADY carries a
+  ##     ``--user-data`` flag (the caller pinned its own file), the argv is
+  ##     returned unchanged and ``path`` is "" (nothing to clean up).
+  ##   * Otherwise the bytes are written to a fresh ``0600`` file under ``dir``
+  ##     and ``--user-data <path>`` is appended. The returned ``path`` MUST be
+  ##     deleted by the caller once the worker has exited.
+  ##
+  ## The contents are treated as a secret (they may carry a runner registration
+  ## token): the file is owner-only and the bytes are never logged. Only the
+  ## resulting PATH ever appears in the argv (and therefore in the access log).
+  if userData.len == 0 or "--user-data" in argv:
+    return (argv, "")
+  createDir(dir)
+  let (f, path) = createTempFile("seed-", ".userdata", dir)
+  try:
+    try:
+      f.write(userData)
+    finally:
+      f.close()
+  except CatchableError:
+    # A write/close failure must not leave a partial, token-bearing seed file
+    # behind: the path is never returned to the caller, so it could not be
+    # cleaned up otherwise. Delete it before re-raising.
+    try: removeFile(path) except CatchableError: discard
+    raise
+  when defined(posix):
+    # createTempFile already uses an owner-only mode on POSIX; assert it
+    # explicitly so the contract holds regardless of the umask/stdlib version.
+    setFilePermissions(path, {fpUserRead, fpUserWrite})
+  (argv & @["--user-data", path], path)
+
 proc handleExec(ctx: ServeContext, client: Socket, req: HttpRequest) =
   ## Parse the forwarded argv, spawn the worker (the same vm-harness
   ## binary), and stream its merged stdout/stderr as NDJSON ``log`` events
@@ -191,7 +233,24 @@ proc handleExec(ctx: ServeContext, client: Socket, req: HttpRequest) =
 
   let exe = if ctx.cfg.workerExe.len > 0: ctx.cfg.workerExe
             else: getAppFilename()
-  let args = ctx.cfg.workerArgPrefix & parsed.argv
+  # Materialize optional cloud-init user-data (e.g. GARM's rendered runner
+  # bootstrap) to a per-request 0600 temp file and append ``--user-data
+  # <path>`` so the worker reuses the local ``run --ephemeral --user-data``
+  # path unchanged. ``userDataPath`` is "" when nothing was materialized.
+  var args = ctx.cfg.workerArgPrefix & parsed.argv
+  var userDataPath = ""
+  try:
+    let applied = applyUserData(args, parsed.userData, userDataTempDir())
+    args = applied.argv
+    userDataPath = applied.path
+  except CatchableError as e:
+    client.beginChunked()
+    client.writeChunk(errorEvent("failed to stage user-data: " & e.msg) & "\n")
+    client.writeChunk(exitEvent(127) & "\n")
+    client.endChunked()
+    return
+  # NB: ``args`` may now end in ``--user-data <path>`` — the PATH is safe to
+  # log; the user-data CONTENTS are never logged.
   daemonLog(ctx, "exec " & exe & " " & args.join(" "))
 
   client.beginChunked()
@@ -200,6 +259,8 @@ proc handleExec(ctx: ServeContext, client: Socket, req: HttpRequest) =
     p = startProcess(exe, workingDir = ctx.cfg.workDir, args = args,
                      options = {poStdErrToStdOut})
   except CatchableError as e:
+    if userDataPath.len > 0:
+      try: removeFile(userDataPath) except CatchableError: discard
     client.writeChunk(errorEvent("failed to start worker: " & e.msg) & "\n")
     client.writeChunk(exitEvent(127) & "\n")
     client.endChunked()
@@ -221,6 +282,11 @@ proc handleExec(ctx: ServeContext, client: Socket, req: HttpRequest) =
     client.writeChunk(exitEvent(1) & "\n")
   finally:
     try: p.close() except CatchableError: discard
+    # Delete the user-data seed as soon as the worker exits: the backend has
+    # already read it (incus copies it into ``cloud-init.user-data``), so the
+    # token-bearing file must not linger on disk.
+    if userDataPath.len > 0:
+      try: removeFile(userDataPath) except CatchableError: discard
     client.endChunked()
 
 proc handleConnection(ctx: ServeContext, client: Socket) =

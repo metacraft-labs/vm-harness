@@ -83,6 +83,16 @@ type
     argv*: seq[string]
     stdin*: string             ## optional stdin fed to the worker
     timeoutSec*: int           ## 0 ⇒ no daemon-side timeout
+    userData*: string          ## optional cloud-init user-data BYTES (raw,
+                               ## not a path). When non-empty the daemon
+                               ## materializes it to a per-request 0600 temp
+                               ## file and appends ``--user-data <path>`` to
+                               ## the worker argv (see ``server.applyUserData``)
+                               ## so the local ``run --ephemeral --user-data``
+                               ## path is reused byte-for-byte. This is how the
+                               ## rendered runner bootstrap reaches a remote
+                               ## guest; it may carry a registration token and
+                               ## is therefore NEVER logged.
 
 proc constantTimeEq*(a, b: string): bool =
   ## Length-independent, data-independent comparison used for the bearer
@@ -117,7 +127,8 @@ proc toJson*(req: ExecRequest): JsonNode =
     "v": req.v,
     "argv": req.argv,
     "stdin": req.stdin,
-    "timeoutSec": req.timeoutSec}
+    "timeoutSec": req.timeoutSec,
+    "userData": req.userData}
 
 proc parseExecRequest*(body: string): ExecRequest =
   ## Parse + validate an ``/v1/exec`` body. Raises ``ValueError`` on a
@@ -139,6 +150,8 @@ proc parseExecRequest*(body: string): ExecRequest =
     result.argv.add(a.getStr())
   result.stdin = node{"stdin"}.getStr("")
   result.timeoutSec = node{"timeoutSec"}.getInt(0)
+  # Optional: absent on a client that predates the field, so default to "".
+  result.userData = node{"userData"}.getStr("")
 
 proc logEvent*(line: string): string =
   ## Serialize a single ``log`` NDJSON event (without the trailing newline
