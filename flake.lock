@@ -3924,14 +3924,14 @@
         "lastModified": 1787323823,
         "narHash": "sha256-ROxqx36o96BzdWGlDaZfugY0CQnytCMGwesn3bz96Ig=",
         "owner": "metacraft-labs",
-        "repo": "nixos-modules",
+        "repo": "devops-modules",
         "rev": "e14e82858d55fc82c5b10c4bf423cd7cecb11290",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "ref": "dev",
-        "repo": "nixos-modules",
+        "repo": "devops-modules",
         "type": "github"
       }
     },
@@ -3984,13 +3984,13 @@
         "lastModified": 1776845907,
         "narHash": "sha256-UmVjz1nAWtMqLdTR+guaNyP1qKFgMMOOYhIfzYefFb4=",
         "owner": "metacraft-labs",
-        "repo": "nixos-modules",
+        "repo": "devops-modules",
         "rev": "b4c1815dc46dbf8d91882a70404f8c621805add9",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
-        "repo": "nixos-modules",
+        "repo": "devops-modules",
         "type": "github"
       }
     },
