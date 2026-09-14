@@ -81,6 +81,9 @@ const posixTestSpecs: seq[VmHarnessTestSpec] = @[
     binary: "t_qemu_windows_arm_backend"),
   VmHarnessTestSpec(source: "tests/unit/t_tart_backend.nim",
     binary: "t_tart_backend"),
+  # Runner-Fleet-M3-ARM-Wave MA0 gate: t_vmharness_image_is_honoured (c).
+  VmHarnessTestSpec(source: "tests/unit/t_vmharness_image_is_honoured.nim",
+    binary: "t_vmharness_image_is_honoured"),
 ]
 
 package vm_harness:

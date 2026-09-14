@@ -29,6 +29,11 @@ run_nim r --hints:off tests/unit/t_qemu_boot_backend.nim
 run_nim r --hints:off tests/unit/t_tpm_device_args.nim
 run_nim r --hints:off tests/unit/t_windows_golden_recipe_hardening.nim
 run_nim r --hints:off tests/unit/t_tart_backend.nim
+# Runner-Fleet-M3-ARM-Wave MA0 gate: t_vmharness_image_is_honoured, assertion
+# (c) — a registry-constructed tart backend with no image configured RAISES
+# rather than substituting a default. Assertions (a) and (b) are provider-side
+# and are run by the nix check of the same name in metacraft-labs/nixos-modules.
+run_nim r --hints:off tests/unit/t_vmharness_image_is_honoured.nim
 run_nim r --hints:off tests/unit/t_lima_backend.nim
 run_nim r --hints:off tests/unit/t_prune.nim
 run_nim r --hints:off tests/unit/t_layer_gc.nim
