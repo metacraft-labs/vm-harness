@@ -8,6 +8,9 @@ $netKvmDir = 'C:\Windows\Temp\virtio\NetKVM\w11\ARM64'
 $installDir = 'C:\Program Files\OpenSSH'
 $expandedDir = 'C:\Program Files\OpenSSH-ARM64'
 $script:provisionFailed = $false
+# Our own inbound allow rule for sshd, owned by this recipe rather than by
+# whatever Add-WindowsCapability happens to install. See ConfigureOpenSsh.
+$script:SshdFirewallRuleName = 'vmh-sshd-in-tcp22'
 
 Remove-Item -LiteralPath $fail, $done -Force -ErrorAction SilentlyContinue
 
@@ -170,16 +173,67 @@ function ConfigureOpenSsh {
     -Force `
     -ErrorAction Stop | Out-Null
 
-  if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule `
-      -Name 'OpenSSH-Server-In-TCP' `
-      -DisplayName 'OpenSSH Server (sshd)' `
-      -Enabled True `
-      -Direction Inbound `
-      -Protocol TCP `
-      -Action Allow `
-      -LocalPort 22 `
-      -ErrorAction Stop | Out-Null
+  # The inbound allow rule for TCP 22, on EVERY firewall profile.
+  #
+  # MEASURED on m3 2026-09-15, and it is what stalled the first headless
+  # golden build for an entire deadline with a perfectly provisioned guest:
+  # `Add-WindowsCapability OpenSSH.Server` installs its own rule named
+  # OpenSSH-Server-In-TCP scoped to the **Private** profile only. QEMU's
+  # user-mode network is unidentified, so Windows classifies it **Public**,
+  # whose policy is BlockInbound. The result reads like nothing is wrong
+  # anywhere: sshd Running, `netstat` showing 0.0.0.0:22 LISTENING, the NIC
+  # up on 10.0.2.15 — and not one banner byte reaching the host through the
+  # forwarded port, because the SYN is dropped inside the guest.
+  #
+  # The old code only created a rule when NONE existed, so the capability's
+  # Private-only rule made this a no-op on exactly the path that needs it.
+  # Widen what is there, and only create when there is nothing to widen.
+  # Widen the capability's own rule when it is there, by whatever name it
+  # carries. Logged either way, because its profile scoping is the fact that
+  # cost a whole build deadline.
+  foreach ($existing in @(Get-NetFirewallRule -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -eq 'OpenSSH-Server-In-TCP' -or
+                     $_.DisplayName -like '*OpenSSH*Server*' })) {
+    Log ('existing sshd firewall rule name=' + $existing.Name +
+         ' display=' + $existing.DisplayName +
+         ' profiles=' + $existing.Profile + ' enabled=' + $existing.Enabled)
+    try {
+      Set-NetFirewallRule -Name $existing.Name -Enabled True -Profile Any `
+        -ErrorAction Stop
+    } catch {
+      LogError ('widen firewall rule ' + $existing.Name) $_
+    }
+  }
+
+  # And own a rule outright, so reachability does not depend on a rule
+  # Microsoft ships and may rename, rescope or stop shipping.
+  Get-NetFirewallRule -Name $script:SshdFirewallRuleName -ErrorAction SilentlyContinue |
+    Remove-NetFirewallRule -ErrorAction SilentlyContinue
+  New-NetFirewallRule `
+    -Name $script:SshdFirewallRuleName `
+    -DisplayName 'vm-harness OpenSSH Server (sshd) any-profile' `
+    -Enabled True `
+    -Direction Inbound `
+    -Protocol TCP `
+    -Action Allow `
+    -LocalPort 22 `
+    -Profile Any `
+    -ErrorAction Stop | Out-Null
+
+  # Assert it, rather than assume it took. A golden whose sshd is firewalled
+  # off is indistinguishable from a golden that never finished installing,
+  # and the harness cannot read this log without the very SSH that is blocked.
+  $sshdRule = Get-NetFirewallRule -Name $script:SshdFirewallRuleName -ErrorAction Stop
+  Log ('firewall rule ' + $sshdRule.Name + ' profiles=' + $sshdRule.Profile +
+       ' enabled=' + $sshdRule.Enabled + ' action=' + $sshdRule.Action +
+       ' direction=' + $sshdRule.Direction)
+  if (("$($sshdRule.Profile)" -ne 'Any') -or
+      ("$($sshdRule.Enabled)" -ne 'True') -or
+      ("$($sshdRule.Action)" -ne 'Allow') -or
+      ("$($sshdRule.Direction)" -ne 'Inbound')) {
+    Fail ('inbound firewall rule for sshd is not an Any-profile allow: profiles=' +
+          $sshdRule.Profile + ' enabled=' + $sshdRule.Enabled +
+          ' action=' + $sshdRule.Action + ' direction=' + $sshdRule.Direction)
   }
 
   $svc = Get-Service -Name sshd -ErrorAction Stop

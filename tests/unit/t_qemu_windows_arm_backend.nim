@@ -634,10 +634,19 @@ suite "QemuWindowsArmBackend pure behavior":
       writeExecutable(badSwtpm, "#!/bin/sh\necho 'swtpm unavailable' >&2\nexit 42\n")
       writeExecutable(sshpass, "#!/bin/sh\necho 'sshpass 1.10'\n")
 
+      # The PRODUCTION timeout, not a shortened one. This test's subject is
+      # "all three present => available"; the bound is incidental to it, and
+      # boundedness is pinned by its own test above ("probeAvailability is
+      # bounded when qemu command is silent"), which needs a short one and
+      # asserts it. MEASURED on m3 2026-09-15: at probeTimeoutSec = 1 this
+      # test failed 3 times in 6 consecutive runs at load average 41 —
+      # spawning three /bin/sh scripts does not reliably finish inside a
+      # second on a host that also serves CI, and a gate that fails half the
+      # time on the deployment host cannot tell a regression from noise.
       let good = newQemuWindowsArmBackend(qemuCmd = qemu,
                                           swtpmCmd = swtpm,
                                           sshpassCmd = sshpass,
-                                          probeTimeoutSec = 1)
+                                          probeTimeoutSec = 10)
       check good.probeAvailability()
 
       let missingTpm = newQemuWindowsArmBackend(qemuCmd = qemu,

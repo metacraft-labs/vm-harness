@@ -153,7 +153,9 @@ vm-harness provision --backend qemu-windows-arm \
 3. Start `swtpm`, then QEMU with `qemuBaseArgs` plus both ISOs as
    `-drive if=none,media=cdrom` + `-device usb-storage`/`scsi-cd`, with
    `bootindex` ordering the install ISO ahead of the NVMe disk, and
-   without `-no-reboot`.
+   without `-no-reboot`. *(Incomplete as written — a fourth change is
+   needed: a `usb-kbd`, plus a bounded keypress injected on the monitor.
+   See "As implemented", departure six.)*
 4. Poll for install completion by SSHing to the forwarded port and testing
    for `C:\Windows\Temp\repro-install-done` — the sentinel
    `autounattend.xml` already writes from `FirstLogonCommands` after
@@ -231,7 +233,7 @@ The host tier requires `VMH_WINDOWS_ARM_GOLDEN_HOST_TEST=1`,
 `VMH_WINDOWS_ARM_ISO` and `VMH_WINDOWS_ARM_AUTOUNATTEND_ISO`, and names each
 missing one in the skip message.
 
-Five points where the implementation departs from the text above, all
+Six points where the implementation departs from the text above, all
 deliberate:
 
 - **It is the monitor socket, not QMP.** `qwaMachineArgs` publishes
@@ -243,11 +245,14 @@ deliberate:
   is also part of the contract: QEMU's default action on a guest power-off is
   to **exit**, so a vanished socket plus a gone process is the same event seen
   from outside, and `guestPoweredOff` treats it as such.
-- **Sysprep is launched detached, and carries `/mode:vm`.** `/shutdown`
-  powers the guest off underneath the SSH channel that issued it, and a
-  generalize runs 10–20 minutes, so a channel-bound invocation is one
-  host-side timeout away from a half-generalized disk that still looks like a
-  golden. `buildSysprepRemoteCommand` wraps it in `Start-Process` and lets go.
+- **Sysprep is launched so as to outlive the SSH session, and carries
+  `/mode:vm`.** `/shutdown` powers the guest off underneath the SSH session
+  that issued it, and a generalize runs 10–20 minutes, so a session-bound
+  invocation is one hangup away from a half-generalized disk that still looks
+  like a golden. `buildSysprepRemoteCommand` creates it through
+  `Win32_Process.Create` and lets go — *not* `Start-Process`, which does not
+  escape Windows OpenSSH's per-session job object; see "What the first real
+  host run found", item 3.
   `/mode:vm` matches the invocation the recipe README documents as the one
   that produced a working golden; it is sound here precisely because every
   instance boots the identical machine shape this backend builds.
@@ -264,6 +269,43 @@ deliberate:
   generalize a half-provisioned disk. `waitForInstallSentinel` waits for the
   sentinel the *last* FirstLogonCommand writes, and only once `sshd` is
   confirmed running — the one signal that means "finished".
+- **The install boot needs a keyboard, and a keypress.** Found by MA4's
+  first real host run on m3, 2026-09-15, and the reason this document's
+  "three changes" was wrong. `\EFI\BOOT\BOOTAA64.EFI` on a Windows install
+  ISO is `cdboot.efi`, which prints *"Press any key to boot from CD or
+  DVD"*, waits about five seconds and returns `EFI_TIMEOUT` if no key
+  arrives. The machine shape here has **no input device at all** —
+  `-display none`, and `-serial file:` is output-only — so the prompt could
+  never be answered. Measured symptom, with nothing else wrong anywhere:
+
+  ```
+  BdsDxe: starting Boot0001 "UEFI QEMU QEMU USB HARDDRIVE 1-…"
+  Error: Image at 0023C314000 start failed: Time out
+  BdsDxe: failed to start Boot0001 …: Time out
+  BdsDxe: loading Boot0004 "EFI Internal Shell"
+  Shell>
+  ```
+
+  Windows Setup never ran; the build then sat out its whole deadline and
+  blamed the answer file. `buildQemuWindowsArmInstallArgs` now attaches a
+  `usb-kbd` to the xHCI controller it already creates, and
+  `answerInstallMediaKeyPrompt` injects `sendkey ret` on the **monitor
+  socket** — the same socket power-off is read from.
+
+  Stopping is as load-bearing as starting. That same prompt timing out is
+  what makes Setup's *own* reboots fall past the still-first install media
+  and onto the disk it is installing to (measured: the media is still ahead
+  of the disk in `BootOrder` after Setup's first reboot). A keyer that never
+  stopped would trade "the install never starts" for "Setup restarts from
+  the ISO forever". So the window ends at the first of: the target qcow2
+  growing past `QwaInstallProgressBytes` (Setup is writing, so the prompt is
+  answered), `GoldenBuildSpec.keyPressWindowSec` (180 s by default; the
+  prompt appears 20–25 s in), and the overall build deadline.
+
+  The per-job argument vector is deliberately untouched — it is already
+  deployed on m3, it boots an installed disk with no prompt to answer, and
+  the unit gate asserts it gains neither the keyboard nor the xHCI.
+
 - **Step 6 does not copy `repro-sysprep.xml` to `C:\`.** `autounattend.xml`
   already does it from the answer-file ISO (`FirstLogonCommands`, Order 6),
   so the harness copying it again would be a second source of truth for a
@@ -290,12 +332,169 @@ The one step that cannot be declared away is the **ISO**: it stays an
 operator-supplied input, pinned by hash in the manifest, because Microsoft's
 download is manual and unversioned.
 
+## What the first real host run found (m3, 2026-09-15)
+
+Three defects, none of which any unit tier could have caught, and a fourth
+correction to this document. Recorded here because every one of them reads
+from the outside exactly like "the answer file is wrong", and each cost a
+deadline to diagnose the first time. They surfaced strictly in sequence —
+each one had to be fixed before the next became visible — which is the honest
+shape of a first host run and worth expecting on the next platform.
+
+1. **`cdboot.efi` waits for a keypress, and the machine had no keyboard.**
+   Covered in full under "As implemented", departure six. Symptom:
+   `failed to start Boot0001 …: Time out` and an EFI shell prompt, with
+   Windows Setup never running at all.
+
+2. **The OpenSSH firewall rule is `Private`-profile only.** With the
+   keypress fixed, the install ran to completion: Windows installed, NetKVM
+   came up on 10.0.2.15, `Add-WindowsCapability OpenSSH.Server` succeeded,
+   Git and PowerShell 7 provisioned, and `C:\Windows\Temp\repro-install-done`
+   — the sentinel this harness polls for — was written. The harness still
+   could not reach the guest, and waited out its deadline against a finished
+   install.
+
+   The cause: the capability's own inbound rule (`OpenSSH-Server-In-TCP`) is
+   scoped to the **Private** profile. QEMU's user-mode network is
+   unidentified, so Windows classifies it **Public**, whose policy is
+   `BlockInbound`. `sshd` was Running, `netstat` showed `0.0.0.0:22
+   LISTENING`, and every SYN forwarded by `hostfwd` was dropped inside the
+   guest. `provision-openssh.ps1` only created a rule *when none existed*, so
+   on exactly this path it was a no-op. It now widens whatever rule is there
+   to `Profile Any`, owns a rule of its own (`vmh-sshd-in-tcp22`), and
+   **asserts** the result — an unreachable sshd must fail the provisioning
+   step loudly rather than produce a golden nothing can log into.
+
+3. **`Start-Process` does not detach sysprep from the SSH session.** With
+   the firewall fixed, the install ran through, the harness logged in and
+   launched `sysprep /generalize /oobe /shutdown /mode:vm`, and sysprep wrote
+   four lines to `C:\Windows\System32\Sysprep\Panther\setupact.log` —
+   `Sysprep mode [vm]`, then *"Beginning action execution from
+   Cleanup.xml"* — and **died one second later**, generalizing nothing. The
+   build then waited 20 minutes for a power-off from a process that no longer
+   existed, with a perfectly installed guest sitting at its desktop.
+
+   Windows OpenSSH puts every process of a session into a **job object** and
+   terminates that job when the session ends. A `Start-Process` child stays
+   inside the job, so "launched detached" was never true. Measured directly
+   on the same guest, with a harmless long-running process instead of a
+   20-minute generalize:
+
+   | launch | survivors 2 s after the session closed |
+   |---|---|
+   | `Start-Process` | **0** |
+   | `Invoke-CimMethod Win32_Process Create` | 1, still running 25 s later |
+
+   `Win32_Process.Create` works because the WMI provider host creates the
+   process, so it is in no session job at all. `buildSysprepRemoteCommand`
+   now uses it and exits non-zero on a refused creation.
+
+   The second half of the fix matters as much: a launch reporting success and
+   a sysprep actually running are different facts, and only the first was
+   ever checked. `sysprepTookHold` now confirms sysprep is still there
+   (`QwaSysprepTakeHoldSec`, default 180 s) or that the guest has already
+   powered off, so this failure costs ten seconds and names itself instead of
+   consuming the whole deadline in silence.
+
+4. **The framebuffer was not actually captured.** The Risks section below
+   claimed it was. It could not have been: `-display none` renders nowhere,
+   and nothing dumped it. A Windows guest writes nothing to the serial port
+   once the firmware hands over, so on both failures above the serial log
+   simply stopped and said nothing more. `captureGuestScreen` now dumps it
+   through the monitor's `screendump` on every failure, into
+   `<golden-dir>/screen.ppm`, and the failure message names it as the thing
+   to read first. It is what turned the second diagnosis from a blind
+   90-minute wait into a ten-second look at a desktop.
+
+### Still open: a DXE spin on the boot after Setup's first reboot
+
+Not fixed, and the reason MA4 has not yet produced an artifact. Two of five
+runs hung on the firmware boot that follows Windows Setup's first reboot,
+on inputs identical to the two runs that sailed past it. The firmware prints
+its banner, does TPM init, prints `UsbBootExecCmd: Success to Exec 0x0 Cmd`
+twice, and never reaches a boot option; the serial log then froze for 23
+minutes and the target qcow2 for 30.
+
+It is a **spin, not starvation** — the distinction matters because the first
+read was "the host is loaded" and that was wrong. `info registers` over the
+monitor shows the guest PC parked at one address (`0x23fd5de04`) for 25
+seconds, and then cycling inside an **eight-byte window**
+(`0x47695fac`/`0x47695fb4`): a polling loop in a DXE driver with no timeout
+firing, most likely the USB/xHCI stack re-enumerating the two CD-ROMs now
+that the NVMe disk also carries boot entries. `system_reset` on the monitor
+does not clear it — the boot after the reset stalls at the same point.
+
+Two things worth trying, in order:
+
+1. Attach the install media over `virtio-scsi` rather than xHCI. EDK2 has
+   `VirtioScsiDxe`, so the firmware can boot it, and it takes the suspected
+   driver out of the path — but check first that Windows Setup can still see
+   the media, since it has no in-box vioscsi driver.
+2. A harness-side watchdog: reset a guest whose serial log *and* target disk
+   have both been unchanged past a bound. Cheap, bounded, and it fits the
+   rest of this design — but it is a workaround, not a fix.
+
+**Measured, for the estimates this document carries.** Install peak on m3:
+**16.4 GiB** of build-directory growth, not the estimated 50 GB — see the
+free-space Decision below. Phase timings: media boot to first Setup write
+~60 s; image applied and first reboot at ~6 min; desktop at ~16 min; NetKVM
+installed at ~7.5 min after that reboot; `Add-WindowsCapability
+OpenSSH.Server` took **8 minutes** on its own; sentinel written by ~16 min
+after boot.
+
+### Two traps the runs left behind, and what now stops them
+
+Neither is a defect in the run; both are ways the *next* build could produce
+an artifact that lies about itself. They are the same class as the artifact
+this whole campaign exists to replace, so they are closed here rather than
+left for the promotion work.
+
+- **A failed build looks exactly like a golden.** MA3's contract
+  deliberately retains a failed build's directory and logs for diagnosis, and
+  MA4's five runs duly left **six** of them under
+  `/private/var/lib/vm-harness/qemu-windows-arm/golden/`, 12–15 GB each
+  (~68 GB total). Every one holds a `windows.qcow2`, because the build
+  creates that empty as its *first* act — and `validateWindowsArmVmDir`, the
+  check the consuming path used, asked for nothing else. All six would have
+  been accepted as a baseline to boot CI jobs from.
+
+  The disk is not an identification. `requireWindowsArmGolden` is now the
+  admission check, and it additionally requires `golden-manifest.json`, which
+  the build writes *last* and which is therefore a genuine completion marker.
+  `provisionBaseline`, `revertToBaseline` and `buildWindowsArmGolden`'s own
+  return value all go through it. `validateWindowsArmVmDir` survives as the
+  purely structural "is there a disk here" question the overlay and clone
+  paths ask of a directory something else already admitted.
+
+  The six directories are **left in place** — they are not urgent, the host
+  has ample space, and they are the diagnostic record for the open DXE spin.
+
+- **A stale answer-file ISO would have poisoned the manifest.** Found before
+  MA4's first run: `guest-recipes/windows-arm-base/build/autounattend.iso`
+  was 7.6 MiB dated 2026-07-06, while `autounattend.xml`, `repro-sysprep.xml`
+  and `provision-openssh.ps1` were from 2026-09-08 — it predated the
+  Git-for-Windows, PowerShell-7 and credential-expiry changes entirely.
+
+  That gap is structural, not a one-off: the manifest digests *both* the ISO
+  it consumed and the *recipe files on disk*, and nothing regenerates the ISO
+  when a recipe file changes, because `build/` is a gitignored artifact built
+  by hand. A build from a stale ISO installs July's recipe and records
+  September's. `staleAnswerIsoRecipeFiles` now refuses such a build **before**
+  it spends an hour, naming the files and the rebuild command.
+
+  It is a staleness *heuristic* — it compares modification times and cannot
+  prove that an ISO rebuilt after an edit actually carries it. Proving that
+  means reading the ISO's contents, which needs ISO tooling this path does
+  not otherwise want; the durable fix is for the promotion work to build the
+  ISO as a declared step of the build rather than leave it in `build/`.
+
 ## Risks
 
 - **Windows setup is opaque when it fails.** A wrong answer file leaves a
   guest sitting at an OOBE prompt with no SSH and no console. Mitigation:
-  the serial log and `ramfb` framebuffer are both captured, and the overall
-  deadline bounds the failure.
+  the serial log is captured, the `ramfb` framebuffer is dumped through the
+  monitor on failure (see `captureGuestScreen` — this was claimed here
+  before it existed), and the overall deadline bounds the failure.
 - **The install may need more reboots than HVF+UEFI tolerates.** Untested on
   this exact firmware/machine combination; Phase 1 is where that is found
   out.
@@ -353,9 +552,18 @@ Derivation, biased pessimistic throughout:
 
 - **50 GB install peak.** A Windows 11 ARM64 install lands around 25 GB, plus
   the component store before `/ResetBase`, a pagefile sized to guest RAM, the
-  staged toolchain, and sysprep's working set. This is an *estimate* — the
-  golden it would have been measured against was lost — and should be
-  replaced with a real figure after the first successful build.
+  staged toolchain, and sysprep's working set. This was an *estimate* — the
+  golden it would have been measured against was lost.
+
+  **MEASURED on m3, 2026-09-15: 16.4 GiB**, sampled every 20 s over a full
+  install through to the sentinel (`du -sk` of the whole build directory, so
+  it includes the 128 MiB firmware pair and the TPM state; the qcow2 itself
+  peaked at 16.3 GiB and then *shrank* as Setup trimmed). The estimate is
+  pessimistic by 3x, which is the safe direction and is why it is left alone:
+  the floor it produces (60 GB) still refuses only builds that genuinely
+  cannot fit, and a `/ResetBase`-less component store on a future Windows
+  release could close the gap. Anyone tempted to lower it should note this
+  figure does not yet include `sysprep /generalize`'s own working set.
 - **116 GB fleet peak**, from live scale-set limits and measured instance
   footprints: 2 macOS at ~36 GB, 3 Linux at ~8 GB, 2 Windows overlays at
   ~10 GB.

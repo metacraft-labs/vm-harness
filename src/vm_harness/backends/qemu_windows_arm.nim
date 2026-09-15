@@ -67,13 +67,28 @@ const
     ## Requested qcow2 size. qcow2 is sparse, so this is a ceiling on
     ## growth rather than an allocation.
   QwaGoldenInstallPeakGB* = 50
-    ## Estimated peak *actual* consumption of a golden install: a Windows 11
-    ## ARM64 install lands around 25 GB, plus the pre-``/ResetBase``
-    ## component store, a pagefile sized to guest RAM, the staged toolchain,
-    ## and sysprep's working set. Not measured on this image — the golden it
-    ## replaces was lost before it could be — so it is an estimate biased
-    ## high, and should be replaced with a measurement after the first
-    ## successful build.
+    ## Peak *actual* consumption assumed for a golden install. It produces a
+    ## 60 GB floor for the default 64 GB image (see ``qwaGoldenFloorGB``).
+    ##
+    ## MEASURED on m3 2026-09-15, sampling ``du -sk`` of the whole build
+    ## directory every 20s across four runs through to the install sentinel:
+    ## peaks of 16.44, 14.97, 15.07 and 14.08 GiB, the largest being the run
+    ## that got furthest through provisioning. The qcow2 alone peaked at
+    ## 16.3 GiB and then SHRANK as Setup trimmed. So this number is
+    ## pessimistic by roughly 3x — and it is KEPT anyway, deliberately:
+    ##
+    ## * The measurement stops at the sentinel. No run has yet survived
+    ##   ``sysprep /generalize``, whose working set is exactly the part of
+    ##   the estimate that is still unmeasured.
+    ## * The error is in the safe direction. The band this over-estimate
+    ##   wrongly refuses is 27-60 GB free, on a 1.9 TB host whose free space
+    ##   swings by a saturated fleet's worth (``QwaFleetPeakGB``, 116 GB)
+    ##   between idle and load. A build started at 30 GB free would be
+    ##   racing CI for the disk for the next hour.
+    ## * ``VMH_QEMU_WINDOWS_ARM_MIN_FREE_GB`` already exists for an operator
+    ##   who knows better on a specific host.
+    ##
+    ## Revisit it when a build has been through generalize, not before.
   QwaGoldenBuildSlackGB* = 10
     ## Logs, firmware vars, TPM state, and room to not wedge the host at
     ## exactly zero.
@@ -98,6 +113,20 @@ const
     ## that echoes back the command it was given must not be able to look
     ## like a finished install.
   QwaSysprepExePath* = "C:\\Windows\\System32\\Sysprep\\sysprep.exe"
+  QwaSysprepCreateMarker* = "VMH-SYSPREP-CREATE"
+    ## Printed by the sysprep launch before it creates anything, so a launch
+    ## that never reached the guest's shell is distinguishable from one that
+    ## reached it and was refused.
+  QwaSysprepRunningMarker* = "VMH-SYSPREP-RUNNING"
+    ## What the "is sysprep actually running?" probe prints. Distinct from
+    ## the process name for the same reason ``QwaInstallDoneMarker`` is: an
+    ## ssh wrapper that echoes its argument must not look like a live sysprep.
+  QwaSysprepTakeHoldSec* = 180
+    ## How long to wait for sysprep to become visible in the guest after it
+    ## has been launched. MEASURED on m3 2026-09-15: a sysprep that is killed
+    ## with the SSH session dies about a second in, so this only has to be
+    ## long enough to cover a slow start, not a whole generalize.
+  QwaSysprepTakeHoldPollMs* = 10_000
   QwaSysprepAnswerGuestPath* = "C:\\repro-sysprep.xml"
     ## Where ``autounattend.xml`` copies ``repro-sysprep.xml`` to, from the
     ## answer-file ISO, in its ``FirstLogonCommands``. Sysprep is invoked
@@ -115,6 +144,30 @@ const
     ## forever.
   QwaSentinelPollMs* = 15_000
   QwaPowerOffPollMs* = 2_000
+  QwaInstallMediaKey* = "ret"
+    ## The key injected to answer ``cdboot.efi``'s "Press any key to boot
+    ## from CD or DVD" prompt. MEASURED on m3 2026-09-15: without it the
+    ## install boot cannot start at all. ``\EFI\BOOT\BOOTAA64.EFI`` on a
+    ## Windows install ISO is ``cdboot.efi``, which waits ~5s for a keypress
+    ## and returns ``EFI_TIMEOUT`` when none arrives; the headless machine
+    ## shape has NO input device (``-display none`` and an output-only
+    ## ``-serial file:``), so the firmware logged
+    ## ``failed to start Boot0001 ...: Time out``, fell through to the EFI
+    ## shell, and the build sat out its whole deadline.
+  QwaInstallKeyPressWindowSec* = 180
+    ## How long the install boot keeps answering that prompt. BOUNDED ON
+    ## PURPOSE, and the bound is load-bearing rather than defensive: the same
+    ## unanswered prompt is what makes Windows Setup's own reboots fall
+    ## through the still-first install media and onto the disk it is
+    ## installing to. Keep pressing keys past the first boot and Setup
+    ## restarts from the media instead of continuing — measured on m3, the
+    ## media is still ahead of the disk in ``BootOrder`` after Setup's first
+    ## reboot. The prompt appears ~20-25s after power-on, so this is ample.
+  QwaInstallKeyPressIntervalMs* = 2_000
+  QwaInstallProgressBytes* = 4'i64 * 1024 * 1024
+    ## Growth of the target qcow2 past its freshly-created size that means
+    ## Windows Setup is writing — i.e. the prompt has been answered and the
+    ## keypress window can stop early. A fresh 64 GB qcow2 is ~200 KB.
   QwaRecipeAnswerFiles* = ["autounattend.xml", "repro-sysprep.xml",
                            "provision-openssh.ps1"]
     ## The checked-in recipe inputs whose digests go into a golden's
@@ -208,7 +261,12 @@ proc runProcessCapture(cmd: seq[string], cwd: string = "",
              elapsedMs: int((epochTime() - start) * 1000))
 
 proc validateWindowsArmVmDir*(dir: string): string =
-  ## Return the absolute baseline directory when it contains windows.qcow2.
+  ## STRUCTURAL check: return the absolute directory when it holds a disk a
+  ## guest could be booted from. This is what the overlay and clone paths
+  ## need, and they are handed a directory something else already admitted.
+  ##
+  ## It is deliberately NOT the admission check. A half-finished install has
+  ## a ``windows.qcow2`` too — see ``requireWindowsArmGolden``.
   if dir.len == 0:
     raise newException(ValueError, "Windows ARM baseline directory is empty")
   if not dirExists(dir):
@@ -218,6 +276,35 @@ proc validateWindowsArmVmDir*(dir: string): string =
     raise newException(ValueError,
       "Windows ARM baseline directory must contain windows.qcow2: " & dir)
   absolutePath(dir)
+
+proc requireWindowsArmGolden*(dir: string): string =
+  ## ADMISSION check: return the absolute directory only when it is a
+  ## FINISHED golden — a disk *and* the manifest that says what it was built
+  ## from. Everything that consumes a golden goes through here.
+  ##
+  ## The manifest is the completion marker, and requiring it is the point.
+  ## ``windows.qcow2`` alone identifies nothing: the golden build creates it
+  ## EMPTY as its first act and writes the manifest as its LAST, so every
+  ## directory a failed build leaves behind — and MA3's contract is that
+  ## failed builds are retained for diagnosis — holds a plausible-looking
+  ## disk and no manifest. MEASURED on m3 2026-09-15: six such directories
+  ## sat under ``golden/`` after MA4's runs, 12-15 GB each, every one of them
+  ## accepted by the structural check as a baseline to boot CI jobs from.
+  ##
+  ## That is the same class of trap this campaign exists to remove. The lane
+  ## was down for weeks because a golden could not be identified, and the
+  ## rule that came out of it is that an artifact must be identifiable AS
+  ## one. A disk that could be a crash site is not an identification.
+  let base = validateWindowsArmVmDir(dir)
+  if not fileExists(base / QwaGoldenManifestName):
+    raise newException(ValueError,
+      "Windows ARM baseline directory " & base & " holds " &
+      QwaBaseDiskName & " but no " & QwaGoldenManifestName & ", so it is " &
+      "NOT a finished golden — most likely a build that failed and was " &
+      "retained for diagnosis. The manifest is written last, as the " &
+      "completion marker. Point at a directory a golden build finished " &
+      "into, or rebuild.")
+  absolutePath(base)
 
 proc ephemeralName*(prefix: string, epochMs: int64, pid: int): string =
   prefix & "-" & $epochMs & "-" & $pid
@@ -461,10 +548,17 @@ proc buildQemuWindowsArmInstallArgs*(vmDir, windowsIso, autounattendIso: string,
   ## * The install media takes boot priority and the target disk goes last,
   ##   so the firmware boots the ISO while the empty NVMe disk is still
   ##   unbootable, and prefers the disk once Windows is installed on it.
+  ## * A ``usb-kbd`` is attached. The per-job boot needs no input device, but
+  ##   the install boot cannot start without one: ``\EFI\BOOT\BOOTAA64.EFI``
+  ##   on the install ISO is ``cdboot.efi``, and it waits for a keypress
+  ##   before handing over to Windows Setup. See ``QwaInstallMediaKey`` and
+  ##   ``answerInstallMediaKeyPrompt`` — the key itself is injected through
+  ##   the monitor socket, but there has to be a keyboard for it to arrive on.
   result = qwaMachineArgs(vmDir, vmDir / QwaBaseDiskName, sshPort, cpus,
                           memoryMB, diskBootIndex = 2)
   result.add(@[
     "-device", "qemu-xhci,id=usb",
+    "-device", "usb-kbd,bus=usb.0",
     "-drive", "id=installcd,file=" & windowsIso & ",media=cdrom,readonly=on,if=none",
     "-device", "usb-storage,bus=usb.0,drive=installcd,bootindex=0",
     "-drive", "id=unattendcd,file=" & autounattendIso & ",media=cdrom,readonly=on,if=none",
@@ -956,6 +1050,74 @@ proc queryQemuMonitor*(monitorPath, command: string,
   else:
     ""
 
+proc sendQemuMonitorCommand*(monitorPath, command: string,
+                             timeoutMs: int = 500): bool =
+  ## Send one command to QEMU's monitor and report whether the monitor took
+  ## it. Separate from ``queryQemuMonitor`` because there is no reply to
+  ## recognise: a ``sendkey`` is answered with nothing but a fresh ``(qemu) ``
+  ## prompt, which carries no newline.
+  ##
+  ## It still DRAINS for ``timeoutMs`` before hanging up, and that is not
+  ## politeness. A monitor is a stream peer being written to by something
+  ## that does not expect its reader to vanish mid-reply; closing on it with
+  ## a reply in flight is a hangup during someone else's ``write``. The one
+  ## measured consequence so far was in the unit tier's fake monitor, which
+  ## wedged in ``send`` and stopped accepting connections at all — so the
+  ## power-off watch that runs AFTER the keypress phase saw a dead monitor
+  ## and a live process, and reported a powered-off guest as running until
+  ## the deadline. Draining costs one bounded wait per keypress and removes
+  ## the whole class.
+  when defined(posix):
+    if monitorPath.len == 0 or not pathExists(monitorPath):
+      return false
+    var sock: Socket
+    try:
+      sock = newSocket(net.Domain.AF_UNIX, net.SockType.SOCK_STREAM,
+                       net.Protocol.IPPROTO_IP)
+    except CatchableError:
+      return false
+    try:
+      sock.connectUnix(monitorPath)
+    except CatchableError:
+      try: sock.close()
+      except CatchableError: discard
+      return false
+    defer:
+      try: sock.close()
+      except CatchableError: discard
+    try:
+      sock.send(command & "\n")
+    except CatchableError:
+      return false
+    # Drain whatever the monitor says back, until the bound. The last thing
+    # it writes is a bare ``(qemu) `` prompt with no newline, so this always
+    # ends on the timeout rather than on a recognised reply — that is the
+    # shape of the protocol, not a missed case.
+    let drainUntil = epochTime() + timeoutMs.float / 1000.0
+    try:
+      while epochTime() < drainUntil:
+        let remainingMs = max(1, int((drainUntil - epochTime()) * 1000.0))
+        var line = ""
+        sock.readLine(line, timeout = remainingMs)
+        if line.len == 0:
+          break     # the monitor hung up
+    except CatchableError:
+      discard
+    true
+  else:
+    false
+
+proc goldenDiskProgressed*(diskPath: string,
+                           thresholdBytes: int64 = QwaInstallProgressBytes):
+                           bool =
+  ## True once the target qcow2 has grown past ``thresholdBytes``, which means
+  ## the guest is writing to it — the one observation available off-band that
+  ## says Windows Setup got past the boot-media prompt and started.
+  try:
+    getFileSize(diskPath) > thresholdBytes
+  except CatchableError:
+    false
+
 proc monitorTextSaysPoweredOff*(text: string): bool =
   ## Read a QEMU monitor ``info status`` reply.
   ##
@@ -1004,6 +1166,40 @@ proc waitForGuestPowerOff*(monitorPath: string, qemuPid: int,
       return true
     if not sleepUntilNextPoll(deadline, pollMs):
       return false
+
+proc answerInstallMediaKeyPrompt*(monitorPath, diskPath: string, qemuPid: int,
+                                  deadline: float,
+                                  windowSec: int = QwaInstallKeyPressWindowSec,
+                                  intervalMs: int = QwaInstallKeyPressIntervalMs,
+                                  key: string = QwaInstallMediaKey): int =
+  ## Answer ``cdboot.efi``'s "Press any key to boot from CD or DVD" prompt on
+  ## the install boot, and then STOP. Returns how many keypresses were
+  ## delivered.
+  ##
+  ## Both halves matter. Without a keypress the install never starts: the
+  ## headless machine shape has no input device, so the prompt times out,
+  ## ``BdsDxe`` reports ``failed to start Boot0001 ...: Time out`` and falls
+  ## through to the EFI shell. Without STOPPING, Setup's own reboots — which
+  ## rely on that same prompt timing out to fall past the still-first install
+  ## media and onto the disk it is installing to — would be answered too, and
+  ## Setup would restart from the media instead of continuing.
+  ##
+  ## So the window is bounded three ways: the disk starting to grow (Setup is
+  ## past the prompt and writing), the given ``windowSec``, and the overall
+  ## build deadline. It never outlives the shortest of them.
+  result = 0
+  if windowSec <= 0:
+    return
+  let windowEnd = min(epochTime() + windowSec.float, deadline)
+  while epochTime() < windowEnd:
+    if qemuProcessGone(qemuPid):
+      return
+    if goldenDiskProgressed(diskPath):
+      return
+    if sendQemuMonitorCommand(monitorPath, "sendkey " & key):
+      inc result
+    if not sleepUntilNextPoll(windowEnd, intervalMs):
+      return
 
 proc buildInstallSentinelProbe*(): string =
   ## A remote command that prints ``QwaInstallDoneMarker`` exactly when the
@@ -1054,20 +1250,53 @@ proc buildSysprepCommand*(modeVm: bool = true): seq[string] =
   result.add("/unattend:" & QwaSysprepAnswerGuestPath)
 
 proc buildSysprepRemoteCommand*(modeVm: bool = true): string =
-  ## Launch sysprep DETACHED from the SSH channel that starts it.
+  ## Launch sysprep so that it OUTLIVES the SSH session that starts it.
   ##
-  ## ``/shutdown`` powers the guest off under that channel, and a generalize
-  ## takes 10-20 minutes, so a channel-bound invocation is one host-side
-  ## timeout away from killing sysprep partway and leaving a half-generalized
-  ## disk that still looks like a golden. Start it and let go; the power-off
-  ## is observed on the monitor socket instead.
+  ## ``/shutdown`` powers the guest off under that session, and a generalize
+  ## takes 10-20 minutes, so a session-bound invocation is one hangup away
+  ## from a half-generalized disk that still looks like a golden.
+  ##
+  ## ``Start-Process`` does NOT achieve that, which is the assumption this
+  ## code shipped on and MA4's host run disproved. Windows OpenSSH puts every
+  ## process of a session into a JOB OBJECT and terminates the job when the
+  ## session ends; a ``Start-Process`` child stays inside that job. MEASURED
+  ## on m3 2026-09-15 with a harmless long-running process: launched with
+  ## ``Start-Process`` it was GONE two seconds after the session closed
+  ## (0 survivors); launched through ``Win32_Process.Create`` it was still
+  ## running 25 seconds later. The real consequence was worse than the probe:
+  ## sysprep logged four lines, reached "Beginning action execution from
+  ## Cleanup.xml", and died one second in — after which the build sat waiting
+  ## for a power-off from a process that no longer existed.
+  ##
+  ## ``Win32_Process.Create`` is the fix because the new process is created
+  ## by the WMI provider host, not by this session, so it is not in the
+  ## session's job at all. A non-zero ``ReturnValue`` exits non-zero so the
+  ## harness reports a sysprep that never started, rather than waiting.
+  ## NO ``$`` ANYWHERE IN THE COMMAND. ``provision-openssh.ps1`` sets sshd's
+  ## ``DefaultShell`` to powershell.exe, so what arrives over SSH is parsed
+  ## by an OUTER PowerShell before the inner ``powershell.exe -Command``
+  ## string ever exists — and that outer parse expands ``$`` inside double
+  ## quotes. MEASURED on m3 2026-09-15: a first cut that stashed the result
+  ## in ``$r`` arrived in the guest as ``rc=' + .ReturnValue``, a parse
+  ## error, because ``$r`` had already been substituted away as an undefined
+  ## variable. Every other remote command this file builds happens to be
+  ## ``$``-free; this one has to be so deliberately, and the gate asserts it.
   let argv = buildSysprepCommand(modeVm)
-  var quoted: seq[string]
+  var commandLine = argv[0]
   for a in argv[1 .. ^1]:
-    quoted.add(powershellLiteral(a))
-  "powershell.exe -NoLogo -NoProfile -Command \"Start-Process -FilePath " &
-    powershellLiteral(argv[0]) & " -ArgumentList " & quoted.join(",") &
-    "; exit 0\""
+    commandLine.add(" " & a)
+  "powershell.exe -NoLogo -NoProfile -Command \"Write-Output '" &
+    QwaSysprepCreateMarker & "'; if ((Invoke-CimMethod -ClassName " &
+    "Win32_Process -MethodName Create -Arguments @{CommandLine = " &
+    powershellLiteral(commandLine) & "}).ReturnValue -ne 0) " &
+    "{ exit 1 }; exit 0\""
+
+proc buildSysprepRunningProbe*(): string =
+  ## A remote command that succeeds only while ``sysprep.exe`` is actually
+  ## running in the guest.
+  "powershell.exe -NoLogo -NoProfile -Command \"if (Get-Process sysprep " &
+    "-ErrorAction SilentlyContinue) { Write-Output '" &
+    QwaSysprepRunningMarker & "'; exit 0 } else { exit 1 }\""
 
 proc runGuestSysprep*(b: QemuWindowsArmBackend, port: int,
                       modeVm: bool = true): ExecResult =
@@ -1087,6 +1316,43 @@ proc runGuestSysprep*(b: QemuWindowsArmBackend, port: int,
       return last
     sleep(QemuSshRetryDelayMs)
   last
+
+proc sysprepRunning*(b: QemuWindowsArmBackend, port: int): bool =
+  ## One probe. Requires BOTH a zero exit and the marker on stdout.
+  let pwdFile = writePasswordFile(b.sshPassword)
+  defer:
+    try: removeFile(pwdFile)
+    except CatchableError: discard
+  let cmd = b.buildSshpassSshArgs(pwdFile, port, buildSysprepRunningProbe())
+  let r = runProcessCapture(cmd, timeoutSec = 60)
+  r.exitCode == 0 and QwaSysprepRunningMarker in r.stdout
+
+proc sysprepTookHold*(b: QemuWindowsArmBackend, port: int,
+                      monitorPath: string, qemuPid: int,
+                      deadline: float,
+                      windowSec: int = QwaSysprepTakeHoldSec,
+                      pollMs: int = QwaSysprepTakeHoldPollMs): bool =
+  ## Confirm that sysprep is STILL THERE shortly after being launched.
+  ##
+  ## The launch reporting success says only that the guest accepted the
+  ## command. MEASURED on m3 2026-09-15: a sysprep launched into the SSH
+  ## session's job object is killed about a second after the session closes,
+  ## having logged four lines and generalized nothing — and the build then
+  ## waits out its entire deadline for a power-off from a process that no
+  ## longer exists. That is a 90-minute silence for a failure that is visible
+  ## in ten seconds, so it is checked instead of assumed.
+  ##
+  ## "Powered off already" counts as taking hold: a generalize normally runs
+  ## for minutes, but a build must not fail because sysprep beat the first
+  ## poll to the finish line.
+  let windowEnd = min(epochTime() + windowSec.float, deadline)
+  while true:
+    if guestPoweredOff(monitorPath, qemuPid):
+      return true
+    if b.sysprepRunning(port):
+      return true
+    if not sleepUntilNextPoll(windowEnd, pollMs):
+      return false
 
 proc machineSidFromUserSid*(sid: string): string =
   ## The machine SID is an account SID with its trailing RID removed.
@@ -1278,6 +1544,37 @@ proc writeGoldenManifest*(inp: GoldenManifestInputs): string =
   writeFile(path, pretty(goldenManifestJson(inp)) & "\n")
   path
 
+proc staleAnswerIsoRecipeFiles*(autounattendIso, recipeDir: string): seq[string] =
+  ## Recipe files that are NEWER than the answer-file ISO said to carry them.
+  ##
+  ## The manifest digests two things that have to agree and are produced by
+  ## different steps: the ISO the build actually consumed, and the RECIPE
+  ## FILES on disk. Nothing regenerates the ISO when a recipe file changes —
+  ## ``build/`` is a gitignored artifact built by hand — so the two can drift
+  ## apart silently, and when they do the manifest claims provenance the
+  ## golden does not have.
+  ##
+  ## MEASURED on m3 2026-09-15, before the first host run:
+  ## ``guest-recipes/windows-arm-base/build/autounattend.iso`` was 7.6 MiB
+  ## from 2026-07-06 while ``autounattend.xml``, ``repro-sysprep.xml`` and
+  ## ``provision-openssh.ps1`` were from 2026-09-08 — it predated the
+  ## Git-for-Windows, PowerShell-7 and credential-expiry changes entirely.
+  ## A build from it would have installed the July recipe and recorded the
+  ## September one.
+  ##
+  ## This is a staleness HEURISTIC, not a proof: it compares modification
+  ## times, and cannot tell that an ISO rebuilt after an edit actually
+  ## carries it. Proving that means reading the ISO's contents, which needs
+  ## ISO tooling this path does not otherwise want. It catches the drift that
+  ## was actually observed, and it costs one stat per file.
+  if recipeDir.len == 0 or not fileExists(autounattendIso):
+    return
+  let isoTime = getLastModificationTime(autounattendIso)
+  for name in QwaRecipeAnswerFiles:
+    let p = recipeDir / name
+    if fileExists(p) and getLastModificationTime(p) > isoTime:
+      result.add(name)
+
 type
   GoldenBuildSpec* = object
     buildDir*: string
@@ -1292,6 +1589,11 @@ type
     memoryMB*: int
     deadlineSec*: int
     sysprepModeVm*: bool
+    keyPressWindowSec*: int
+      ## How long to keep answering the install media's keypress prompt. See
+      ## ``answerInstallMediaKeyPrompt``; 0 disables it, which is only ever
+      ## right for a test that wants to prove the prompt is what stalls a
+      ## headless install.
 
 proc newGoldenBuildSpec*(buildDir, windowsIso, autounattendIso: string,
                          baseline = "win-arm-runner",
@@ -1299,24 +1601,64 @@ proc newGoldenBuildSpec*(buildDir, windowsIso, autounattendIso: string,
                          diskGB = QwaDefaultGoldenDiskGB,
                          cpus = 4, memoryMB = 8192,
                          deadlineSec = QwaDefaultGoldenDeadlineSec,
-                         sysprepModeVm = true): GoldenBuildSpec =
+                         sysprepModeVm = true,
+                         keyPressWindowSec = QwaInstallKeyPressWindowSec):
+                         GoldenBuildSpec =
   GoldenBuildSpec(buildDir: buildDir, baseline: baseline,
                   windowsIso: windowsIso, autounattendIso: autounattendIso,
                   recipeDir: recipeDir, diskGB: diskGB, cpus: cpus,
                   memoryMB: memoryMB, deadlineSec: deadlineSec,
-                  sysprepModeVm: sysprepModeVm)
+                  sysprepModeVm: sysprepModeVm,
+                  keyPressWindowSec: keyPressWindowSec)
+
+const QwaGoldenScreenshotName* = "screen.ppm"
+  ## Where a failed golden build dumps the guest's framebuffer. The design
+  ## claimed ramfb "is captured"; it was not, and could not be — ``-display
+  ## none`` renders nowhere. MEASURED on m3 2026-09-15: the framebuffer was
+  ## the artifact that turned a blind 90-minute timeout into a ten-second
+  ## diagnosis, because a Windows guest says nothing at all on the serial
+  ## port once the firmware hands over.
+
+proc captureGuestScreen*(monitorPath, buildDir: string): string =
+  ## Dump the guest framebuffer through the monitor's ``screendump``, and
+  ## return the path when one landed. Best effort: a guest whose QEMU has
+  ## already exited has no framebuffer to dump, and that is not a new failure.
+  let dest = buildDir / QwaGoldenScreenshotName
+  try: removeFile(dest)
+  except CatchableError: discard
+  if not sendQemuMonitorCommand(monitorPath, "screendump " & dest,
+                                timeoutMs = 3000):
+    return ""
+  # screendump writes before it answers, but give a large framebuffer a
+  # moment rather than racing it.
+  for _ in 1 .. 10:
+    if fileExists(dest) and getFileSize(dest) > 0:
+      return dest
+    sleep(200)
+  if fileExists(dest): dest else: ""
 
 proc goldenBuildDiagnostics*(buildDir: string): string =
   ## The tail every golden-build failure carries. A Windows install that goes
-  ## wrong has no console and no SSH, so the serial log and QEMU's own log
-  ## are the entire diagnostic surface — and they are only useful if the
-  ## failure path says where they are and leaves them there.
-  " Diagnostics retained: " & (buildDir / "serial.log") &
-  " (guest serial console) and " & (buildDir / "qemu.log") & "; " &
-  buildDir & " is left in place. Start the next attempt in a NEW versioned " &
-  "directory — never reuse this one, and never rebuild over a live golden."
+  ## wrong has no console and no SSH, so the serial log, QEMU's own log and
+  ## the framebuffer dump are the entire diagnostic surface — and they are
+  ## only useful if the failure path says where they are and leaves them
+  ## there.
+  result = " Diagnostics retained: " & (buildDir / "serial.log") &
+    " (guest serial console) and " & (buildDir / "qemu.log")
+  if fileExists(buildDir / QwaGoldenScreenshotName):
+    result.add(" and " & (buildDir / QwaGoldenScreenshotName) &
+      " (guest framebuffer at the moment of failure — read this FIRST; a " &
+      "Windows guest is silent on the serial port once the firmware hands " &
+      "over, so the screen is the only thing that says where it stopped)")
+  result.add("; " & buildDir & " is left in place. Start the next attempt " &
+    "in a NEW versioned directory — never reuse this one, and never " &
+    "rebuild over a live golden.")
 
 proc goldenBuildFailure*(buildDir, msg: string): ref VmHarnessError =
+  ## Grab the framebuffer BEFORE composing the message: every raise below
+  ## happens while QEMU is still alive (the teardown is in the caller's
+  ## ``finally``), and once it exits the screen is gone for good.
+  discard captureGuestScreen(qwaMonitorSocketPath(buildDir), buildDir)
   newVmHarnessError($biQemuWindowsArm, lpProvisioning,
                     msg & goldenBuildDiagnostics(buildDir))
 
@@ -1343,6 +1685,19 @@ proc buildWindowsArmGolden*(b: QemuWindowsArmBackend,
       "golden build: answer-file ISO not found: " & spec.autounattendIso &
       ". Build it with guest-recipes/windows-arm-base/" &
       "build-autounattend-iso.sh.")
+  # Refuse BEFORE spending an hour, not after: a golden built from a stale
+  # ISO records the recipe files on disk and installs different ones.
+  let stale = staleAnswerIsoRecipeFiles(spec.autounattendIso, spec.recipeDir)
+  if stale.len > 0:
+    raise newVmHarnessError($b.id, lpProvisioning,
+      "golden build: the answer-file ISO " & spec.autounattendIso &
+      " is OLDER than the recipe files it is supposed to carry (" &
+      stale.join(", ") & "). The manifest digests the recipe files, so a " &
+      "build from a stale ISO produces a golden whose manifest claims " &
+      "provenance it does not have — MEASURED on m3 2026-09-15, where the " &
+      "ISO on disk predated the Git, PowerShell and credential changes by " &
+      "two months. Rebuild it with guest-recipes/windows-arm-base/" &
+      "build-autounattend-iso.sh and start again.")
   let diskGB = if spec.diskGB > 0: spec.diskGB else: QwaDefaultGoldenDiskGB
   let cpus = if spec.cpus > 0: spec.cpus else: 4
   let memoryMB = if spec.memoryMB > 0: spec.memoryMB else: 8192
@@ -1376,19 +1731,49 @@ proc buildWindowsArmGolden*(b: QemuWindowsArmBackend,
         "the golden install boot did not start: " & e.msg & ".")
     qemuPid = started.pid
 
+    # cdboot.efi will not hand over to Windows Setup until a key is pressed,
+    # and this machine shape has no input device an operator could press one
+    # on. Bounded, and it stops the moment Setup starts writing — see
+    # answerInstallMediaKeyPrompt for why continuing would be worse than not
+    # starting.
+    let keysSent = answerInstallMediaKeyPrompt(
+      qwaMonitorSocketPath(buildDir), buildDir / QwaBaseDiskName, qemuPid,
+      deadline, windowSec = spec.keyPressWindowSec)
+    if spec.keyPressWindowSec > 0 and keysSent == 0:
+      stderr.writeLine("[vm-harness] golden build: not one keypress reached " &
+        "the install boot's monitor at " & qwaMonitorSocketPath(buildDir) &
+        ". If the install never starts, that is why: cdboot.efi waits for a " &
+        "key it will never get.")
+
     if not b.waitForInstallSentinel(started.sshPort, deadline):
       raise goldenBuildFailure(buildDir,
         "the unattended install did not reach " & QwaInstallSentinelPath &
         " within " & $deadlineSec & "s. The sentinel is written by the LAST " &
         "FirstLogonCommand in autounattend.xml and only once sshd is " &
         "running, so a guest stuck at OOBE, a rejected answer file or a " &
-        "failed OpenSSH provisioning all land here.")
+        "failed OpenSSH provisioning all land here. Read serial.log FIRST: " &
+        "if it ends in \"failed to start Boot0001\" and an EFI shell prompt, " &
+        "Windows Setup never ran at all because cdboot.efi's keypress " &
+        "prompt went unanswered (" & $keysSent & " keypresses were " &
+        "delivered), not because the answer file is wrong.")
 
     let sysprep = b.runGuestSysprep(started.sshPort, spec.sysprepModeVm)
     if sysprep.exitCode != 0 and not transientSshFailure(sysprep):
       raise goldenBuildFailure(buildDir,
         "sysprep could not be launched in the guest (exit " &
         $sysprep.exitCode & "): " & sysprep.stdout & sysprep.stderr & ".")
+
+    if not b.sysprepTookHold(started.sshPort, qwaMonitorSocketPath(buildDir),
+                             qemuPid, deadline):
+      raise goldenBuildFailure(buildDir,
+        "sysprep was launched but was not running " &
+        $QwaSysprepTakeHoldSec & "s later, and the guest has not powered " &
+        "off. That is what a sysprep killed with the SSH session that " &
+        "started it looks like: it logs a few lines to " &
+        "C:\\Windows\\System32\\Sysprep\\Panther\\setupact.log, generalizes " &
+        "nothing, and leaves the build waiting for a power-off that can " &
+        "never come. Checked here so the failure costs seconds instead of " &
+        "the whole deadline.")
 
     if not waitForGuestPowerOff(qwaMonitorSocketPath(buildDir), qemuPid,
                                 deadline):
@@ -1404,13 +1789,23 @@ proc buildWindowsArmGolden*(b: QemuWindowsArmBackend,
       stopStartedProcess(swtpmPid)
 
   try:
-    result = finalizeGoldenDir(buildDir)
+    discard finalizeGoldenDir(buildDir)
   except VmHarnessError as e:
     raise goldenBuildFailure(buildDir, e.msg)
   discard writeGoldenManifest(GoldenManifestInputs(
     baseline: spec.baseline, buildDir: buildDir, diskGB: diskGB,
     windowsIso: spec.windowsIso, autounattendIso: spec.autounattendIso,
     recipeDir: spec.recipeDir))
+  # The manifest is the completion marker, so the build only claims to have
+  # produced a golden AFTER it has written one — and proves the result
+  # passes the same admission check the consuming path applies, rather than
+  # the weaker structural one finalizeGoldenDir uses internally.
+  try:
+    result = requireWindowsArmGolden(buildDir)
+  except ValueError as e:
+    raise goldenBuildFailure(buildDir,
+      "the golden build did not produce a directory the consuming path " &
+      "accepts: " & e.msg)
 
 method probeAvailability*(b: QemuWindowsArmBackend): bool =
   when defined(macosx):
@@ -1437,7 +1832,7 @@ method provisionBaseline*(b: QemuWindowsArmBackend, spec: BaselineSpec) =
   let source = if spec.sourceImage.len > 0: spec.sourceImage else: spec.name
   let baselineDir =
     try:
-      validateWindowsArmVmDir(source)
+      requireWindowsArmGolden(source)
     except ValueError as e:
       raise newVmHarnessError($b.id, lpProvisioning,
         "QemuWindowsArmBackend: " & e.msg)
@@ -1454,7 +1849,7 @@ method revertToBaseline*(b: QemuWindowsArmBackend, baselineName: string): VmHand
       b.baselines[baselineName]
     else:
       try:
-        validateWindowsArmVmDir(baselineName)
+        requireWindowsArmGolden(baselineName)
       except ValueError as e:
         raise newVmHarnessError($b.id, lpRevert,
           "QemuWindowsArmBackend: " & e.msg)
