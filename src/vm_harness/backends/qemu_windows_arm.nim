@@ -262,6 +262,13 @@ proc qwaDiskImagePath*(vmDir: string): string =
 proc pidAlive*(pid: int): bool =
   ## Best-effort liveness check. ``kill(pid, 0)`` succeeds while the process
   ## exists (or fails with EPERM, which still means it is alive).
+  ##
+  ## DO NOT "SIMPLIFY" THIS TO A ``ps`` PROBE. On macOS 26 (measured on m3,
+  ## 26.5.1 / 25F80) ``ps -p <pid>`` writes ``ps: time: requires entitlement``
+  ## and exits 1 for its default column set — even for a process that is very
+  ## much alive — so the idiomatic ``ps -p $pid >/dev/null 2>&1`` shell probe
+  ## reports EVERY pid dead on such a host. Asking for an explicit column
+  ## (``ps -p $pid -o pid=``) exits 0 again. ``kill(pid, 0)`` is unaffected.
   if pid <= 0:
     return false
   when defined(posix):

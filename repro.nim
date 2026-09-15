@@ -90,6 +90,12 @@ const posixTestSpecs: seq[VmHarnessTestSpec] = @[
   # scripts/run-host-tests.sh.
   VmHarnessTestSpec(source: "tests/unit/t_qemu_windows_arm_golden_build.nim",
     binary: "t_qemu_windows_arm_golden_build"),
+  # Runner-Fleet-M3-ARM-Wave MA7 (hygiene half) gate:
+  # t_m3_tart_orphan_dirs_reclaimed. POSIX-only: it stands its fake `tart` up
+  # as a shell script and redirects the process's real stdout fd to assert the
+  # CLI's own JSON report.
+  VmHarnessTestSpec(source: "tests/unit/t_m3_tart_orphan_dirs_reclaimed.nim",
+    binary: "t_m3_tart_orphan_dirs_reclaimed"),
 ]
 
 package vm_harness:

@@ -46,6 +46,13 @@ run_nim r --hints:off tests/unit/t_tart_backend.nim
 run_nim r --hints:off tests/unit/t_vmharness_image_is_honoured.nim
 run_nim r --hints:off tests/unit/t_lima_backend.nim
 run_nim r --hints:off tests/unit/t_prune.nim
+# Runner-Fleet-M3-ARM-Wave MA7 (hygiene half) gate:
+# t_m3_tart_orphan_dirs_reclaimed — `tart list` omits a VM with no disk.img,
+# so `tart delete` cannot address one and every CLI-driven reaper is blind to
+# it; m3 had leaked 600 such directories / 14.6 GiB. This gates the
+# filesystem sweep that reclaims them AND, mostly, that each of its four
+# guards independently spares a VM that is alive.
+run_nim r --hints:off tests/unit/t_m3_tart_orphan_dirs_reclaimed.nim
 run_nim r --hints:off tests/unit/t_layer_gc.nim
 run_nim r --hints:off tests/unit/t_design_reprobuild_adapter_section.nim
 run_nim r --hints:off tests/unit/t_uefi_iso_validator.nim

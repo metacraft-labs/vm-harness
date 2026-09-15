@@ -125,23 +125,31 @@ suite "prune: temp scratch files":
     check rep.removedTmpFiles.len == 0
 
 proc writeFakeTart(dir, stateFile: string): string =
-  ## A minimal ``tart`` that reports/deletes VM names from a state file.
+  ## A minimal ``tart`` that reports/deletes VMs from a state file. Each line
+  ## of the state file is ``<name> <state>``, matching the Name and State
+  ## columns of real ``tart list`` output — the run state is load-bearing for
+  ## the reap decision, so the fixture has to carry it rather than hard-code
+  ## one value for every VM.
   let script = dir / "fake-tart.sh"
   writeFile(script, """#!/bin/sh
 state="$FAKE_TART_STATE"
 case "$1" in
   list)
-    echo "Source Name State"
+    echo "Source Name Disk Size SizeOnDisk State"
     if [ -f "$state" ]; then
-      while IFS= read -r n; do
-        [ -n "$n" ] && echo "local $n running"
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        n=$(echo "$line" | awk '{print $1}')
+        s=$(echo "$line" | awk '{print $2}')
+        [ -n "$s" ] || s=stopped
+        echo "local $n 50 33 33 $s"
       done < "$state"
     fi
     ;;
   stop) : ;;
   delete)
     if [ -f "$state" ]; then
-      grep -vx "$2" "$state" > "$state.tmp" 2>/dev/null || true
+      grep -v "^$2 " "$state" > "$state.tmp" 2>/dev/null || true
       mv "$state.tmp" "$state" 2>/dev/null || true
     fi
     ;;
@@ -159,7 +167,10 @@ suite "prune: tart clones":
       let deadClone = Prefix & "-" & $OldEpochMs & "-" & $DeadPid
       let liveClone = Prefix & "-" & $OldEpochMs & "-" & $getCurrentProcessId()
       let otherClone = "unrelated-vm-" & $OldEpochMs & "-" & $DeadPid
-      writeFile(stateFile, deadClone & "\n" & liveClone & "\n" & otherClone & "\n")
+      writeFile(stateFile,
+        deadClone & " stopped\n" &
+        liveClone & " stopped\n" &
+        otherClone & " stopped\n")
 
       let tart = writeFakeTart(root, stateFile)
       putEnv("VMH_TART_CMD", tart)
@@ -178,5 +189,65 @@ suite "prune: tart clones":
       check deadClone notin remaining        # deleted via fake tart
       check liveClone in remaining           # preserved
       check otherClone in remaining          # out of scope
+    else:
+      skip()
+
+  test "a RUNNING clone is spared even when its creator PID is dead and old":
+    # The case PID + age alone cannot see. On m3 the creator PID in the name
+    # is the supervising `vm-harness run`, which normally lives for the whole
+    # job — but if it is SIGKILLed, the `tart run` it parented is reparented
+    # and the guest keeps serving its job. The name's PID is then dead and the
+    # age floor lapses, so only the run state `tart list` reports separates a
+    # live VM from residue.
+    when defined(posix):
+      let root = createTempDir("vmh-prune-tart-running-", "")
+      defer: removeDir(root)
+      let stateFile = root / "vms.txt"
+      let runningClone = Prefix & "-" & $OldEpochMs & "-" & $DeadPid
+      let stoppedClone = Prefix & "-" & $(OldEpochMs + 1) & "-" & $DeadPid
+      writeFile(stateFile,
+        runningClone & " running\n" & stoppedClone & " stopped\n")
+
+      let tart = writeFakeTart(root, stateFile)
+      putEnv("VMH_TART_CMD", tart)
+      putEnv("FAKE_TART_STATE", stateFile)
+      defer:
+        delEnv("VMH_TART_CMD")
+        delEnv("FAKE_TART_STATE")
+
+      let rep = runPrune(PruneScope(
+        ephemeralPrefix: Prefix, olderThanSec: 3600, backend: "tart"))
+
+      check runningClone in rep.liveTartClones
+      check runningClone notin rep.removedTartClones
+      check runningClone in readFile(stateFile)
+      # The converse, so "spare running" cannot pass by sparing everything.
+      check stoppedClone in rep.removedTartClones
+      check stoppedClone notin readFile(stateFile)
+    else:
+      skip()
+
+  test "an unreadable `tart list` reaps no clone at all":
+    when defined(posix):
+      let root = createTempDir("vmh-prune-tart-unreadable-", "")
+      defer: removeDir(root)
+      let stateFile = root / "vms.txt"
+      let clone = Prefix & "-" & $OldEpochMs & "-" & $DeadPid
+      writeFile(stateFile, clone & " stopped\n")
+      let tart = writeFakeTart(root, stateFile)
+      putEnv("VMH_TART_CMD", tart)
+      # Point the fake at a state file that does not exist AND make the
+      # command itself fail, which is what a missing/broken tart looks like.
+      putEnv("FAKE_TART_STATE", root / "missing.txt")
+      defer:
+        delEnv("VMH_TART_CMD")
+        delEnv("FAKE_TART_STATE")
+      # A `tart` that is not on the host at all: the strongest form.
+      putEnv("VMH_TART_CMD", root / "no-such-tart")
+
+      let rep = runPrune(PruneScope(
+        ephemeralPrefix: Prefix, olderThanSec: 3600, backend: "tart"))
+      check rep.removedTartClones.len == 0
+      check clone in readFile(stateFile)
     else:
       skip()

@@ -40,6 +40,12 @@ import ../auto
 # Backend type.
 
 type
+  TartVmListing* = object
+    ## One ``local`` row of ``tart list``: the VM name and the run state Tart
+    ## reports for it.
+    name*: string
+    state*: string
+
   TartSharedDir = object
     tag: string
     hostPath: string
@@ -95,6 +101,18 @@ const
   DefaultCirrusLabsPassword* = "admin"
   DefaultEphemeralPrefixMacos* = "repro-vm-tart-macos"
   DefaultEphemeralPrefixLinuxArm* = "repro-vm-tart-linux"
+  TartVmsSubdir* = "vms"
+    ## Tart stores each local VM as one directory under ``$TART_HOME/vms``.
+  TartVmDiskName* = "disk.img"
+    ## The guest disk inside a Tart VM directory. Its ABSENCE is what makes a
+    ## directory invisible to ``tart list`` — Tart computes the Disk /
+    ## SizeOnDisk columns from this file and silently omits a VM that has
+    ## none. Such a directory is therefore unreachable by ``tart delete`` and
+    ## by every reaper that enumerates through ``tart list``; see
+    ## ``pruneTartVmDirs`` in ../prune.nim, which is the only thing that can
+    ## reclaim it.
+  TartVmConfigName* = "config.json"
+    ## Tart's per-VM metadata file.
 
 when defined(macosx):
   const
@@ -104,6 +122,26 @@ else:
   const
     DefaultTartSshCmd* = "ssh"
     DefaultTartScpCmd* = "scp"
+
+proc tartHomeDir*(): string =
+  ## Where Tart keeps its state, by the same precedence Tart itself uses
+  ## plus the vm-harness override that ``newTartBackend`` promotes into
+  ## ``TART_HOME``:
+  ##   1. ``TART_HOME``            — Tart's own environment override;
+  ##   2. ``VM_HARNESS_TART_STATE_DIR`` — what the m3 runner host exports and
+  ##      what ``newTartBackend`` copies into ``TART_HOME``;
+  ##   3. ``~/.tart``              — Tart's default.
+  let tartHome = getEnv("TART_HOME")
+  if tartHome.len > 0:
+    return tartHome
+  let vmhState = getEnv("VM_HARNESS_TART_STATE_DIR")
+  if vmhState.len > 0:
+    return vmhState
+  getHomeDir() / ".tart"
+
+proc tartVmsDir*(): string =
+  ## The directory holding one sub-directory per LOCAL Tart VM.
+  tartHomeDir() / TartVmsSubdir
 
 proc defaultSharedDirs(guestOs: GuestOs): seq[TartSharedDir] =
   let nixStore = getEnv("MCL_RUNNER_SHARED_NIX_STORE")
@@ -280,24 +318,72 @@ proc runProcessCapture(cmd: seq[string], cwd: string = "",
 # ---------------------------------------------------------------------------
 # Tart CLI primitives.
 
-proc listTartVms*(b: TartBackend): seq[string] =
-  ## ``tart list`` and pull the ``Name`` column for ``local`` rows (the
-  ## ``OCI`` rows are golden images, not VMs the backend should touch).
-  ## Returns an empty seq on any failure — caller is responsible for
-  ## checking ``probeAvailability`` separately.
+proc tryListTartVmsDetailed*(b: TartBackend): Option[seq[TartVmListing]] =
+  ## ``tart list`` for ``local`` rows, keeping the RUN STATE alongside the
+  ## name, and distinguishing "Tart says there are no local VMs" from "Tart
+  ## could not be asked at all".
+  ##
+  ## Both distinctions are load-bearing for the reapers:
+  ##
+  ## * THE STATE is the liveness signal a Tart host can be held to. The
+  ##   creator PID embedded in an ephemeral's name is a WEAKER one: it is the
+  ##   supervising ``vm-harness run`` process (measured on m3 2026-09-15 it is
+  ##   alive for the whole job and is the parent of the ``tart run`` hosting
+  ##   the guest), so it is right on the ordinary path but silent about the
+  ##   case that matters — a supervisor SIGKILLed while the orphaned ``tart
+  ##   run`` keeps the guest going. The PID is then dead while the VM is still
+  ##   serving a job, and only the run state says so.
+  ## * READABILITY matters because ``listTartVms`` collapses "empty" and
+  ##   "failed" into one empty seq. That is safe for callers that only ever
+  ##   ADD work when a name comes back; it is not safe for a caller that
+  ##   treats absence from the listing as evidence that nothing owns a
+  ##   resource, because an unreadable listing then reads as "nothing is
+  ##   referenced" — the state in which every live VM looks like garbage.
   let r = runProcessCapture(@[b.tartCmd, "list"], timeoutSec = 30)
   if r.exitCode != 0:
-    return @[]
+    return none(seq[TartVmListing])
+  var rows: seq[TartVmListing] = @[]
   for line in r.stdout.splitLines():
     let stripped = line.strip()
     if stripped.len == 0 or stripped.startsWith("Source"):
       continue
-    # Columns are whitespace-separated; we want "local <name> ..." rows.
+    # Columns are whitespace-separated; we want "local <name> … <state>" rows.
     let parts = stripped.splitWhitespace()
     if parts.len < 2:
       continue
-    if parts[0].toLowerAscii == "local":
-      result.add(parts[1])
+    if parts[0].toLowerAscii != "local":
+      continue
+    # The state is the last column. On an older/narrower `tart list` that
+    # does not print one, `parts[^1]` is the name itself — which is NOT a
+    # known state, and `isRunning` below then answers "unknown", not "idle".
+    rows.add(TartVmListing(name: parts[1], state: parts[^1].toLowerAscii))
+  some(rows)
+
+proc isRunning*(row: TartVmListing): bool =
+  ## Whether Tart reports this VM as running. UNKNOWN states answer TRUE:
+  ## a reaper must not delete a VM whose state it cannot read, and a Tart
+  ## release that renames or drops the State column must fail toward sparing.
+  row.state notin ["stopped", "suspended"]
+
+proc tryListTartVms*(b: TartBackend): Option[seq[string]] =
+  ## Names only. See ``tryListTartVmsDetailed`` for what the ``Option``
+  ## distinguishes and why.
+  let rows = b.tryListTartVmsDetailed()
+  if rows.isNone:
+    return none(seq[string])
+  var names: seq[string] = @[]
+  for row in rows.get():
+    names.add(row.name)
+  some(names)
+
+proc listTartVms*(b: TartBackend): seq[string] =
+  ## ``tart list`` and pull the ``Name`` column for ``local`` rows (the
+  ## ``OCI`` rows are golden images, not VMs the backend should touch).
+  ## Returns an empty seq on any failure — caller is responsible for
+  ## checking ``probeAvailability`` separately. Use ``tryListTartVms`` when
+  ## the difference between "empty" and "unreadable" matters, and
+  ## ``tryListTartVmsDetailed`` when run state does.
+  b.tryListTartVms().get(@[])
 
 proc stopTartVm*(b: TartBackend, name: string) =
   ## ``tart stop <name>``. Never raises — a stopped VM returning non-zero
@@ -570,6 +656,19 @@ method provisionBaseline*(b: TartBackend, spec: BaselineSpec) =
   ##    ``stopAndCleanup`` so the matched-pair contract holds, but doing
   ##    it again here protects against the case where a previous run was
   ##    SIGKILL'd before the ``finally`` block could fire.
+  ##
+  ##    This reap enumerates through ``tart list`` and therefore CANNOT see a
+  ##    VM directory that has no ``disk.img`` — the residue of a clone that
+  ##    died between creating the directory and materialising the disk.
+  ##    Nothing driven through the Tart CLI can: ``tart delete`` cannot
+  ##    address a VM that ``tart list`` does not name. Those are reclaimed by
+  ##    ``prune``'s ``pruneTartVmDirs`` (../prune.nim), which walks the
+  ##    filesystem instead. It is deliberately NOT called from here: in
+  ##    production ``ephemeralPrefix`` is per-INSTANCE (the provider passes
+  ##    ``repro-vm-tart-<os>-<garm-instance-name>``), so a session-scoped
+  ##    sweep could only ever see its own leftovers, never the accumulated
+  ##    population. Reclaiming that needs the broader shared stem and a
+  ##    schedule, which is what the host's scheduled `vm-harness prune` is.
   if spec.sourceImage.len > 0:
     b.goldenImage = spec.sourceImage
   if "ephemeralPrefix" in spec.backendOptions:

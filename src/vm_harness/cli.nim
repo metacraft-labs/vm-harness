@@ -226,6 +226,13 @@ type
                                  ## identity lifetime (default 3600).
     hostId*: string              ## ``serve --host-id <name>`` — identity host
                                  ## label; default the OS hostname.
+    tartVmsDir*: string          ## ``--tart-vms-dir <dir>`` — ``prune`` scope
+                                 ## for Tart's local VM directory. Defaults to
+                                 ## ``$TART_HOME/vms`` (then
+                                 ## ``$VM_HARNESS_TART_STATE_DIR/vms``, then
+                                 ## ``~/.tart/vms``); naming it explicitly is
+                                 ## what a scheduled sweeper should do rather
+                                 ## than depend on its inherited environment.
 
 const HelpText = """
 vm-harness <subcommand> [flags]
@@ -300,12 +307,18 @@ Subcommands:
                           sparse and one number alone misstates it by orders
                           of magnitude.
   prune --ephemeral-prefix <p> [--backend all|tart|qemu-windows-arm]
-        [--state-dir <dir>] [--older-than <sec>] [--sweep-tmp] [--dry-run]
+        [--state-dir <dir>] [--tart-vms-dir <dir>] [--older-than <sec>]
+        [--sweep-tmp] [--dry-run]
                           Reclaim ephemeral instances/clones leaked by
                           hard-killed launchers, scoped to --ephemeral-prefix.
                           A running instance (advisory lock held, or creator
                           PID alive) is never removed. --older-than guards the
                           PID-fallback path (default 3600s; 0 disables).
+                          The tart sweep also reclaims VM directories that
+                          `tart list` cannot see because they carry no
+                          disk.img — `tart delete` cannot reach those, so
+                          nothing else can. --tart-vms-dir names Tart's VM
+                          directory explicitly (default $TART_HOME/vms).
                           --sweep-tmp also age-removes transient /tmp scratch
                           files (SSH password files, mount-share scripts).
                           --dry-run reports what would be reclaimed.
@@ -800,6 +813,8 @@ proc parseCliOpts*(args: seq[string]): CliOpts =
         raise newException(ValueError, "--identity-ttl-sec must be >= 0")
     of "--host-id":
       inc i; result.hostId = args[i]; inc i
+    of "--tart-vms-dir":
+      inc i; result.tartVmsDir = args[i]; inc i
     of "-h", "--help":
       result.subcommand = "help"
       inc i
@@ -1984,7 +1999,8 @@ proc cmdPrune(opts: CliOpts): int =
     olderThanSec: (if opts.olderThanSet: opts.olderThanSec else: DefaultPruneAgeSec),
     dryRun: opts.dryRun,
     backend: backend,
-    sweepTmp: opts.sweepTmp)
+    sweepTmp: opts.sweepTmp,
+    tartVmsDir: opts.tartVmsDir)
   let rep = runPrune(scope)
   let mib = rep.bytesReclaimed.float / (1024.0 * 1024.0)
   if opts.logFormat == lfJson:
@@ -1999,6 +2015,13 @@ proc cmdPrune(opts: CliOpts): int =
       "freshInstanceDirs": rep.freshInstanceDirs,
       "removedTartClones": rep.removedTartClones,
       "liveTartClones": rep.liveTartClones,
+      "removedTartVmDirs": rep.removedTartVmDirs,
+      "tartVmDirsListedByTart": rep.tartVmDirsListedByTart,
+      "tartVmDirsWithDisk": rep.tartVmDirsWithDisk,
+      "tartVmDirsOwnerAlive": rep.tartVmDirsOwnerAlive,
+      "freshTartVmDirs": rep.freshTartVmDirs,
+      "tartVmDirSweepAborted": rep.tartVmDirSweepAborted,
+      "tartVmDirSweepAbortReason": rep.tartVmDirSweepAbortReason,
       "removedTmpFiles": rep.removedTmpFiles,
       "bytesReclaimed": rep.bytesReclaimed})
   else:
@@ -2006,10 +2029,21 @@ proc cmdPrune(opts: CliOpts): int =
     echo &"vm-harness prune ({backend}, prefix '{opts.ephemeralPrefix}'): " &
          &"{verb} {rep.removedInstanceDirs.len} instance dir(s), " &
          &"{rep.removedTartClones.len} tart clone(s), " &
+         &"{rep.removedTartVmDirs.len} unlisted tart VM dir(s), " &
          &"{rep.removedTmpFiles.len} tmp file(s) " &
          &"(~{mib:.1f} MiB); kept {rep.liveInstanceDirs.len} live + " &
          &"{rep.freshInstanceDirs.len} fresh instance dir(s), " &
-         &"{rep.liveTartClones.len} live tart clone(s)."
+         &"{rep.liveTartClones.len} live tart clone(s), " &
+         &"{rep.tartVmDirsListedByTart.len} listed + " &
+         &"{rep.tartVmDirsWithDisk.len} disk-bearing + " &
+         &"{rep.tartVmDirsOwnerAlive.len} owner-alive + " &
+         &"{rep.freshTartVmDirs.len} fresh tart VM dir(s)."
+    if rep.tartVmDirSweepAborted:
+      # Never silent: a sweep that refused to run must say so, or a host
+      # whose `tart list` has been broken for weeks looks like a clean host.
+      stderr.writeLine(
+        "vm-harness prune: the unlisted-tart-VM-directory sweep was SKIPPED " &
+        "— " & rep.tartVmDirSweepAbortReason)
   0
 
 proc cmdLayer(opts: CliOpts): int =
