@@ -173,6 +173,55 @@ const
     ## The checked-in recipe inputs whose digests go into a golden's
     ## manifest. Together with the ISO hash they are what makes a golden of
     ## unknown provenance identifiable as one.
+  QwaSerialLogName* = "serial.log"
+    ## The guest serial console, as ``qwaMachineArgs`` names it. Watched for
+    ## progress as well as read for diagnosis — see ``GuestProgressWatch``.
+  QwaInstallFreezeSec* = 600
+    ## How long the guest's serial console AND the target qcow2 may both stay
+    ## byte-for-byte unchanged before the install is declared FROZEN rather
+    ## than slow. MEASURED on m3 2026-09-15: two of five runs stopped dead in
+    ## the firmware on a boot after Setup's first reboot and then sat there —
+    ## one with the serial log frozen for 23 minutes and the disk for 30 —
+    ## while the build waited out its 90-minute deadline having done nothing.
+    ##
+    ## Both signals are needed and neither alone would do. Windows says
+    ## nothing on the serial port once the firmware hands over, so a healthy
+    ## guest has a static serial log for most of the install; and Windows
+    ## Setup has long phases (the ~8 minutes ``Add-WindowsCapability
+    ## OpenSSH.Server`` takes on its own) with no qcow2 growth at all. Ten
+    ## minutes of BOTH being still is not a phase this install has.
+  QwaInstallMaxPowerCycles* = 2
+    ## How many times a frozen install may be power-cycled before the build
+    ## gives up.
+    ##
+    ## WHAT THE FREEZE ACTUALLY IS, measured on m3 2026-09-15 with the
+    ## framebuffer dump ``captureGuestScreen`` added for it: the screen shows
+    ## the TianoCore splash with the caption ``Start boot option`` and a
+    ## progress bar at 0%. That caption is
+    ## ``PlatformBootManagerWaitCallback``'s, and ``BdsDxe``'s ``BdsWait``
+    ## calls it ONCE PER SECOND off a one-second DXE timer event. One call and
+    ## no more means the timer never fired again: the guest's firmware is
+    ## blocked in ``gBS->WaitForEvent`` on a timer that has stopped, which is
+    ## also why the PC sits forever in the DXE core's event-wait loop. It is
+    ## NOT the USB/xHCI stack (the earlier reading), and it is not storage:
+    ## the freeze survived moving the answer-file CD off the xHCI entirely.
+    ## Nothing inside the guest can recover from it — injected keypresses do
+    ## nothing, because EDK2 polls the USB keyboard from that same dead timer.
+    ##
+    ## So a power cycle, and not the alternatives, both of which were tried
+    ## and measured: a ``system_reset`` on the monitor does NOT clear it (the
+    ## boot after it stalls at the same point), and twelve injected
+    ## ``sendkey ret`` presses moved the PC once and changed nothing else.
+    ## Stopping QEMU and starting it again on the same disk DOES clear it —
+    ## verified twice, once against a copy of a frozen run's disk and once
+    ## against a live frozen build, which resumed, booted Windows Boot
+    ## Manager and went on writing.
+  QwaPowerCycleSwtpmAttempts* = 3
+    ## ``startSwtpmInBackground`` gives itself 3 seconds to create its socket,
+    ## which `:status8b:` already flagged as thin on a host that also serves
+    ## CI. A power cycle has to restart swtpm as well as QEMU, so it inherits
+    ## that bound; retrying is cheaper than failing a build an hour in on a
+    ## process start.
 
 type
   PortAllocationLock* = object
@@ -543,8 +592,45 @@ proc buildQemuWindowsArmInstallArgs*(vmDir, windowsIso, autounattendIso: string,
   ## * ``-no-reboot`` is omitted. Windows setup reboots several times between
   ##   media boot and OOBE, and exiting on the first one leaves a half
   ##   installed disk that looks like a hung build.
-  ## * Both ISOs are attached over xHCI, since the aarch64 ``virt`` machine
-  ##   has no built-in USB or IDE controller to hang a CD-ROM off.
+  ## * The two ISOs are attached to DIFFERENT controllers, and which one each
+  ##   gets is measured rather than a matter of taste. MEASURED on m3
+  ##   2026-09-15: with BOTH on the xHCI as ``usb-storage``, two of five runs
+  ##   FROZE in the firmware on a boot after Setup's first reboot, the serial
+  ##   log ending on exactly the two ``UsbBootExecCmd: Success to Exec 0x0
+  ##   Cmd`` lines ``UsbMassStorageDxe`` emits — one per CD-ROM — and never
+  ##   reaching a boot option. EDK2 re-enumerates and re-reads the media on
+  ##   EVERY boot and the install needs three of them, so a per-boot hazard is
+  ##   a per-build one.
+  ##
+  ##   The install ISO HAS to stay on USB. The choice is pinned from both
+  ##   ends, and both ends were checked on m3:
+  ##
+  ##   - the firmware must boot ``\EFI\BOOT\BOOTAA64.EFI`` off it, and this
+  ##     EDK2 (``edk2-stable202408``, the ArmVirtQemu build QEMU ships) has no
+  ##     ATA/AHCI driver at all. MEASURED: with the install ISO on
+  ##     ``ich9-ahci`` the firmware created no boot option for it whatsoever —
+  ##     ``BdsDxe`` went straight from the empty NVMe disk to the EFI shell.
+  ##   - Windows Setup must read ``install.wim`` off it in WinPE, which rules
+  ##     out the ``virtio-scsi`` the design notes suggested first. VERIFIED
+  ##     against ``Win11_25H2_English_Arm64_v2.iso``: ``sources/boot.wim``
+  ##     carries ``storahci.sys``, ``stornvme.sys``, ``USBSTOR.SYS`` and
+  ##     ``uaspstor.sys`` but NEITHER ``vioscsi.sys`` nor ``viostor.sys``.
+  ##     virtio-scsi would have booted in the firmware and then left Setup
+  ##     with no media.
+  ##
+  ##   The answer-file ISO is a different question, because nothing needs to
+  ##   BOOT it — only Windows needs to read it, in the specialize and
+  ##   oobeSystem passes, by drive letter. So it goes on ``ich9-ahci``, whose
+  ##   invisibility to this firmware is the point: ``storahci.sys`` is in
+  ##   ``boot.wim`` and ``install.wim`` both, so Windows sees an ordinary
+  ##   removable CD-ROM, while the firmware never touches it. MEASURED on m3:
+  ##   this halves the firmware's USB mass-storage work, from two
+  ##   ``UsbBootExecCmd`` lines per boot to one.
+  ##
+  ##   This shrinks the hazard rather than removing it — one USB CD-ROM is
+  ##   still enumerated on every boot. The recovery for the residual case is
+  ##   ``watchGuestProgress``/``QwaInstallFreezeSec``, which power-cycles a
+  ##   guest whose serial log and target disk have both stopped moving.
   ## * The install media takes boot priority and the target disk goes last,
   ##   so the firmware boots the ISO while the empty NVMe disk is still
   ##   unbootable, and prefers the disk once Windows is installed on it.
@@ -554,6 +640,7 @@ proc buildQemuWindowsArmInstallArgs*(vmDir, windowsIso, autounattendIso: string,
   ##   before handing over to Windows Setup. See ``QwaInstallMediaKey`` and
   ##   ``answerInstallMediaKeyPrompt`` — the key itself is injected through
   ##   the monitor socket, but there has to be a keyboard for it to arrive on.
+  ##   This is the only reason the xHCI is still here at all.
   result = qwaMachineArgs(vmDir, vmDir / QwaBaseDiskName, sshPort, cpus,
                           memoryMB, diskBootIndex = 2)
   result.add(@[
@@ -561,8 +648,9 @@ proc buildQemuWindowsArmInstallArgs*(vmDir, windowsIso, autounattendIso: string,
     "-device", "usb-kbd,bus=usb.0",
     "-drive", "id=installcd,file=" & windowsIso & ",media=cdrom,readonly=on,if=none",
     "-device", "usb-storage,bus=usb.0,drive=installcd,bootindex=0",
+    "-device", "ich9-ahci,id=sata",
     "-drive", "id=unattendcd,file=" & autounattendIso & ",media=cdrom,readonly=on,if=none",
-    "-device", "usb-storage,bus=usb.0,drive=unattendcd,bootindex=1"
+    "-device", "ide-cd,bus=sata.0,drive=unattendcd,bootindex=1"
   ])
   result.add(qemuFirmwareArgs(vmDir))
 
@@ -1118,6 +1206,54 @@ proc goldenDiskProgressed*(diskPath: string,
   except CatchableError:
     false
 
+type
+  GuestProgressWatch* = object
+    ## Two sizes and a timestamp: everything the harness can see of a headless
+    ## Windows guest's liveness from outside it.
+    serialPath*: string
+    diskPath*: string
+    serialSize*: int64
+    diskSize*: int64
+    lastProgress*: float
+      ## ``epochTime`` of the last sample at which EITHER size differed from
+      ## the one before it.
+
+proc fileSizeOrZero(path: string): int64 =
+  try: getFileSize(path)
+  except CatchableError: 0
+
+proc newGuestProgressWatch*(serialPath, diskPath: string,
+                            now: float = epochTime()): GuestProgressWatch =
+  GuestProgressWatch(serialPath: serialPath, diskPath: diskPath,
+                     serialSize: fileSizeOrZero(serialPath),
+                     diskSize: fileSizeOrZero(diskPath),
+                     lastProgress: now)
+
+proc observeGuestProgress*(w: var GuestProgressWatch,
+                           now: float = epochTime()): bool =
+  ## Take one sample. Returns true when the guest moved — either it said
+  ## something on the serial console or it wrote to the target disk — and
+  ## resets the stall clock when it did.
+  let serialSize = fileSizeOrZero(w.serialPath)
+  let diskSize = fileSizeOrZero(w.diskPath)
+  result = serialSize != w.serialSize or diskSize != w.diskSize
+  w.serialSize = serialSize
+  w.diskSize = diskSize
+  if result:
+    w.lastProgress = now
+
+proc guestStalledSec*(w: GuestProgressWatch,
+                      now: float = epochTime()): float =
+  max(0.0, now - w.lastProgress)
+
+proc guestFrozen*(w: GuestProgressWatch, freezeSec: int = QwaInstallFreezeSec,
+                  now: float = epochTime()): bool =
+  ## A freeze is a POSITIVE observation, not the absence of one: both signals
+  ## have to have been still for longer than any phase of this install is.
+  ## ``freezeSec <= 0`` disables the watchdog, which is what a test that wants
+  ## to prove the install is what finishes the build asks for.
+  freezeSec > 0 and guestStalledSec(w, now) >= freezeSec.float
+
 proc monitorTextSaysPoweredOff*(text: string): bool =
   ## Read a QEMU monitor ``info status`` reply.
   ##
@@ -1235,6 +1371,50 @@ proc waitForInstallSentinel*(b: QemuWindowsArmBackend, port: int,
       return true
     if not sleepUntilNextPoll(deadline, pollMs):
       return false
+
+proc waitForInstallSentinelWatched*(serialPath, diskPath: string,
+                                    deadline: float,
+                                    sentinelPresent: proc (): bool,
+                                    powerCycle: proc (),
+                                    freezeSec: int = QwaInstallFreezeSec,
+                                    maxPowerCycles: int = QwaInstallMaxPowerCycles,
+                                    pollMs: int = QwaSentinelPollMs):
+                                    tuple[ok: bool, powerCycles: int] =
+  ## ``waitForInstallSentinel`` with a freeze watchdog around it.
+  ##
+  ## The plain wait cannot tell a long Windows Setup phase from a guest that
+  ## has stopped executing, so on m3 it spent the whole 90-minute deadline
+  ## twice on installs that were already dead in the firmware. This one keeps
+  ## the same "the sentinel is the only success" contract and adds ONE
+  ## recovery: when the serial console and the target disk have both been
+  ## still for ``freezeSec``, power-cycle the guest and start the stall clock
+  ## again, up to ``maxPowerCycles`` times.
+  ##
+  ## The recovery is a power cycle rather than a ``system_reset`` because
+  ## that is what was measured to work; see ``QwaInstallMaxPowerCycles``. It
+  ## is a MITIGATION and is deliberately shaped like one: it does not pretend
+  ## to know why the guest stopped, it bounds how long the build pays for it,
+  ## and exhausting the allowance still fails the build rather than promoting
+  ## a half-installed disk.
+  ##
+  ## Callback-shaped so the unit tier can drive every branch — a frozen
+  ## guest, a recovery that works, and an allowance that runs out — without
+  ## a real Windows install.
+  var watch = newGuestProgressWatch(serialPath, diskPath)
+  result = (ok: false, powerCycles: 0)
+  while true:
+    if sentinelPresent():
+      result.ok = true
+      return
+    discard observeGuestProgress(watch)
+    if guestFrozen(watch, freezeSec):
+      if result.powerCycles >= maxPowerCycles:
+        return
+      powerCycle()
+      inc result.powerCycles
+      watch = newGuestProgressWatch(serialPath, diskPath)
+    if not sleepUntilNextPoll(deadline, pollMs):
+      return
 
 proc buildSysprepCommand*(modeVm: bool = true): seq[string] =
   ## ``/generalize`` is load-bearing and must never be dropped: without it
@@ -1443,7 +1623,7 @@ proc finalizeGoldenDir*(buildDir: string): string =
   try: removeFile(buildDir / "tpm" / ".lock")
   except CatchableError: discard
   for a in buildQemuWindowsArmArgs(buildDir, 0):
-    if "media=cdrom" in a or "usb-storage" in a:
+    if "media=cdrom" in a or "usb-storage" in a or "ide-cd" in a:
       raise newVmHarnessError($biQemuWindowsArm, lpProvisioning,
         "the golden at " & buildDir & " would still boot with install " &
         "media attached (" & a & "). The ISOs are build inputs and are not " &
@@ -1594,6 +1774,16 @@ type
       ## ``answerInstallMediaKeyPrompt``; 0 disables it, which is only ever
       ## right for a test that wants to prove the prompt is what stalls a
       ## headless install.
+    freezeSec*: int
+      ## How long the guest may be wholly still before the install is
+      ## declared frozen and power-cycled. Defaults to
+      ## ``QwaInstallFreezeSec``; 0 disables the watchdog. Settable for the
+      ## same reason ``keyPressWindowSec`` is: the unit tier has to be able
+      ## to drive the recovery without waiting ten real minutes for it.
+    maxPowerCycles*: int
+      ## Defaults to ``QwaInstallMaxPowerCycles``. Negative is treated as 0,
+      ## so "no recovery" is expressible and "the default" is not silently
+      ## reinstated over an operator's zero.
 
 proc newGoldenBuildSpec*(buildDir, windowsIso, autounattendIso: string,
                          baseline = "win-arm-runner",
@@ -1602,14 +1792,17 @@ proc newGoldenBuildSpec*(buildDir, windowsIso, autounattendIso: string,
                          cpus = 4, memoryMB = 8192,
                          deadlineSec = QwaDefaultGoldenDeadlineSec,
                          sysprepModeVm = true,
-                         keyPressWindowSec = QwaInstallKeyPressWindowSec):
+                         keyPressWindowSec = QwaInstallKeyPressWindowSec,
+                         freezeSec = QwaInstallFreezeSec,
+                         maxPowerCycles = QwaInstallMaxPowerCycles):
                          GoldenBuildSpec =
   GoldenBuildSpec(buildDir: buildDir, baseline: baseline,
                   windowsIso: windowsIso, autounattendIso: autounattendIso,
                   recipeDir: recipeDir, diskGB: diskGB, cpus: cpus,
                   memoryMB: memoryMB, deadlineSec: deadlineSec,
                   sysprepModeVm: sysprepModeVm,
-                  keyPressWindowSec: keyPressWindowSec)
+                  keyPressWindowSec: keyPressWindowSec,
+                  freezeSec: freezeSec, maxPowerCycles: maxPowerCycles)
 
 const QwaGoldenScreenshotName* = "screen.ppm"
   ## Where a failed golden build dumps the guest's framebuffer. The design
@@ -1719,13 +1912,13 @@ proc buildWindowsArmGolden*(b: QemuWindowsArmBackend,
   var qemuPid = 0
   try:
     swtpmPid = b.startSwtpmInBackground(buildDir)
+    let installArgs = proc (port: int): seq[string] =
+      buildQemuWindowsArmInstallArgs(buildDir, spec.windowsIso,
+                                     spec.autounattendIso, port,
+                                     cpus, memoryMB)
     var started: tuple[sshPort: int, pid: int]
     try:
-      started = b.startQemuWithAllocatedPortUsing(buildDir,
-        proc (port: int): seq[string] =
-          buildQemuWindowsArmInstallArgs(buildDir, spec.windowsIso,
-                                         spec.autounattendIso, port,
-                                         cpus, memoryMB))
+      started = b.startQemuWithAllocatedPortUsing(buildDir, installArgs)
     except CatchableError as e:
       raise goldenBuildFailure(buildDir,
         "the golden install boot did not start: " & e.msg & ".")
@@ -1745,12 +1938,57 @@ proc buildWindowsArmGolden*(b: QemuWindowsArmBackend,
         ". If the install never starts, that is why: cdboot.efi waits for a " &
         "key it will never get.")
 
-    if not b.waitForInstallSentinel(started.sshPort, deadline):
+    # Wait for the sentinel, and power-cycle a guest that has stopped
+    # executing rather than spending the whole deadline on it. The restart
+    # reuses the SAME forwarded port, so every later phase keeps working
+    # against started.sshPort.
+    let watched = waitForInstallSentinelWatched(
+      buildDir / QwaSerialLogName, buildDir / QwaBaseDiskName, deadline,
+      sentinelPresent = proc (): bool =
+        b.installSentinelPresent(started.sshPort),
+      powerCycle = proc () =
+        stderr.writeLine("[vm-harness] golden build: the guest's serial " &
+          "console and " & QwaBaseDiskName & " have both been unchanged for " &
+          $spec.freezeSec & "s. Power-cycling it; see " &
+          "QwaInstallFreezeSec for why that is a recovery and not a guess.")
+        # QEMU first, and swtpm SECOND but not optionally: `swtpm socket`
+        # exits when its client disconnects, so by the time QEMU is gone the
+        # TPM socket is gone with it — MEASURED on m3, a restart that brought
+        # QEMU back alone died on `Failed to connect to
+        # /tmp/vmh-qwa-tpm-....sock: No such file or directory`. A Windows 11
+        # guest will not boot without the TPM, so this is not salvage, it is
+        # part of the power cycle.
+        if qemuPid > 0:
+          stopStartedProcess(qemuPid)
+          qemuPid = 0
+        if swtpmPid > 0:
+          stopStartedProcess(swtpmPid)
+          swtpmPid = 0
+        for attempt in 1 .. QwaPowerCycleSwtpmAttempts:
+          try:
+            swtpmPid = b.startSwtpmInBackground(buildDir)
+            break
+          except CatchableError as e:
+            stderr.writeLine("[vm-harness] golden build: swtpm did not come " &
+              "back on power-cycle attempt " & $attempt & " of " &
+              $QwaPowerCycleSwtpmAttempts & ": " & e.msg)
+            if attempt == QwaPowerCycleSwtpmAttempts:
+              raise
+        qemuPid = b.startQemuArgvInBackground(buildDir,
+                                              installArgs(started.sshPort)),
+      freezeSec = spec.freezeSec,
+      maxPowerCycles = max(0, spec.maxPowerCycles))
+    if watched.powerCycles > 0:
+      stderr.writeLine("[vm-harness] golden build: the install needed " &
+        $watched.powerCycles & " power cycle(s) to get past a frozen guest.")
+    if not watched.ok:
       raise goldenBuildFailure(buildDir,
         "the unattended install did not reach " & QwaInstallSentinelPath &
-        " within " & $deadlineSec & "s. The sentinel is written by the LAST " &
-        "FirstLogonCommand in autounattend.xml and only once sshd is " &
-        "running, so a guest stuck at OOBE, a rejected answer file or a " &
+        " within " & $deadlineSec & "s (" & $watched.powerCycles &
+        " power cycle(s) were spent on a frozen guest, of " &
+        $max(0, spec.maxPowerCycles) & " allowed). The sentinel is written by " &
+        "the LAST FirstLogonCommand in autounattend.xml and only once sshd " &
+        "is running, so a guest stuck at OOBE, a rejected answer file or a " &
         "failed OpenSSH provisioning all land here. Read serial.log FIRST: " &
         "if it ends in \"failed to start Boot0001\" and an EFI shell prompt, " &
         "Windows Setup never ran at all because cdboot.efi's keypress " &

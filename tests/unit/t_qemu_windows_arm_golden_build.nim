@@ -17,8 +17,10 @@
 ##
 ## WHAT IS ASSERTED HERE, and why each is a regression of a real hazard:
 ##
-##  1. The install boot attaches both ISOs over xHCI, orders the install media
-##     ahead of the still-empty target disk, and omits ``-no-reboot``.
+##  1. The install boot attaches the Windows ISO over xHCI and the answer-file
+##     ISO on ``ich9-ahci`` (each is pinned to the controller it HAS to be on —
+##     see ``buildQemuWindowsArmInstallArgs``), orders the install media ahead
+##     of the still-empty target disk, and omits ``-no-reboot``.
 ##  2. A build into a directory already holding a golden is REFUSED — qcow2
 ##     does not verify a backing file, so rebuilding in place corrupts every
 ##     live overlay with no error anywhere.
@@ -71,6 +73,9 @@ const
   FakeSshDirEnv = "VMH_GOLDEN_FAKE_SSH_DIR"
   PowerOffFlagName = ".fake-poweroff"
   MonitorLogName = ".fake-monitor-commands"
+  FakeFreezeEnv = "VMH_GOLDEN_FAKE_QEMU_FREEZE_FIRST_BOOT"
+  FakeBootCountName = ".fake-boots"
+  FakeSwtpmLogEnv = "VMH_GOLDEN_FAKE_SWTPM_LOG"
 
 proc argValue(flag: string): string =
   for i in 1 ..< paramCount():
@@ -110,6 +115,22 @@ proc maybeRunFakeQemu() =
   ## the fake sshpass creates when it is handed the sysprep command.
   if getEnv(FakeQemuEnv) != "1":
     return
+  if getEnv(FakeFreezeEnv) == "1":
+    # A guest that FREEZES on its first boot and installs on its second.
+    #
+    # This is the only shape in which the freeze watchdog can be driven end
+    # to end: on the first boot this fake writes the serial log once and then
+    # goes quiet for good, which is exactly the signature the two frozen
+    # host runs had (serial log still for 23 minutes, target disk for 30).
+    # It writes the install sentinel only on a LATER boot, so nothing but a
+    # real power cycle can make the build succeed.
+    let bootFlag = getCurrentDir() / FakeBootCountName
+    if fileExists(bootFlag):
+      let sshDir = getEnv(FakeSshDirEnv)
+      if sshDir.len > 0:
+        writeFile(sshDir / "sentinel", "")
+    else:
+      writeFile(bootFlag, "first boot\n")
   let serialArg = argStartingWith("file:")
   if serialArg.len > 0:
     writeFile(serialArg["file:".len .. ^1],
@@ -119,7 +140,20 @@ proc maybeRunFakeQemu() =
     writeFile(qemuLog, "fake qemu log\n")
 
   var listener = newSocket()
-  listener.bindAddr(Port(fakeQemuForwardedPort()), "127.0.0.1")
+  listener.setSockOpt(OptReuseAddr, true)
+  # A power cycle restarts this fake on the SAME forwarded port the previous
+  # incarnation had just released, so the bind is retried rather than taken
+  # for granted; a fake that died here would look like a guest that never
+  # came back.
+  block bindPort:
+    for attempt in 1 .. 40:
+      try:
+        listener.bindAddr(Port(fakeQemuForwardedPort()), "127.0.0.1")
+        break bindPort
+      except OSError:
+        if attempt == 40:
+          raise
+        sleep(100)
   listener.listen()
 
   let monitorArg = argStartingWith("unix:")
@@ -232,13 +266,19 @@ proc repoRoot(): string =
 
 proc writeFakeSwtpm(path: string) =
   ## Creates the control socket ``startSwtpmInBackground`` waits for, then
-  ## stays alive as the real one does.
+  ## stays alive as the real one does. Records every start in
+  ## ``$VMH_GOLDEN_FAKE_SWTPM_LOG`` when that is set, because a power cycle
+  ## has to bring swtpm back as well as QEMU and "it was started twice" is
+  ## the only way to see that from outside.
   writeExecutable(path, """#!/bin/sh
 for a in "$@"; do
   case "$a" in
     type=unixio,path=*) : > "${a#type=unixio,path=}" ;;
   esac
 done
+if [ -n "${VMH_GOLDEN_FAKE_SWTPM_LOG:-}" ]; then
+  printf 'started %s\n' "$*" >> "$VMH_GOLDEN_FAKE_SWTPM_LOG"
+fi
 sleep 120
 """)
 
@@ -318,11 +358,41 @@ suite "QemuWindowsArmBackend golden build":
     # empty at this point, so anything else leaves the firmware with nothing
     # bootable.
     check "usb-storage,bus=usb.0,drive=installcd,bootindex=0" in args
-    check "usb-storage,bus=usb.0,drive=unattendcd,bootindex=1" in args
+    check "ide-cd,bus=sata.0,drive=unattendcd,bootindex=1" in args
     check "nvme,drive=disk0,serial=winarm0,bootindex=2" in args
 
-    # aarch64 virt has no built-in USB or IDE controller to hang a CD off.
+    # The two ISOs go on DIFFERENT controllers, and the split is measured.
+    #
+    # MEASURED on m3 2026-09-15: with BOTH CD-ROMs on the xHCI as
+    # usb-storage, two of five runs froze in the firmware on a boot after
+    # Setup's first reboot, the serial log ending on exactly the two
+    # `UsbBootExecCmd: Success to Exec 0x0 Cmd` lines UsbMassStorageDxe emits
+    # — one per CD-ROM — without ever reaching a boot option. EDK2
+    # re-enumerates the media on every boot and the install needs three, so a
+    # per-boot hazard is a per-build one.
+    #
+    # The install ISO cannot move: it is the one the firmware has to boot,
+    # and this EDK2 (edk2-stable202408, the ArmVirtQemu build QEMU ships) has
+    # no ATA/AHCI driver — MEASURED, with the install ISO on ich9-ahci the
+    # firmware created no boot option for it at all and dropped to the EFI
+    # shell. Nor can it go on virtio-scsi, which the firmware CAN boot:
+    # Win11 ARM64's sources/boot.wim carries storahci.sys and USBSTOR.SYS but
+    # neither vioscsi.sys nor viostor.sys, so WinPE would have no way to read
+    # install.wim.
     check "qemu-xhci,id=usb" in args
+
+    # The answer-file ISO CAN move, because nothing boots it — Windows reads
+    # it by drive letter in the specialize and oobeSystem passes, and
+    # storahci.sys is inbox in both boot.wim and install.wim. Its being
+    # invisible to the firmware is the whole point.
+    check "ich9-ahci,id=sata" in args
+    check args.countIt("usb-storage" in it) == 1
+    # Controllers have to precede the devices that name their buses: a drive
+    # on a bus QEMU has not created yet is a startup failure, not a warning.
+    check args.find("ich9-ahci,id=sata") <
+          args.find("ide-cd,bus=sata.0,drive=unattendcd,bootindex=1")
+    check args.find("qemu-xhci,id=usb") <
+          args.find("usb-storage,bus=usb.0,drive=installcd,bootindex=0")
 
     # A KEYBOARD. MEASURED on m3 2026-09-15: without one the install cannot
     # start. \EFI\BOOT\BOOTAA64.EFI on a Windows install ISO is cdboot.efi,
@@ -355,6 +425,18 @@ suite "QemuWindowsArmBackend golden build":
     check args.anyIt(it.startsWith("file:") and it.endsWith("serial.log"))
 
   test "the per-job boot keeps -no-reboot and its own boot order":
+    ## WARNING, ADDED IN REVIEW 2026-09-15: the ``-no-reboot`` assertion below
+    ## PINS A DEFECT, and is left in place only because changing the deployed
+    ## per-job argv is not this slice's to make. MEASURED on m3 against the
+    ## real golden: a ``/generalize``d image reboots once between its
+    ## specialize and oobeSystem passes (``repro-sysprep.xml``, and the recipe
+    ## README §7 says so), ``sshd`` is started by the FirstLogonCommands that
+    ## run AFTER that reboot, so ``-no-reboot`` makes QEMU exit rc=0 at ~38s
+    ## and ``revertToBaseline`` NEVER reaches SSH. Removing ``-no-reboot`` and
+    ## changing nothing else reached SSH in 67s on the same golden. So this
+    ## file's argv assertions say the vector is UNCHANGED; they do not and
+    ## cannot say it is CORRECT. See "Open: the per-job boot cannot boot a
+    ## generalized golden" in docs/windows-arm-headless-golden.md.
     let tmp = createTempDir("vmh-qemu-win-arm-runargv-", "")
     defer: removeDir(tmp)
     writeFile(tmp / "windows.qcow2", "")
@@ -368,6 +450,12 @@ suite "QemuWindowsArmBackend golden build":
     # leak into the per-job shape that every CI job boots.
     check not args.anyIt("usb-kbd" in it)
     check not args.anyIt("qemu-xhci" in it)
+    # Nor the install boot's AHCI CD-ROM controller. A golden carries no
+    # install media, so a SATA controller on the per-job boot is either dead
+    # weight or a sign the run path grew a dependency on the build inputs.
+    check not args.anyIt("ich9-ahci" in it)
+    check not args.anyIt("ide-cd" in it)
+    check not args.anyIt("sata" in it)
 
   test "a golden build refuses to overwrite an existing golden":
     let tmp = createTempDir("vmh-qemu-win-arm-guard-", "")
@@ -774,6 +862,164 @@ suite "Golden build: the install wait":
     for p in probes:
       check QwaInstallSentinelPath in p
 
+suite "Golden build: the freeze watchdog":
+  ## MA4's fourth and fifth host runs: the guest stopped dead in the firmware
+  ## on a boot after Windows Setup's first reboot — serial log frozen for 23
+  ## minutes, target qcow2 for 30 — and the build spent its whole 90-minute
+  ## deadline waiting for a sentinel from a guest that was no longer
+  ## executing. Nothing in the harness could tell that from a slow install,
+  ## because it was not looking.
+
+  test "a guest that writes to either surface is not stalled":
+    let tmp = createTempDir("vmh-qwa-progress-", "")
+    defer: removeDir(tmp)
+    let serial = tmp / "serial.log"
+    let disk = tmp / "windows.qcow2"
+    writeFile(serial, "boot\n")
+    writeFile(disk, "x")
+    var w = newGuestProgressWatch(serial, disk, now = 1000.0)
+    # Nothing moved: the stall clock keeps running.
+    check not observeGuestProgress(w, now = 1100.0)
+    check guestStalledSec(w, now = 1100.0) == 100.0
+
+    # The serial console alone is enough, and it resets the clock.
+    writeFile(serial, "boot\nmore firmware chatter\n")
+    check observeGuestProgress(w, now = 1200.0)
+    check guestStalledSec(w, now = 1200.0) == 0.0
+
+    # So is the target disk alone. Windows says nothing on the serial port
+    # once the firmware hands over, so for most of a healthy install this is
+    # the ONLY signal there is — which is exactly why both are watched.
+    writeFile(disk, "xxxxxxxx")
+    check observeGuestProgress(w, now = 1300.0)
+    check guestStalledSec(w, now = 1300.0) == 0.0
+
+  test "a freeze is both surfaces still, past a bound, and nothing less":
+    let tmp = createTempDir("vmh-qwa-frozen-", "")
+    defer: removeDir(tmp)
+    let serial = tmp / "serial.log"
+    let disk = tmp / "windows.qcow2"
+    writeFile(serial, "")
+    writeFile(disk, "")
+    var w = newGuestProgressWatch(serial, disk, now = 0.0)
+    discard observeGuestProgress(w, now = 100.0)
+    # Under the bound is not a freeze. Windows Setup has phases longer than
+    # this with no disk growth at all -- Add-WindowsCapability
+    # OpenSSH.Server took eight minutes on its own on m3.
+    check not guestFrozen(w, freezeSec = 600, now = 599.0)
+    check guestFrozen(w, freezeSec = 600, now = 600.0)
+    # A missing file is not a freeze signal of its own: it reads as size 0
+    # and only counts once it has been 0 for the whole bound.
+    var missing = newGuestProgressWatch(tmp / "nope", tmp / "also-nope",
+                                        now = 0.0)
+    check not guestFrozen(missing, freezeSec = 600, now = 100.0)
+    check guestFrozen(missing, freezeSec = 600, now = 900.0)
+    # And a zero or negative bound disables the watchdog outright.
+    check not guestFrozen(w, freezeSec = 0, now = 1e9)
+    check not guestFrozen(w, freezeSec = -1, now = 1e9)
+
+  test "the shipped freeze bound is the measured one":
+    # Ten minutes, and the reason is in QwaInstallFreezeSec: the two runs that
+    # froze sat still for 23 and 30 minutes, and the longest quiet phase a
+    # healthy install has is the ~8 minute OpenSSH capability install.
+    check QwaInstallFreezeSec == 600
+    check QwaInstallMaxPowerCycles == 2
+    # The default has to BE the shipped constant, not a copy of its value:
+    # a watchdog whose default is 0 is a watchdog that never fires.
+    let tmp = createTempDir("vmh-qwa-freeze-default-", "")
+    defer: removeDir(tmp)
+    var w = newGuestProgressWatch(tmp / "serial.log", tmp / "windows.qcow2",
+                                  now = 0.0)
+    check not guestFrozen(w, now = QwaInstallFreezeSec.float - 1.0)
+    check guestFrozen(w, now = QwaInstallFreezeSec.float)
+
+  test "a frozen guest is power-cycled, and the install then finishes":
+    let tmp = createTempDir("vmh-qwa-watchdog-recover-", "")
+    defer: removeDir(tmp)
+    let serial = tmp / "serial.log"
+    let disk = tmp / "windows.qcow2"
+    writeFile(serial, "frozen in the firmware\n")
+    writeFile(disk, "")
+    var cycles = 0
+    var sentinel = false
+    let watched = waitForInstallSentinelWatched(
+      serial, disk, epochTime() + 30.0,
+      sentinelPresent = (proc (): bool = sentinel),
+      # The recovery is what makes the install finish: nothing else in this
+      # test ever sets the sentinel.
+      powerCycle = (proc () =
+        inc cycles
+        sentinel = true),
+      freezeSec = 1, maxPowerCycles = 2, pollMs = 100)
+    check watched.ok
+    check watched.powerCycles == 1
+    check cycles == 1
+
+  test "the allowance runs out, and the build is failed rather than faked":
+    let tmp = createTempDir("vmh-qwa-watchdog-exhaust-", "")
+    defer: removeDir(tmp)
+    let serial = tmp / "serial.log"
+    let disk = tmp / "windows.qcow2"
+    writeFile(serial, "")
+    writeFile(disk, "")
+    var cycles = 0
+    let start = epochTime()
+    let watched = waitForInstallSentinelWatched(
+      serial, disk, epochTime() + 30.0,
+      sentinelPresent = (proc (): bool = false),
+      powerCycle = (proc () = inc cycles),
+      freezeSec = 1, maxPowerCycles = 2, pollMs = 100)
+    # Two cycles spent, then a refusal — NOT an eleventh attempt, and not a
+    # success. A half-installed disk must never be reported as a golden.
+    check not watched.ok
+    check watched.powerCycles == 2
+    check cycles == 2
+    # And it gave up on the allowance rather than sitting out the deadline.
+    check epochTime() - start < 25.0
+
+  test "a guest that keeps moving is never power-cycled":
+    let tmp = createTempDir("vmh-qwa-watchdog-quiet-", "")
+    defer: removeDir(tmp)
+    let serial = tmp / "serial.log"
+    let disk = tmp / "windows.qcow2"
+    writeFile(serial, "")
+    writeFile(disk, "")
+    var cycles = 0
+    var probes = 0
+    let watched = waitForInstallSentinelWatched(
+      serial, disk, epochTime() + 30.0,
+      sentinelPresent = (proc (): bool =
+        inc probes
+        # Writing to the disk on every probe is a guest that is installing.
+        writeFile(disk, repeat('x', probes))
+        probes >= 5),
+      powerCycle = (proc () = inc cycles),
+      freezeSec = 1, maxPowerCycles = 2, pollMs = 100)
+    check watched.ok
+    check watched.powerCycles == 0
+    check cycles == 0
+
+  test "the watchdog cannot outlive the build deadline":
+    let tmp = createTempDir("vmh-qwa-watchdog-deadline-", "")
+    defer: removeDir(tmp)
+    let serial = tmp / "serial.log"
+    let disk = tmp / "windows.qcow2"
+    writeFile(serial, "")
+    writeFile(disk, "")
+    let start = epochTime()
+    # A poll interval far longer than the deadline, and a freeze bound that
+    # never fires: the bound that has to hold is the deadline.
+    let watched = waitForInstallSentinelWatched(
+      serial, disk, epochTime() + 1.0,
+      sentinelPresent = (proc (): bool = false),
+      powerCycle = (proc () = discard),
+      freezeSec = 0, maxPowerCycles = 2, pollMs = 30_000)
+    check not watched.ok
+    check watched.powerCycles == 0
+    let elapsed = epochTime() - start
+    check elapsed >= 0.9
+    check elapsed < 15.0
+
 suite "Golden build: sysprep has to still be there a moment later":
   ## MA4's second host run: the launch reported success, sysprep logged four
   ## lines, reached "Beginning action execution from Cleanup.xml" and died
@@ -996,6 +1242,7 @@ suite "Golden build: finalize drops the install media":
     let boot = buildQemuWindowsArmArgs(golden, 2247)
     check not boot.anyIt("media=cdrom" in it)
     check not boot.anyIt("usb-storage" in it)
+    check not boot.anyIt("ide-cd" in it)
     check "id=disk0,file=" & golden / "windows.qcow2" &
           ",format=qcow2,if=none,cache=writeback,discard=unmap" in boot
 
@@ -1560,3 +1807,92 @@ exit 1
       discard b.buildWindowsArmGolden(newGoldenBuildSpec(
         buildDir = golden, windowsIso = tmp / "win.iso",
         autounattendIso = tmp / "unattend.iso", diskGB = 1))
+
+  test "a build whose guest freezes power-cycles it and still finishes":
+    ## MA4's blocker, driven end to end. The guest stops executing on one of
+    ## the firmware boots the install needs; the only recovery measured to
+    ## work on the real host is a power cycle of QEMU **and swtpm**, because
+    ## `swtpm socket` exits with its client and a Windows 11 guest will not
+    ## boot without a TPM.
+    ##
+    ## freezeSec is 1 rather than the shipped 600 only so the suite stays
+    ## fast; the shipped value is pinned in "the shipped freeze bound is the
+    ## measured one".
+    let tmp = createTempDir("vmh-qwa-run-frozen-", "")
+    defer: removeDir(tmp)
+    let b = goldenBackend(tmp)
+    writeFile(tmp / "win.iso", "pretend windows iso")
+    writeFile(tmp / "unattend.iso", "pretend answer iso")
+    writeFile(tmp / "code.fd", "efi code")
+    writeFile(tmp / "vars.fd", "efi vars")
+    putEnv("VMH_QEMU_EFI_CODE_TEMPLATE", tmp / "code.fd")
+    putEnv("VMH_QEMU_EFI_VARS_TEMPLATE", tmp / "vars.fd")
+    createDir(tmp / "ssh")
+    # NO sentinel up front: only a power cycle can produce one here.
+    putEnv(FakeSshDirEnv, tmp / "ssh")
+    putEnv(FakeQemuEnv, "1")
+    putEnv(FakeFreezeEnv, "1")
+    putEnv(FakeSwtpmLogEnv, tmp / "swtpm.log")
+    defer:
+      delEnv(FakeFreezeEnv)
+      delEnv(FakeSwtpmLogEnv)
+
+    let golden = tmp / "win-arm-runner-0301"
+    putEnv("VMH_GOLDEN_FAKE_SSH_VMDIR", golden)
+
+    let produced = b.buildWindowsArmGolden(newGoldenBuildSpec(
+      buildDir = golden, windowsIso = tmp / "win.iso",
+      autounattendIso = tmp / "unattend.iso", recipeDir = recipeDir(),
+      diskGB = 1, cpus = 1, memoryMB = 64, deadlineSec = 180,
+      keyPressWindowSec = 2, freezeSec = 1, maxPowerCycles = 2))
+
+    check produced == absolutePath(golden)
+    check requireWindowsArmGolden(produced) == absolutePath(golden)
+    # The guest really was booted more than once...
+    check fileExists(golden / FakeBootCountName)
+    # ...and swtpm really came back with it. One start would mean a recovery
+    # that brings QEMU up against a TPM socket that no longer exists, which
+    # is the exact error the first hand-run power cycle on m3 hit.
+    let swtpmStarts = readFile(tmp / "swtpm.log").strip().splitLines()
+    check swtpmStarts.len >= 2
+    for line in swtpmStarts:
+      check "type=unixio,path=" in line
+
+  test "a guest that never comes back is refused, not promoted":
+    ## The other half of the watchdog contract: the allowance is spent and
+    ## the build FAILS. A half-installed disk must never be finalized, and
+    ## the message has to say power cycles were spent so the next operator
+    ## reads "the guest kept freezing" and not "the answer file is wrong".
+    let tmp = createTempDir("vmh-qwa-run-frozen-dead-", "")
+    defer: removeDir(tmp)
+    let b = goldenBackend(tmp)
+    writeFile(tmp / "win.iso", "pretend windows iso")
+    writeFile(tmp / "unattend.iso", "pretend answer iso")
+    writeFile(tmp / "code.fd", "efi code")
+    writeFile(tmp / "vars.fd", "efi vars")
+    putEnv("VMH_QEMU_EFI_CODE_TEMPLATE", tmp / "code.fd")
+    putEnv("VMH_QEMU_EFI_VARS_TEMPLATE", tmp / "vars.fd")
+    createDir(tmp / "ssh")
+    putEnv(FakeSshDirEnv, tmp / "ssh")
+    putEnv(FakeQemuEnv, "1")
+    delEnv(FakeFreezeEnv)   # a guest that is simply never done
+    let golden = tmp / "win-arm-runner-0302"
+    putEnv("VMH_GOLDEN_FAKE_SSH_VMDIR", golden)
+
+    var msg = ""
+    try:
+      discard b.buildWindowsArmGolden(newGoldenBuildSpec(
+        buildDir = golden, windowsIso = tmp / "win.iso",
+        autounattendIso = tmp / "unattend.iso", recipeDir = recipeDir(),
+        diskGB = 1, cpus = 1, memoryMB = 64, deadlineSec = 60,
+        keyPressWindowSec = 0, freezeSec = 1, maxPowerCycles = 1))
+    except VmHarnessError as e:
+      msg = e.msg
+    check msg.len > 0
+    check "1 power cycle(s) were spent on a frozen guest, of 1 allowed" in msg
+    # Nothing was promoted: no manifest, so the admission check refuses it.
+    check not fileExists(golden / QwaGoldenManifestName)
+    expect ValueError:
+      discard requireWindowsArmGolden(golden)
+    # And the diagnostics are still there.
+    check fileExists(golden / "serial.log")

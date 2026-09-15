@@ -25,7 +25,11 @@ the checked-in answer files.
 | `provisionBaseline` (validate existing golden) | ✓ | Already shipped; unchanged by this work. |
 | Headless install boot — argument vector | ✓ | `buildQemuWindowsArmInstallArgs`. |
 | Headless install boot — orchestration | ✓ | `buildWindowsArmGolden`; UEFI staged by `stageGoldenFirmware`. |
-| Install-completion detection | ✓ | `waitForInstallSentinel` over the `repro-install-done` sentinel. |
+| Install-completion detection | ✓ | `waitForInstallSentinelWatched` over the `repro-install-done` sentinel, with the freeze watchdog around it. |
+| Frozen-guest recovery | ✓ | `GuestProgressWatch` + a power cycle of QEMU **and** swtpm. See "Closed: the guest freeze on a firmware boot". |
+| A golden actually built on m3 | ✓ | 2026-09-15, `win-arm-runner-20260915T154742Z`: 35.1 min wall clock, 13.81 GiB, passes `requireWindowsArmGolden`. NOT promoted. |
+| The golden boots and runs a command | ✓ | Verified in review 2026-09-15: SSH in 48–67 s, two independent overlays, DISTINCT machine SIDs. But **not through the per-job path** — see "Open: the per-job boot cannot boot a generalized golden". |
+| A per-job instance created from the golden | ✗ | **BLOCKED.** `buildQemuWindowsArmArgs` passes `-no-reboot`; a generalized image must reboot once, so QEMU exits ~40 s in and `revertToBaseline` always fails. See the section named above. |
 | Rebuild safety guard (never build in place) | ✓ | `prepareGoldenBuildDir`. |
 | Overlay backing-path symlink resolution | ✓ | Prerequisite for a safe flip; landed early with the guard. |
 | Golden disk allocation | ✓ | `createGoldenDisk`. |
@@ -50,7 +54,9 @@ place and proven — the golden build reuses that argument vector with three
 changes:
 
 1. a freshly created empty `windows.qcow2` instead of a CoW copy;
-2. the Windows ISO and the autounattend ISO attached as CD-ROMs;
+2. the Windows ISO and the autounattend ISO attached as CD-ROMs — on
+   *different* controllers, for measured reasons: see "Where the install
+   media lives, and why";
 3. `-no-reboot` dropped, because a Windows install reboots several times.
 
 The recipe inputs are likewise already checked in and independent of UTM:
@@ -155,7 +161,9 @@ vm-harness provision --backend qemu-windows-arm \
    `bootindex` ordering the install ISO ahead of the NVMe disk, and
    without `-no-reboot`. *(Incomplete as written — a fourth change is
    needed: a `usb-kbd`, plus a bounded keypress injected on the monitor.
-   See "As implemented", departure six.)*
+   See "As implemented", departure six. And `scsi-cd` on `virtio-scsi` is
+   not an option for the install ISO at all: see "Where the install media
+   lives, and why".)*
 4. Poll for install completion by SSHing to the forwarded port and testing
    for `C:\Windows\Temp\repro-install-done` — the sentinel
    `autounattend.xml` already writes from `FirstLogonCommands` after
@@ -202,9 +210,10 @@ equivalent check.
 
 | Gate | Layer | Runs where |
 |---|---|---|
-| Argument-vector unit test: install boot attaches both ISOs, orders bootindex, and omits `-no-reboot` | unit | anywhere |
+| Argument-vector unit test: install boot attaches both ISOs, on the controllers each has to be on, orders bootindex, and omits `-no-reboot` | unit | anywhere |
 | `qemu-img`/`swtpm` invocation shape | unit | anywhere |
 | Golden shape accepted by `validateWindowsArmVmDir` | unit | anywhere |
+| A frozen guest is power-cycled — QEMU **and** swtpm — and the install finishes; the allowance runs out and the build fails | unit | anywhere |
 | Full install → sysprep → golden | host e2e, opt-in | macOS ARM host with the ISO |
 | Two clones of the golden have distinct machine SIDs | host e2e, opt-in | macOS ARM host with a golden |
 
@@ -306,6 +315,18 @@ deliberate:
   deployed on m3, it boots an installed disk with no prompt to answer, and
   the unit gate asserts it gains neither the keyboard nor the xHCI.
 
+- **Step 4 gained a freeze watchdog.** The plain
+  `waitForInstallSentinel` cannot tell a long Windows Setup phase from a
+  guest that has stopped executing, and on m3 it spent the whole 90-minute
+  deadline twice on installs that were already dead in the firmware.
+  `waitForInstallSentinelWatched` keeps the same "only the sentinel is
+  success" contract and adds one recovery: when the serial console **and**
+  the target qcow2 have both been byte-for-byte unchanged for
+  `GoldenBuildSpec.freezeSec`, power-cycle QEMU and swtpm and start the
+  stall clock again, up to `maxPowerCycles` times. See "Closed: the guest
+  freeze on a firmware boot" for why a power cycle and not a
+  `system_reset`, and why swtpm has to come back with it.
+
 - **Step 6 does not copy `repro-sysprep.xml` to `C:\`.** `autounattend.xml`
   already does it from the answer-file ISO (`FirstLogonCommands`, Order 6),
   so the harness copying it again would be a second source of truth for a
@@ -406,41 +427,173 @@ shape of a first host run and worth expecting on the next platform.
    to read first. It is what turned the second diagnosis from a blind
    90-minute wait into a ten-second look at a desktop.
 
-### Still open: a DXE spin on the boot after Setup's first reboot
+### Closed: the guest freeze on a firmware boot, and what it actually was
 
-Not fixed, and the reason MA4 has not yet produced an artifact. Two of five
-runs hung on the firmware boot that follows Windows Setup's first reboot,
-on inputs identical to the two runs that sailed past it. The firmware prints
-its banner, does TPM init, prints `UsbBootExecCmd: Success to Exec 0x0 Cmd`
-twice, and never reaches a boot option; the serial log then froze for 23
-minutes and the target qcow2 for 30.
+This was MA4's blocker. Two of five runs stopped dead on a firmware boot
+after Windows Setup's first reboot, on inputs identical to the runs that
+sailed past it; serial log still for 23 minutes, target qcow2 for 30, and
+the build sat out its 90-minute deadline. **It reproduced a third time**, on
+2026-09-15's successful run, on the boot after Setup's *second* reboot — so
+it is not attached to any particular boot.
 
-It is a **spin, not starvation** — the distinction matters because the first
-read was "the host is loaded" and that was wrong. `info registers` over the
-monitor shows the guest PC parked at one address (`0x23fd5de04`) for 25
-seconds, and then cycling inside an **eight-byte window**
-(`0x47695fac`/`0x47695fb4`): a polling loop in a DXE driver with no timeout
-firing, most likely the USB/xHCI stack re-enumerating the two CD-ROMs now
-that the NVMe disk also carries boot entries. `system_reset` on the monitor
-does not clear it — the boot after the reset stalls at the same point.
+**The earlier reading was wrong, and it sent both of its suggested fixes in
+the wrong direction.** It said: a polling loop in a DXE driver with no
+timeout, "most likely the USB/xHCI stack re-enumerating the two CD-ROMs",
+evidenced by the PC parked at `0x23fd5de04` and cycling in an eight-byte
+window. Two measurements retire that:
 
-Two things worth trying, in order:
+- `0x23fd5de04` is where this firmware waits for **anything**. The same
+  address was sampled on a guest sitting harmlessly at the `Shell>` prompt
+  of the EFI internal shell. It is the DXE core's event-wait loop, so
+  "the PC is parked there" says the firmware is blocked, not what on.
+- The freeze survived taking the answer-file CD-ROM off the xHCI entirely.
+  One USB mass-storage device instead of two, one `UsbBootExecCmd` line per
+  boot instead of two — and the guest still froze.
 
-1. Attach the install media over `virtio-scsi` rather than xHCI. EDK2 has
-   `VirtioScsiDxe`, so the firmware can boot it, and it takes the suspected
-   driver out of the path — but check first that Windows Setup can still see
-   the media, since it has no in-box vioscsi driver.
-2. A harness-side watchdog: reset a guest whose serial log *and* target disk
-   have both been unchanged past a bound. Cheap, bounded, and it fits the
-   rest of this design — but it is a workaround, not a fix.
+**What it is, from the framebuffer.** `captureGuestScreen` — added in MA4 for
+exactly this — shows the TianoCore splash with the caption
+**`Start boot option`** and a progress bar at **0%**. That caption belongs to
+`PlatformBootManagerWaitCallback`, and `BdsDxe`'s `BdsWait` calls it once per
+loop iteration off a **one-second DXE timer event**. One call and no more
+means the timer never fired again: the firmware is blocked in
+`gBS->WaitForEvent` on a timer that has stopped.
+
+**How far that evidence actually reaches.** What is *measured* is that the
+firmware is blocked in a timer wait that never completes again, and that only
+a power cycle clears it. The step from there to "the guest's virtual timer
+interrupt stops being delivered, below the firmware, in QEMU/HVF" is the best
+available *inference*, not a measurement: no QEMU-side or HVF-side
+instrumentation was run, and the observed rate is only three times in six real
+installs. Read this section as "the timer is dead and a power cycle revives
+it", and do not read the QEMU/HVF attribution as established. Anything that
+would stop timer interrupts reaching EL1 — the GIC, the vtimer, HVF's exit
+handling — fits the same evidence equally well.
+
+Three recoveries were tried on real frozen guests:
+
+| Attempt | Result |
+|---|---|
+| `system_reset` on the monitor | **No.** The boot after it stalls at the same point. |
+| 12 × `sendkey ret` on the monitor | **No.** Moved the PC once, changed nothing else — EDK2 polls the USB keyboard from the same dead timer, so keys are never seen. |
+| Power cycle: stop QEMU **and swtpm**, start both again on the same disk | **Yes.** Verified twice — once against a copy of a frozen run's disk, once against a live frozen build, which resumed, booted Windows Boot Manager and went on to finish the install. |
+
+So the watchdog is the only recovery available to the harness — it is a
+*mitigation* for a cause that has been narrowed but not proven, and it is the
+right one whatever the cause turns out to be, because nothing inside a guest
+whose timer has stopped can restart it. `QwaInstallFreezeSec` (600 s of
+the serial console **and** the target qcow2 both byte-for-byte unchanged) and
+`QwaInstallMaxPowerCycles` (2). Both signals are needed — Windows is mute on
+the serial port once the firmware hands over, and `Add-WindowsCapability
+OpenSSH.Server` takes ~8 minutes with no disk growth at all — and exhausting
+the allowance still **fails** the build rather than finalizing a
+half-installed disk.
+
+`swtpm` is not an afterthought in that recovery. `swtpm socket` exits when
+its client disconnects, so the first hand-run power cycle on m3 brought QEMU
+back against a TPM socket that no longer existed and died on
+`Failed to connect to /tmp/vmh-qwa-tpm-....sock`. A Windows 11 guest will not
+boot without a TPM, so the power cycle restarts both.
+
+### Where the install media lives, and why
+
+`buildQemuWindowsArmInstallArgs` puts the **Windows ISO on `usb-storage`** on
+the xHCI and the **answer-file ISO on `ide-cd`** on an `ich9-ahci`. Both ends
+of that split are measured, and the first one closes off the `virtio-scsi`
+idea the earlier notes led with:
+
+- The install ISO **cannot** move. The firmware has to boot
+  `\EFI\BOOT\BOOTAA64.EFI` off it, and this EDK2 (`edk2-stable202408`, the
+  ArmVirtQemu build QEMU ships) has **no ATA/AHCI driver at all** — measured:
+  with the install ISO on `ich9-ahci`, `BdsDxe` created no boot option for it
+  and went straight from the empty NVMe disk to the EFI shell. And it cannot
+  go on `virtio-scsi`, which the firmware *can* boot, because Windows Setup
+  must read `install.wim` off it in WinPE: `sources/boot.wim` on
+  `Win11_25H2_English_Arm64_v2.iso` carries `storahci.sys`, `stornvme.sys`,
+  `USBSTOR.SYS` and `uaspstor.sys` and **neither `vioscsi.sys` nor
+  `viostor.sys`**.
+- The answer-file ISO **can** move, because nothing boots it — Windows reads
+  it by drive letter in the specialize and oobeSystem passes, and
+  `storahci.sys` is in `boot.wim` and `install.wim` both. Its invisibility to
+  this firmware is the point: the firmware's USB mass-storage work per boot
+  halves, from two `UsbBootExecCmd` lines to one.
+
+This was originally made as a fix for the freeze, on the hypothesis the
+evidence above overturned. It is kept because it is a real reduction in
+per-boot firmware work, because it is what the 2026-09-15 golden was actually
+built with, and because Windows Setup was verified end to end against it —
+including finding `autounattend.xml` on an AHCI CD-ROM. It is **not** the fix
+for the freeze.
 
 **Measured, for the estimates this document carries.** Install peak on m3:
 **16.4 GiB** of build-directory growth, not the estimated 50 GB — see the
-free-space Decision below. Phase timings: media boot to first Setup write
-~60 s; image applied and first reboot at ~6 min; desktop at ~16 min; NetKVM
-installed at ~7.5 min after that reboot; `Add-WindowsCapability
-OpenSSH.Server` took **8 minutes** on its own; sentinel written by ~16 min
-after boot.
+free-space Decision below. The 2026-09-15 golden's finished directory is
+**13.81 GiB** (`du -sk`, after `/generalize` trimmed). Phase timings: media
+boot to first Setup write ~60 s; image applied and first reboot at ~4 min;
+second reboot at ~6 min; desktop at ~16 min; NetKVM installed at ~7.5 min
+after that reboot; `Add-WindowsCapability OpenSSH.Server` took **8 minutes**
+on its own; sentinel written by ~16 min after boot. The successful run took
+**35.1 minutes** wall clock end to end, of which ~20 were lost to one freeze
+and its recovery.
+
+### Open: the per-job boot cannot boot a generalized golden
+
+**Found in review 2026-09-15, on the first attempt to consume the golden
+through the path a CI job uses. It is not a defect in the golden, and it is
+not new — it is in `buildQemuWindowsArmArgs` at HEAD and in the vector
+deployed on m3.**
+
+`buildQemuWindowsArmArgs` adds `-no-reboot`, which turns a guest-initiated
+reboot into a QEMU exit. That is the right shape for a one-shot job *once the
+guest is up*. It is fatal on the **first** boot of every instance, because the
+golden is `/generalize`d: `repro-sysprep.xml` drives a fresh specialize +
+oobeSystem pass on every clone — that is the whole point of generalizing, and
+the recipe's README §7 says so explicitly ("first-boot of any clone uses the
+post-SysPrep `oobeSystem` pass; admin user is recreated at first boot of every
+clone"). Windows reboots between those two passes. `sshd` is started by
+`FirstLogonCommands`, which run *after* that reboot. So QEMU exits before
+OpenSSH has ever existed, on every instance, every time.
+
+Measured on m3 against `win-arm-runner-20260915T154742Z`, same golden, same
+fresh overlay, same firmware pair, same swtpm, argv taken straight from
+`buildQemuWindowsArmArgs`:
+
+| Arm | Argv | Result |
+|---|---|---|
+| A | exactly as emitted | QEMU **exits rc=0 after 38 s**. `serial.log` ends at `BdsDxe: starting Boot0003 "Windows Boot Manager"`. No SSH, ever. |
+| B | identical, `-no-reboot` removed, nothing else | **SSH ready in 67 s.** `cmd /c echo`, `set /a 6*7`, `whoami /user` and `ver` all answer. |
+
+Through the real harness (`provisionBaseline` → `revertToBaseline`) with
+production defaults, the operator-visible outcome is:
+
+```
+GuestBootFailureError: QemuWindowsArmBackend: SSH did not become ready
+on 127.0.0.1:2223 within 300s
+```
+
+after **301 s** — five minutes of silence, and then a message that blames SSH
+for a QEMU that exited four and a half minutes earlier. The per-job boot has
+no liveness check at all: `waitForSshReady` never looks at the QEMU pid, so it
+polls a dead guest until its deadline. The install path grew exactly that
+check (`waitForInstallSentinelWatched`); the run path did not.
+
+Why no test caught it: the unit tier asserts the *argv*, and one of its tests
+(`the per-job boot keeps -no-reboot and its own boot order`) asserts
+`-no-reboot` is present — so the gate actively pins the defect. Three review
+passes also treated "the per-job argv is byte-identical to HEAD" as a safety
+property; it is, but the vector it was protecting has never booted a
+generalized golden. Nothing short of booting one could have found this, and
+the host tier that would have (`t_qemu_windows_arm_golden_build_host`, whose
+two-clone SID check runs `revertToBaseline`) has never been executed — there
+is no `test-logs/test-host.log` on m3.
+
+What the fix has to weigh: dropping `-no-reboot` outright restores the boot
+but also gives up the one-shot lifecycle guarantee (a job that reboots its own
+guest would loop rather than end). The likely shape is to keep the guest
+rebootable until SSH is first reached and bound that window, the same way
+`answerInstallMediaKeyPrompt` bounds the keypress window — plus a liveness
+check in `waitForSshReady` so a dead QEMU is reported as a dead QEMU. Either
+way it needs its own gate, and the gate has to be the host tier, because the
+unit tier cannot tell a bootable argv from an unbootable one.
 
 ### Two traps the runs left behind, and what now stops them
 
