@@ -28,8 +28,8 @@ the checked-in answer files.
 | Install-completion detection | ✓ | `waitForInstallSentinelWatched` over the `repro-install-done` sentinel, with the freeze watchdog around it. |
 | Frozen-guest recovery | ✓ | `GuestProgressWatch` + a power cycle of QEMU **and** swtpm. See "Closed: the guest freeze on a firmware boot". |
 | A golden actually built on m3 | ✓ | 2026-09-15, `win-arm-runner-20260915T154742Z`: 35.1 min wall clock, 13.81 GiB, passes `requireWindowsArmGolden`. NOT promoted. |
-| The golden boots and runs a command | ✓ | Verified in review 2026-09-15: SSH in 48–67 s, two independent overlays, DISTINCT machine SIDs. But **not through the per-job path** — see "Open: the per-job boot cannot boot a generalized golden". |
-| A per-job instance created from the golden | ✗ | **BLOCKED.** `buildQemuWindowsArmArgs` passes `-no-reboot`; a generalized image must reboot once, so QEMU exits ~40 s in and `revertToBaseline` always fails. See the section named above. |
+| The golden boots and runs a command | ✓ | Verified in review 2026-09-15: SSH in 48–67 s, two independent overlays, DISTINCT machine SIDs — and since the reboot fix, through the per-job path itself (row below). |
+| A per-job instance created from the golden | ✓ | **FIXED 2026-09-15.** `buildQemuWindowsArmArgs` used to pass `-no-reboot`, so a generalized image's mandatory reboot ended QEMU ~38 s in and `revertToBaseline` always failed. It now starts the guest with `-action reboot=reset` plus a QMP socket, and `revertToBaseline` puts the one-shot semantics back with `set-action reboot=shutdown` the moment SSH is first reached. Measured end to end through `provisionBaseline` → `revertToBaseline`: SSH at **47 s and 53 s**, two firmware boots each, distinct machine SIDs, real commands answered. See "Closed: the per-job boot could not boot a generalized golden". |
 | Rebuild safety guard (never build in place) | ✓ | `prepareGoldenBuildDir`. |
 | Overlay backing-path symlink resolution | ✓ | Prerequisite for a safe flip; landed early with the guard. |
 | Golden disk allocation | ✓ | `createGoldenDisk`. |
@@ -214,8 +214,12 @@ equivalent check.
 | `qemu-img`/`swtpm` invocation shape | unit | anywhere |
 | Golden shape accepted by `validateWindowsArmVmDir` | unit | anywhere |
 | A frozen guest is power-cycled — QEMU **and** swtpm — and the install finishes; the allowance runs out and the build fails | unit | anywhere |
+| Per-job argv allows the first boot's reboot **and** carries the QMP socket that revokes it; the install argv carries neither | unit | anywhere |
+| Firmware boots counted off the serial console; a reboot loop is named rather than waited out | unit | anywhere |
+| `revertToBaseline` survives a guest that reboots before sshd exists, and refuses the instance when `set-action` cannot be applied | unit (fake QEMU that performs the reboot and obeys the argv) | anywhere |
 | Full install → sysprep → golden | host e2e, opt-in | macOS ARM host with the ISO |
 | Two clones of the golden have distinct machine SIDs | host e2e, opt-in | macOS ARM host with a golden |
+| **The per-job path boots a real golden, reaches SSH and runs a command** (`t_qemu_windows_arm_per_job_boot`) | host e2e | macOS ARM host with a golden; ~2 min |
 
 The unit layer must not claim coverage of the e2e layer. Following this
 repo's existing convention, a missing ISO or a non-macOS host **skips with an
@@ -229,6 +233,14 @@ Both tiers carry the same greppable gate name, `t_qemu_windows_arm_golden_build`
 |---|---|---|
 | unit (runs anywhere) | `tests/unit/t_qemu_windows_arm_golden_build.nim` | `scripts/run-tests.sh`, `repro.nim` |
 | host (opt-in) | `tests/e2e/t_qemu_windows_arm_golden_build_host.nim` | `scripts/run-host-tests.sh` |
+
+The *consuming* side has its own gate, `t_qemu_windows_arm_per_job_boot`, in
+`tests/e2e/t_qemu_windows_arm_per_job_boot_host.nim` (also wired into
+`scripts/run-host-tests.sh`). It boots an existing golden through
+`provisionBaseline` → `revertToBaseline` → `execInGuest` → `stopAndCleanup`,
+costs ~2 minutes rather than an hour, and needs no opt-in flag — only a
+finished golden, whose absence it names. See "Closed: the per-job boot could
+not boot a generalized golden" for why it exists.
 
 The unit tier drives the *whole* orchestration — install wait, sysprep,
 power-off, finalize, manifest — against a fake QEMU that binds the real
@@ -535,65 +547,108 @@ on its own; sentinel written by ~16 min after boot. The successful run took
 **35.1 minutes** wall clock end to end, of which ~20 were lost to one freeze
 and its recovery.
 
-### Open: the per-job boot cannot boot a generalized golden
+### Closed: the per-job boot could not boot a generalized golden
 
 **Found in review 2026-09-15, on the first attempt to consume the golden
-through the path a CI job uses. It is not a defect in the golden, and it is
-not new — it is in `buildQemuWindowsArmArgs` at HEAD and in the vector
-deployed on m3.**
+through the path a CI job uses. It was not a defect in the golden, and it was
+not new — `-no-reboot` was in `buildQemuWindowsArmArgs` at HEAD and in the
+vector deployed on m3. It was a LATENT incompatibility, not a regression:
+the fleet's Windows goldens were historically not sysprepped (see
+`infra/checks/t_windows_sysprep_golden.sh`, whose own header records that the
+non-sysprepped golden's clones shared the base SID), and a non-generalized
+image boots straight through with no specialize pass and no reboot. MA4's
+golden is properly generalized — which is correct and strictly better — and
+that is what exposed it.**
 
-`buildQemuWindowsArmArgs` adds `-no-reboot`, which turns a guest-initiated
+`buildQemuWindowsArmArgs` added `-no-reboot`, which turns a guest-initiated
 reboot into a QEMU exit. That is the right shape for a one-shot job *once the
-guest is up*. It is fatal on the **first** boot of every instance, because the
-golden is `/generalize`d: `repro-sysprep.xml` drives a fresh specialize +
+guest is up*. It was fatal on the **first** boot of every instance, because
+the golden is `/generalize`d: `repro-sysprep.xml` drives a fresh specialize +
 oobeSystem pass on every clone — that is the whole point of generalizing, and
 the recipe's README §7 says so explicitly ("first-boot of any clone uses the
 post-SysPrep `oobeSystem` pass; admin user is recreated at first boot of every
 clone"). Windows reboots between those two passes. `sshd` is started by
-`FirstLogonCommands`, which run *after* that reboot. So QEMU exits before
-OpenSSH has ever existed, on every instance, every time.
+`FirstLogonCommands`, which run *after* that reboot. So QEMU exited before
+OpenSSH had ever existed, on every instance, every time.
 
 Measured on m3 against `win-arm-runner-20260915T154742Z`, same golden, same
 fresh overlay, same firmware pair, same swtpm, argv taken straight from
 `buildQemuWindowsArmArgs`:
 
-| Arm | Argv | Result |
-|---|---|---|
-| A | exactly as emitted | QEMU **exits rc=0 after 38 s**. `serial.log` ends at `BdsDxe: starting Boot0003 "Windows Boot Manager"`. No SSH, ever. |
-| B | identical, `-no-reboot` removed, nothing else | **SSH ready in 67 s.** `cmd /c echo`, `set /a 6*7`, `whoami /user` and `ver` all answer. |
+| Arm | Argv | Runtime action | Result |
+|---|---|---|---|
+| A | exactly as emitted (`-no-reboot`) | — | QEMU **exits rc=0 after 38 s**. `serial.log` ends at `BdsDxe: starting Boot0003 "Windows Boot Manager"`. No SSH, ever. |
+| B | `-action reboot=reset`, nothing else changed | none | **SSH ready in 52 s**, two firmware banners in `serial.log`. Then `shutdown /r /t 0` in the guest: QEMU **still alive 84 s later**, third firmware banner — the one-shot guarantee genuinely gone. |
+| C | same as B | `set-action reboot=shutdown` over QMP | same `shutdown /r /t 0`: QEMU **exits in 6 s**, no new firmware boot. |
 
-Through the real harness (`provisionBaseline` → `revertToBaseline`) with
-production defaults, the operator-visible outcome is:
+Arm C is what shipped. The fix is a **lifecycle**, not a flag removal:
 
-```
-GuestBootFailureError: QemuWindowsArmBackend: SSH did not become ready
-on 127.0.0.1:2223 within 300s
-```
+1. The argv starts the guest with `-action reboot=reset` — QEMU's default,
+   stated explicitly so the intent is an argument you can assert on rather
+   than the absence of one — plus a **QMP socket** (`qwaQmpSocketPath`).
+2. `waitForFirstBootSshReady` waits for the first SSH while counting
+   `UEFI firmware (version ` banners on the serial console. A healthy first
+   boot shows exactly **two**. Past `QwaFirstBootMaxFirmwareBoots` (4) the
+   guest is reboot-looping, and the instance fails by name in seconds rather
+   than sitting out `sshReadyTimeoutSec` in silence.
+3. The moment SSH answers — and **before** the handle is returned to anything
+   that could run a job — `revertToBaseline` sends
+   `set-action reboot=shutdown` over QMP. A refusal **fails the instance**:
+   handing back a guest that can silently reboot and carry a job's state into
+   a second life is exactly the property `-no-reboot` existed to prevent, and
+   "we could not restore it" is not a state a CI job may run in.
 
-after **301 s** — five minutes of silence, and then a message that blames SSH
-for a QEMU that exited four and a half minutes earlier. The per-job boot has
-no liveness check at all: `waitForSshReady` never looks at the QEMU pid, so it
-polls a dead guest until its deadline. The install path grew exactly that
-check (`waitForInstallSentinelWatched`); the run path did not.
+So the window in which a reboot is tolerated is bounded twice — by the first
+successful SSH probe and by the firmware-boot allowance — and nothing has run
+in the guest while it is open, because the runner has not registered yet.
 
-Why no test caught it: the unit tier asserts the *argv*, and one of its tests
-(`the per-job boot keeps -no-reboot and its own boot order`) asserts
-`-no-reboot` is present — so the gate actively pins the defect. Three review
-passes also treated "the per-job argv is byte-identical to HEAD" as a safety
-property; it is, but the vector it was protecting has never booted a
-generalized golden. Nothing short of booting one could have found this, and
-the host tier that would have (`t_qemu_windows_arm_golden_build_host`, whose
-two-clone SID check runs `revertToBaseline`) has never been executed — there
-is no `test-logs/test-host.log` on m3.
+**Why it has to be QMP.** `-no-reboot` and `-action` are start-time only.
+HMP — the `-monitor` socket this backend has always had — has no `set-action`;
+checked against the QEMU on m3 (10.1.5), whose HMP command list carries
+`watchdog_action` and nothing else of the sort, while QMP's `query-commands`
+lists `set-action`. The QMP socket is on the **per-job vector only**. The
+install boot never stops being rebootable, so it needs no way to revoke that
+— and leaving its argv alone keeps the golden on disk reproducible from this
+source.
 
-What the fix has to weigh: dropping `-no-reboot` outright restores the boot
-but also gives up the one-shot lifecycle guarantee (a job that reboots its own
-guest would loop rather than end). The likely shape is to keep the guest
-rebootable until SSH is first reached and bound that window, the same way
-`answerInstallMediaKeyPrompt` bounds the keypress window — plus a liveness
-check in `waitForSshReady` so a dead QEMU is reported as a dead QEMU. Either
-way it needs its own gate, and the gate has to be the host tier, because the
-unit tier cannot tell a bootable argv from an unbootable one.
+**Measured through the real harness**, `provisionBaseline` →
+`revertToBaseline` → `execInGuest` → `stopAndCleanup`, twice against the
+2026-09-15 golden: SSH ready at **53 s** and **47 s**, **2 firmware boots**
+each, `echo` answered verbatim, `set /a 6*7` answered `42`, machine SIDs
+`S-1-5-21-4141119040-1327074746-2687477893` and
+`S-1-5-21-3248826874-1080048203-430612151` — distinct, so `/generalize` took.
+The golden's `windows.qcow2` was sha256-identical before and after, and
+`instances/` was empty afterwards with no stray `qemu-system-aarch64` or
+`swtpm socket`.
+
+**Why no test caught it, which is the part worth keeping.** The unit tier
+asserted the *argv*, and one of its tests (`the per-job boot keeps -no-reboot
+and its own boot order`) asserted `-no-reboot` was present — so the gate
+actively pinned the defect. Three review passes also treated "the per-job
+argv is byte-identical to HEAD" as a safety property; it was, and the vector
+it was protecting had never booted a generalized golden. Two things changed:
+
+- The unit tier's fake QEMU now **performs** the mandatory reboot and takes
+  QEMU's own decision on it *from the argv it was handed*, so restoring
+  `-no-reboot` to production code makes the end-to-end unit tests fail. It
+  can now tell a bootable vector from an unbootable one in that one modelled
+  sense.
+- A host gate exists that actually boots one:
+  `tests/e2e/t_qemu_windows_arm_per_job_boot_host.nim`, wired into
+  `scripts/run-host-tests.sh`. It consumes a golden that already exists, so
+  it costs about two minutes rather than MA3's ~60-minute install, and it
+  skips loudly — naming the golden path it looked at and the environment
+  variable that overrides it — when there is no golden or the host is wrong.
+  It is the gate that should have caught this, and the one to run after any
+  change to `buildQemuWindowsArmArgs`, `waitForFirstBootSshReady` or
+  `revertToBaseline`.
+
+**Still open, and filed as MA8.** The run path has no liveness check:
+`waitForSshReady` never consults the QEMU pid, so a guest that dies for any
+*other* reason is still polled until the SSH deadline and then reported as an
+SSH failure. Allowing the reboot removes the one cause that was making that
+happen on every instance; it does not add the watchdog.
+
 
 ### Two traps the runs left behind, and what now stops them
 

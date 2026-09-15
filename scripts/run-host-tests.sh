@@ -42,6 +42,13 @@ run_nim r --hints:off tests/e2e/t_vmharness_serve_macos_tart.nim
 # paths, because one run is a real ~60 minute Windows install. With any
 # precondition missing it SKIPS and names each one; it never passes quietly.
 run_nim r --hints:off tests/e2e/t_qemu_windows_arm_golden_build_host.nim
+# Runner-Fleet-M3-ARM-Wave MA4 gate: t_qemu_windows_arm_per_job_boot, HOST
+# TIER. Boots an EXISTING golden through the per-job path a CI job uses and
+# requires SSH plus a real command. ~2 minutes, no opt-in flag: it needs only
+# a finished golden, and it is the gate that would have caught `-no-reboot`
+# making every per-job instance die 38s in. Skips loudly, naming the golden
+# path it looked at, when there is none.
+run_nim r --hints:off tests/e2e/t_qemu_windows_arm_per_job_boot_host.nim
 run_nim r --hints:off tests/integration/t_utm_lifecycle.nim
 run_nim r --hints:off tests/e2e/t_vm_harness_utm_windows_arm_smoke.nim
 run_nim r --hints:off tests/e2e/t_vm_harness_utm_windows_dism_works_under_prism.nim

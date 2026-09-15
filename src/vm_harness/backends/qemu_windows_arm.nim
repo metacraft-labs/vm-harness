@@ -223,6 +223,75 @@ const
     ## that bound; retrying is cheaper than failing a build an hour in on a
     ## process start.
 
+  # ---- The per-job boot's reboot lifecycle (Runner-Fleet-M3-ARM-Wave MA4) --
+  #
+  # A ``/generalize``d golden MUST reboot once on the first boot of every
+  # clone, and the per-job boot has to survive that reboot and then stop
+  # allowing them. These two are the two ends of that transition and they are
+  # read straight into QEMU's ``-action reboot=`` / ``set-action`` vocabulary.
+  QwaFirstBootRebootAction* = "reset"
+    ## What a guest-initiated reboot does while the instance is still coming
+    ## up: restart the guest, which is QEMU's default and NOT what
+    ## ``-no-reboot`` does.
+    ##
+    ## MEASURED on m3 2026-09-15 against
+    ## ``golden/win-arm-runner-20260915T154742Z``, same overlay recipe, same
+    ## firmware pair, same swtpm, argv from this proc:
+    ##
+    ## * with ``-no-reboot``: QEMU EXITS rc=0 38 seconds in, ``serial.log``
+    ##   ending on ``BdsDxe: starting Boot0003 "Windows Boot Manager"``, and
+    ##   no SSH ever — on every instance, because ``repro-sysprep.xml`` drives
+    ##   a fresh specialize pass and then an oobeSystem pass with a Windows
+    ##   reboot between them, and ``sshd`` is started by the
+    ##   ``FirstLogonCommands`` that run AFTER that reboot.
+    ## * with ``reset``: SSH ready in **52 seconds**, and ``serial.log``
+    ##   carries EXACTLY TWO firmware banners — the power-on boot and the one
+    ##   mandatory reboot.
+  QwaOneShotRebootAction* = "shutdown"
+    ## What a guest-initiated reboot does once the instance has been reached:
+    ## end the guest, which is exactly what ``-no-reboot`` meant.
+    ##
+    ## This is not cosmetic and the transition is not optional. The one-shot
+    ## lifecycle guarantee is that a job's guest cannot silently reboot and
+    ## carry state into a second life, and it is the reason ``-no-reboot`` was
+    ## there in the first place. MEASURED on m3 2026-09-15 on one guest, in
+    ## sequence: booted with ``-action reboot=reset``, ``shutdown /r /t 0``
+    ## inside the guest left QEMU ALIVE 84 seconds later with a THIRD firmware
+    ## banner in the serial log — the guarantee genuinely gone. Then
+    ## ``set-action`` with this value over QMP, and the same
+    ## ``shutdown /r /t 0`` ended QEMU in **6 seconds** with no new firmware
+    ## boot. So the runtime transition restores the property rather than
+    ## approximating it.
+    ##
+    ## It has to be QMP: HMP (the ``-monitor`` socket this file has always
+    ## had) has no ``set-action``. Checked against the QEMU on m3
+    ## (10.1.5): its HMP command list carries ``watchdog_action`` and nothing
+    ## else of the sort, while QMP's ``query-commands`` lists ``set-action``.
+  QwaFirmwareBannerMarker* = "UEFI firmware (version "
+    ## One occurrence per FIRMWARE boot on the guest serial console. EDK2
+    ## prints it as its first line every time it starts, so counting it turns
+    ## the serial log into a boot counter — which is the only way this harness
+    ## can see a reboot at all, given that the reboot is now allowed and QEMU
+    ## no longer exits on it.
+  QwaFirstBootMaxFirmwareBoots* = 4
+    ## How many firmware boots the first boot of an instance may take before
+    ## SSH is reached. Past this the guest is REBOOT-LOOPING, not booting
+    ## slowly, and the instance is failed by name instead of waiting out the
+    ## SSH deadline in silence.
+    ##
+    ## The bound exists because allowing reboots at all reintroduces a failure
+    ## mode ``-no-reboot`` could not have: an endless one. It is the same
+    ## shape as ``QwaInstallKeyPressWindowSec`` — a capability the boot needs
+    ## once, bounded so it cannot become the boot's whole behaviour.
+    ##
+    ## MEASURED: a healthy first boot of the 2026-09-15 golden shows EXACTLY
+    ## TWO banners (power-on, then the specialize -> oobeSystem reboot). Four
+    ## is double that, so a guest that needed one extra retry still boots.
+  QwaQmpTimeoutMs* = 4_000
+    ## Bound on one QMP conversation (greeting, capabilities negotiation, one
+    ## command). Local unix socket to a process this harness started, so this
+    ## is generous; the point is that a wedged monitor cannot hang a CI job.
+
 type
   PortAllocationLock* = object
     held*: bool
@@ -501,6 +570,16 @@ proc qwaMonitorSocketPath*(vmDir: string): string =
   ## expression the argv uses so the two cannot drift.
   shortSocketPath("vmh-qwa-mon", vmDir)
 
+proc qwaQmpSocketPath*(vmDir: string): string =
+  ## The QMP socket published by the PER-JOB argv for ``vmDir``. Distinct from
+  ## ``qwaMonitorSocketPath``: HMP and QMP are two protocols and QEMU serves
+  ## each on its own socket.
+  ##
+  ## It exists for exactly one operation — ``set-action`` on the reboot event,
+  ## which HMP cannot express (see ``QwaOneShotRebootAction``). Everything
+  ## else this backend asks a running guest still goes over the HMP monitor.
+  shortSocketPath("vmh-qwa-qmp", vmDir)
+
 proc pathExists(path: string): bool =
   try:
     discard getFileInfo(path, followSymlink = false)
@@ -576,12 +655,41 @@ proc qwaMachineArgs(vmDir, disk: string, sshPort, cpus, memoryMB,
 
 proc buildQemuWindowsArmArgs*(vmDir: string, sshPort: int,
                               cpus: int = 4, memoryMB: int = 8192): seq[string] =
-  ## Per-job boot: one guest command, then teardown. ``-no-reboot`` turns a
-  ## guest-initiated reboot into an exit, which is what the one-shot
-  ## lifecycle wants.
+  ## Per-job boot: one guest command, then teardown.
+  ##
+  ## THE FIRST BOOT OF AN INSTANCE MUST BE ALLOWED TO REBOOT, and this argv
+  ## used to forbid it. It carried ``-no-reboot`` — i.e. ``-action
+  ## reboot=shutdown`` — from the start, which was harmless only for as long
+  ## as the fleet's Windows goldens were NOT sysprepped (see
+  ## ``infra/checks/t_windows_sysprep_golden.sh``, whose own header records
+  ## that the non-sysprepped golden's clones shared the base SID). A
+  ## non-generalized image boots straight through with no specialize pass and
+  ## no reboot. A ``/generalize``d one — which is what the 2026-09-15 golden
+  ## is, and what makes distinct machine SIDs possible at all — MUST reboot
+  ## once between its specialize and oobeSystem passes, and ``sshd`` is
+  ## started by the ``FirstLogonCommands`` that run AFTER that reboot. So
+  ## ``-no-reboot`` made QEMU exit rc=0 ~38s into every boot, before OpenSSH
+  ## had ever existed. See ``QwaFirstBootRebootAction`` for the A/B.
+  ##
+  ## The one-shot guarantee ``-no-reboot`` provided is NOT given up. It is
+  ## moved to where the instance's lifetime actually starts: ``-action
+  ## reboot=reset`` here, then ``set-action`` back to ``shutdown`` over the
+  ## QMP socket below, the moment SSH is first reached and BEFORE the handle
+  ## is returned to a caller that could run a job on it. The window in which
+  ## a reboot is tolerated is therefore bounded twice — by the first
+  ## successful SSH probe, and by ``QwaFirstBootMaxFirmwareBoots`` firmware
+  ## boots counted off the serial console — and nothing has run in the guest
+  ## while it is open, because the runner has not registered yet.
+  ##
+  ## ``-action reboot=reset`` is QEMU's default and is stated EXPLICITLY on
+  ## purpose: the intent ("this boot is allowed its reboot") should be
+  ## assertable as a present argument rather than as the absence of one, since
+  ## the absence is precisely what three review passes read as safety.
   result = qwaMachineArgs(vmDir, qwaDiskImagePath(vmDir), sshPort, cpus,
                           memoryMB, diskBootIndex = 1)
-  result.add("-no-reboot")
+  result.add(@["-action", "reboot=" & QwaFirstBootRebootAction])
+  result.add(@["-qmp",
+               "unix:" & qwaQmpSocketPath(vmDir) & ",server=on,wait=off"])
   result.add(qemuFirmwareArgs(vmDir))
 
 proc buildQemuWindowsArmInstallArgs*(vmDir, windowsIso, autounattendIso: string,
@@ -589,9 +697,15 @@ proc buildQemuWindowsArmInstallArgs*(vmDir, windowsIso, autounattendIso: string,
                                      memoryMB: int = 8192): seq[string] =
   ## Golden install boot. Three deliberate differences from the per-job boot:
   ##
-  ## * ``-no-reboot`` is omitted. Windows setup reboots several times between
-  ##   media boot and OOBE, and exiting on the first one leaves a half
-  ##   installed disk that looks like a hung build.
+  ## * ``-no-reboot`` is omitted, and stays omitted for the WHOLE run.
+  ##   Windows setup reboots several times between media boot and OOBE, and
+  ##   exiting on the first one leaves a half installed disk that looks like a
+  ##   hung build. The per-job boot now also tolerates a reboot, but only
+  ##   until it first reaches SSH, at which point it transitions back to
+  ##   one-shot semantics (``QwaOneShotRebootAction``); an install has no such
+  ##   moment, so it needs no QMP socket and is not given one — which also
+  ##   keeps the argv that produced the golden on disk reproducible from this
+  ##   source.
   ## * The two ISOs are attached to DIFFERENT controllers, and which one each
   ##   gets is measured rather than a matter of taste. MEASURED on m3
   ##   2026-09-15: with BOTH on the xHCI as ``usb-storage``, two of five runs
@@ -929,20 +1043,88 @@ proc releaseInstanceLock*(b: QemuWindowsArmBackend, name: string) =
       discard posix.close(fd)
       b.instanceLockFds.del(name)
 
-proc waitForSshReady*(b: QemuWindowsArmBackend, port: int,
-                    timeoutSec: int): bool =
-  let deadline = epochTime() + timeoutSec.float
+proc qwaFirmwareBootCount*(serialPath: string): int =
+  ## How many times the guest's FIRMWARE has started, counted off the serial
+  ## console. EDK2 prints ``QwaFirmwareBannerMarker`` as its first line on
+  ## every boot, and the ``-serial file:`` chardev stays open across a guest
+  ## reset, so the occurrences accumulate within one QEMU process.
+  ##
+  ## This is the only reboot signal the harness has now that a reboot no
+  ## longer ends QEMU. A missing or unreadable log counts as zero boots
+  ## rather than raising: it means the firmware has not spoken yet, which is
+  ## an ordinary state in the first second of a boot.
+  if serialPath.len == 0:
+    return 0
+  try:
+    readFile(serialPath).count(QwaFirmwareBannerMarker)
+  except CatchableError:
+    0
+
+type
+  FirstBootOutcome* = enum
+    ## How the wait for an instance's first SSH ended. Three outcomes and not
+    ## a ``bool``, because "the guest never answered" and "the guest kept
+    ## rebooting" want different messages and take different amounts of time
+    ## to establish.
+    fbSshReady           ## SSH answered the readiness probe.
+    fbSshTimedOut        ## the SSH deadline expired.
+    fbRebootLoop         ## the firmware kept restarting past its allowance.
+
+  FirstBootResult* = object
+    outcome*: FirstBootOutcome
+    firmwareBoots*: int    ## banners seen on the serial console
+    elapsedSec*: float
+
+proc waitForFirstBootSshReady*(b: QemuWindowsArmBackend, port: int,
+                               timeoutSec: int, serialPath: string = "",
+                               maxFirmwareBoots: int =
+                                 QwaFirstBootMaxFirmwareBoots,
+                               pollMs: int = 3000): FirstBootResult =
+  ## Wait for the first SSH of a freshly-created instance, tolerating the ONE
+  ## reboot a ``/generalize``d golden has to perform — and bounding it.
+  ##
+  ## The bound is the point. Allowing reboots is what makes the boot work at
+  ## all (``QwaFirstBootRebootAction``), and it also introduces a failure mode
+  ## ``-no-reboot`` could not have: a guest that restarts forever instead of
+  ## dying. Counting firmware banners turns that into a fast, named failure
+  ## rather than the whole ``sshReadyTimeoutSec`` spent in silence.
+  ##
+  ## ``serialPath = ""`` or ``maxFirmwareBoots <= 0`` disables the bound and
+  ## leaves the deadline as the only limit, which is what a caller with no
+  ## serial console to read asks for.
+  let start = epochTime()
+  let deadline = start + timeoutSec.float
   let pwdFile = writePasswordFile(b.sshPassword)
   defer:
     try: removeFile(pwdFile)
     except CatchableError: discard
+  result = FirstBootResult(outcome: fbSshTimedOut, firmwareBoots: 0,
+                           elapsedSec: 0.0)
   while epochTime() < deadline:
     let cmd = b.buildSshpassSshArgs(pwdFile, port, "cmd /c \"echo ready\"")
     let r = runProcessCapture(cmd, timeoutSec = 20)
+    result.firmwareBoots = qwaFirmwareBootCount(serialPath)
     if r.exitCode == 0 and "ready" in r.stdout:
-      return true
-    sleep(3000)
-  false
+      result.outcome = fbSshReady
+      result.elapsedSec = epochTime() - start
+      return
+    if maxFirmwareBoots > 0 and result.firmwareBoots > maxFirmwareBoots:
+      result.outcome = fbRebootLoop
+      result.elapsedSec = epochTime() - start
+      return
+    let remainingMs = int((deadline - epochTime()) * 1000.0)
+    if remainingMs <= 0:
+      break
+    sleep(min(pollMs, remainingMs + 1))
+  result.firmwareBoots = qwaFirmwareBootCount(serialPath)
+  result.elapsedSec = epochTime() - start
+
+proc waitForSshReady*(b: QemuWindowsArmBackend, port: int,
+                    timeoutSec: int): bool =
+  ## The plain "did SSH come up" question, with no reboot accounting. Kept
+  ## for callers that have no serial console to count boots on;
+  ## ``revertToBaseline`` uses ``waitForFirstBootSshReady`` because it does.
+  b.waitForFirstBootSshReady(port, timeoutSec).outcome == fbSshReady
 
 proc startSwtpmInBackground*(b: QemuWindowsArmBackend, vmDir: string): int =
   let tpmDir = vmDir / "tpm"
@@ -1194,6 +1376,114 @@ proc sendQemuMonitorCommand*(monitorPath, command: string,
     true
   else:
     false
+
+proc qmpCommand*(qmpPath, command: string, arguments: JsonNode = nil,
+                 timeoutMs: int = QwaQmpTimeoutMs):
+                 tuple[ok: bool, detail: string] =
+  ## Run ONE QMP command on ``qmpPath`` and report whether QEMU accepted it.
+  ##
+  ## Deliberately NOT modelled on ``queryQemuMonitor``, because QMP is not
+  ## HMP and the differences are the whole reason this exists:
+  ##
+  ## * every message is one newline-terminated JSON object, so a reply is
+  ##   recognisable rather than guessed at from a prompt with no newline;
+  ## * the connection opens with a greeting and REFUSES every command until
+  ##   ``qmp_capabilities`` has been executed, so the negotiation is not
+  ##   optional politeness;
+  ## * asynchronous EVENTS share the stream and can arrive between a command
+  ##   and its reply, so anything carrying an ``event`` key is skipped rather
+  ##   than mistaken for the answer.
+  ##
+  ## A failure is returned, never raised, and ``detail`` says which step
+  ## failed — the caller's decision is a lifecycle one (see
+  ## ``QwaOneShotRebootAction``) and it needs the reason in its own message.
+  when defined(posix):
+    if qmpPath.len == 0 or not pathExists(qmpPath):
+      return (ok: false, detail: "no QMP socket at " & qmpPath &
+              " (QEMU publishes one only for the per-job boot; an instance " &
+              "started by an older harness has none)")
+    var sock: Socket
+    try:
+      sock = newSocket(net.Domain.AF_UNIX, net.SockType.SOCK_STREAM,
+                       net.Protocol.IPPROTO_IP)
+    except CatchableError as e:
+      return (ok: false, detail: "cannot create a unix socket: " & e.msg)
+    try:
+      sock.connectUnix(qmpPath)
+    except CatchableError as e:
+      try: sock.close()
+      except CatchableError: discard
+      return (ok: false, detail: "cannot connect to " & qmpPath & ": " & e.msg)
+    defer:
+      try: sock.close()
+      except CatchableError: discard
+
+    let deadline = epochTime() + timeoutMs.float / 1000.0
+    proc nextMessage(): JsonNode =
+      ## The next JSON object that is not an asynchronous event, or nil.
+      while epochTime() < deadline:
+        var line = ""
+        let remainingMs = max(1, int((deadline - epochTime()) * 1000.0))
+        try:
+          sock.readLine(line, timeout = remainingMs)
+        except CatchableError:
+          return nil
+        if line.len == 0:
+          return nil          # the peer went away
+        var parsed: JsonNode
+        try:
+          parsed = parseJson(line)
+        except CatchableError:
+          continue
+        if parsed.kind == JObject and parsed.hasKey("event"):
+          continue
+        return parsed
+      nil
+
+    try:
+      let greeting = nextMessage()
+      if greeting.isNil or not greeting.hasKey("QMP"):
+        return (ok: false, detail: qmpPath & " did not send a QMP greeting")
+      sock.send($(%*{"execute": "qmp_capabilities"}) & "\n")
+      let negotiated = nextMessage()
+      if negotiated.isNil or not negotiated.hasKey("return"):
+        return (ok: false, detail: "qmp_capabilities was not accepted on " &
+                qmpPath & ": " &
+                (if negotiated.isNil: "no reply" else: $negotiated))
+      var request = %*{"execute": command}
+      if not arguments.isNil:
+        request["arguments"] = arguments
+      sock.send($request & "\n")
+      let reply = nextMessage()
+      if reply.isNil:
+        return (ok: false, detail: command & " got no reply on " & qmpPath)
+      if reply.hasKey("error"):
+        return (ok: false, detail: command & " was refused: " & $reply["error"])
+      if not reply.hasKey("return"):
+        return (ok: false, detail: command & " got an unrecognised reply: " &
+                $reply)
+      return (ok: true, detail: $reply)
+    except CatchableError as e:
+      return (ok: false, detail: command & " on " & qmpPath & " failed: " &
+              e.msg)
+  else:
+    (ok: false, detail: "QMP requires a POSIX host")
+
+proc setQemuRebootAction*(qmpPath, action: string,
+                          timeoutMs: int = QwaQmpTimeoutMs):
+                          tuple[ok: bool, detail: string] =
+  ## Change what a guest-initiated reboot does, on a guest that is already
+  ## running. This is the runtime half of the per-job boot's reboot
+  ## lifecycle: the argv starts the guest rebootable so a generalized golden
+  ## can complete its specialize -> oobeSystem pass, and this puts the
+  ## one-shot semantics back once SSH has been reached.
+  ##
+  ## ``-no-reboot`` and ``-action`` are START-TIME only; HMP cannot express
+  ## this and QMP's ``set-action`` can. VERIFIED on m3 2026-09-15 against a
+  ## real guest: after this call a ``shutdown /r /t 0`` in the guest ended
+  ## QEMU in 6 seconds, where the same command on the same guest before it
+  ## left QEMU running with a further firmware boot.
+  qmpCommand(qmpPath, "set-action", %*{"reboot": action}, timeoutMs)
 
 proc goldenDiskProgressed*(diskPath: string,
                            thresholdBytes: int64 = QwaInstallProgressBytes):
@@ -2113,18 +2403,59 @@ method revertToBaseline*(b: QemuWindowsArmBackend, baselineName: string): VmHand
   let port = started.sshPort
   let pid = started.pid
   b.qemuPids[name] = pid
-  if not b.waitForSshReady(port, b.sshReadyTimeoutSec):
+  let serialPath = vmDir / QwaSerialLogName
+  let qmpPath = qwaQmpSocketPath(vmDir)
+
+  proc failStartup(reason: string) =
     let vm = VmHandle(backend: b, name: name, baseline: baselineName,
                       ipAddress: some("127.0.0.1"), sshPort: port,
                       sshUser: b.sshUser,
-                      sshAuth: SshAuth(kind: saPassword, password: b.sshPassword),
+                      sshAuth: SshAuth(kind: saPassword,
+                                       password: b.sshPassword),
                       extra: {"vmDir": vmDir, "qemuPid": $pid,
                               "swtpmPid": $swtpmPid}.toTable)
     b.stopAndCleanup(vm, deleteVm = true)
     raise (ref GuestBootFailureError)(
-      msg: "QemuWindowsArmBackend: SSH did not become ready on " &
-           "127.0.0.1:" & $port & " within " & $b.sshReadyTimeoutSec & "s",
+      msg: "QemuWindowsArmBackend: " & reason,
       backend: $b.id, phase: lpStartup)
+
+  # The first boot of an instance is allowed its ONE mandatory reboot and no
+  # more; see buildQemuWindowsArmArgs.
+  let firstBoot = b.waitForFirstBootSshReady(port, b.sshReadyTimeoutSec,
+                                             serialPath)
+  case firstBoot.outcome
+  of fbRebootLoop:
+    failStartup("the guest's firmware started " & $firstBoot.firmwareBoots &
+      " times without SSH becoming ready on 127.0.0.1:" & $port &
+      " (allowance " & $QwaFirstBootMaxFirmwareBoots & ", reached after " &
+      $int(firstBoot.elapsedSec) & "s). A generalized golden reboots EXACTLY " &
+      "ONCE, between its specialize and oobeSystem passes; more than that is " &
+      "a boot loop, not a slow boot. Guest serial console: " & serialPath)
+  of fbSshTimedOut:
+    failStartup("SSH did not become ready on 127.0.0.1:" & $port &
+      " within " & $b.sshReadyTimeoutSec & "s (the guest's firmware started " &
+      $firstBoot.firmwareBoots & " time(s); a healthy first boot of a " &
+      "generalized golden shows two). Guest serial console: " & serialPath)
+  of fbSshReady:
+    discard
+
+  # SSH is up, so the instance's life as a job runner starts HERE — and so
+  # must the one-shot lifecycle guarantee. Until this call lands, a guest
+  # reboot merely restarts the guest, which is what let it finish its
+  # oobeSystem pass; from here on it ends the guest, which is what
+  # -no-reboot used to mean for the whole boot.
+  #
+  # A refusal FAILS the instance. Handing back a guest that can silently
+  # reboot and carry a job's state into a second life is the exact property
+  # -no-reboot existed to prevent, and "we could not restore it" is not a
+  # state a CI job may run in.
+  let restored = setQemuRebootAction(qmpPath, QwaOneShotRebootAction)
+  if not restored.ok:
+    failStartup("the guest booted and answered SSH on 127.0.0.1:" & $port &
+      ", but one-shot reboot semantics could not be restored over QMP, so " &
+      "the instance was refused rather than handed out able to reboot " &
+      "itself: " & restored.detail)
+
   VmHandle(
     backend: b,
     name: name,
@@ -2134,7 +2465,10 @@ method revertToBaseline*(b: QemuWindowsArmBackend, baselineName: string): VmHand
     sshUser: b.sshUser,
     sshAuth: SshAuth(kind: saPassword, password: b.sshPassword),
     extra: {"vmDir": vmDir, "baselineDir": baselineDir, "qemuPid": $pid,
-            "swtpmPid": $swtpmPid}.toTable)
+            "swtpmPid": $swtpmPid, "qmpSocket": qmpPath,
+            "rebootAction": QwaOneShotRebootAction,
+            "firmwareBoots": $firstBoot.firmwareBoots,
+            "sshReadySec": $int(firstBoot.elapsedSec)}.toTable)
 
 method execInGuest*(b: QemuWindowsArmBackend, vm: VmHandle,
                    env: Table[string, string],

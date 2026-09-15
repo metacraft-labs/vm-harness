@@ -63,8 +63,8 @@
 ## real recipe files are read off disk, and the real ``shasum`` computes the
 ## manifest digests.
 
-import std/[json, net, os, osproc, posix, sequtils, strutils, tempfiles,
-            times, unittest]
+import std/[json, net, os, osproc, posix, sequtils, strutils, tables,
+            tempfiles, times, unittest]
 import vm_harness
 
 const
@@ -76,6 +76,18 @@ const
   FakeFreezeEnv = "VMH_GOLDEN_FAKE_QEMU_FREEZE_FIRST_BOOT"
   FakeBootCountName = ".fake-boots"
   FakeSwtpmLogEnv = "VMH_GOLDEN_FAKE_SWTPM_LOG"
+  # The per-job boot's reboot lifecycle (MA4).
+  FakeFirstBootRebootEnv = "VMH_GOLDEN_FAKE_QEMU_FIRST_BOOT_REBOOT"
+    ## Model a generalized golden: reboot ONCE before sshd exists.
+  FakeBootLoopEnv = "VMH_GOLDEN_FAKE_QEMU_BOOT_LOOP"
+    ## Model a guest that restarts forever and never reaches sshd.
+  FakeQmpRefuseEnv = "VMH_GOLDEN_FAKE_QMP_REFUSE"
+    ## Model a QEMU that will not take ``set-action``.
+  QmpLogName = ".fake-qmp-commands"
+  SshReadyFlagName = "ssh-ready"
+  FakeFirmwareBanner =
+    "UEFI firmware (version edk2-fake built at 00:00:00 on Jan 1 1980)\n"
+    ## One per firmware boot, carrying ``QwaFirmwareBannerMarker`` verbatim.
 
 proc argValue(flag: string): string =
   for i in 1 ..< paramCount():
@@ -132,9 +144,15 @@ proc maybeRunFakeQemu() =
     else:
       writeFile(bootFlag, "first boot\n")
   let serialArg = argStartingWith("file:")
-  if serialArg.len > 0:
-    writeFile(serialArg["file:".len .. ^1],
-              "fake guest serial console output\n")
+  let serialPath =
+    if serialArg.len > 0: serialArg["file:".len .. ^1] else: ""
+  if serialPath.len > 0:
+    # One firmware banner per boot, as EDK2 prints it and as
+    # ``qwaFirmwareBootCount`` counts it. The fake has to speak this now that
+    # a reboot no longer ends QEMU: the serial log is the ONLY place a reboot
+    # is visible from outside the guest.
+    writeFile(serialPath,
+              FakeFirmwareBanner & "fake guest serial console output\n")
   let qemuLog = argValue("-D")
   if qemuLog.len > 0:
     writeFile(qemuLog, "fake qemu log\n")
@@ -170,12 +188,125 @@ proc maybeRunFakeQemu() =
                           net.Protocol.IPPROTO_IP)
   monitor.bindUnix(monitorPath)
   monitor.listen()
-  while true:
+
+  # ---- QMP, when the argv publishes one ----------------------------------
+  #
+  # Only the PER-JOB vector does. This fake serves it for one reason: HMP has
+  # no ``set-action``, so the transition back to one-shot reboot semantics is
+  # a QMP conversation and nothing else can observe it. The negotiation is
+  # modelled faithfully — greeting, then every command REFUSED until
+  # ``qmp_capabilities`` — because a client that skipped it would work
+  # against a lenient fake and fail against a real QEMU.
+  var qmpListener: Socket = nil
+  let qmpArg = argValue("-qmp")
+  if qmpArg.startsWith("unix:") and qmpArg.find(",server=on") > 0:
+    let qmpPath = qmpArg["unix:".len ..< qmpArg.find(",server=on")]
+    removeFile(qmpPath)
+    qmpListener = newSocket(net.Domain.AF_UNIX, net.SockType.SOCK_STREAM,
+                            net.Protocol.IPPROTO_IP)
+    qmpListener.bindUnix(qmpPath)
+    qmpListener.listen()
+
+  # ---- The guest's reboot timeline ---------------------------------------
+  #
+  # A real ``/generalize``d golden reboots ONCE before ``sshd`` has ever
+  # existed, between its specialize and oobeSystem passes. That reboot is the
+  # whole reason the per-job argv changed, so the fake performs it — and
+  # takes the same decision on it that QEMU takes, READ OFF THE ARGV IT WAS
+  # HANDED. That is what lets this tier tell a bootable argument vector from
+  # an unbootable one, which is exactly what it could not do before.
+  let firstBootReboot = getEnv(FakeFirstBootRebootEnv) == "1"
+  let bootLoop = getEnv(FakeBootLoopEnv) == "1"
+  let sshDir = getEnv(FakeSshDirEnv)
+  var runtimeRebootAction =
+    if "-no-reboot" in commandLineParams(): "shutdown"
+    elif argValue("-action") == "reboot=shutdown": "shutdown"
+    else: "reset"
+  var nextRebootAt =
+    if firstBootReboot or bootLoop: epochTime() + 1.2 else: 0.0
+
+  proc simulateGuestReboot() =
+    if runtimeRebootAction == "shutdown":
+      # -no-reboot, by either spelling: QEMU EXITS. On the first boot of a
+      # generalized golden that happens before sshd exists, which is the
+      # 2026-09-15 defect, reproduced here from the real argument vector.
+      quit(QuitSuccess)
+    if serialPath.len > 0:
+      let f = open(serialPath, fmAppend)
+      f.write(FakeFirmwareBanner)
+      f.close()
+    if bootLoop:
+      nextRebootAt = epochTime() + 0.4
+    else:
+      nextRebootAt = 0.0
+      # sshd is started by the FirstLogonCommands that run AFTER the reboot.
+      if sshDir.len > 0:
+        writeFile(sshDir / "ssh-ready", "")
+
+  proc serveQmpClient() =
+    let fd = posix.accept(qmpListener.getFd(), nil, nil)
+    if cint(fd) < 0:
+      return
+    var client = newSocket(fd, net.Domain.AF_UNIX, net.SockType.SOCK_STREAM,
+                           net.Protocol.IPPROTO_IP)
+    var negotiated = false
+    proc reply(node: JsonNode) =
+      client.send($node & "\n")
+    proc ok(): JsonNode =
+      result = newJObject()
+      result["return"] = newJObject()
+    proc err(desc: string): JsonNode =
+      result = newJObject()
+      result["error"] = %*{"class": "GenericError", "desc": desc}
+    try:
+      reply(%*{"QMP": {"version": {"qemu": {"major": 10, "minor": 1,
+                                            "micro": 5}},
+                       "capabilities": ["oob"]}})
+      while true:
+        var line = ""
+        client.readLine(line, timeout = 500)
+        if line.len == 0:
+          break
+        let log = open(getCurrentDir() / QmpLogName, fmAppend)
+        log.writeLine(line)
+        log.close()
+        var request: JsonNode
+        try:
+          request = parseJson(line)
+        except CatchableError:
+          reply(err("not JSON"))
+          continue
+        let cmd =
+          if request.kind == JObject and request.hasKey("execute"):
+            request["execute"].getStr
+          else: ""
+        if cmd == "qmp_capabilities":
+          negotiated = true
+          reply(ok())
+        elif not negotiated:
+          reply(err("Expecting capabilities negotiation with " &
+                    "'qmp_capabilities'"))
+        elif cmd == "set-action":
+          if getEnv(FakeQmpRefuseEnv) == "1":
+            reply(err("fake QEMU refuses set-action"))
+          else:
+            if request.hasKey("arguments") and
+               request["arguments"].hasKey("reboot"):
+              runtimeRebootAction = request["arguments"]["reboot"].getStr
+            reply(ok())
+        else:
+          reply(err("fake QEMU does not implement " & cmd))
+    except CatchableError:
+      discard
+    try: client.close()
+    except CatchableError: discard
+
+  proc serveMonitorClient() =
     # Raw accept: std/net's own ``accept`` stringifies the peer address, and
     # an AF_UNIX peer has none, so it raises on a perfectly good connection.
     let fd = posix.accept(monitor.getFd(), nil, nil)
     if cint(fd) < 0:
-      continue
+      return
     var client = newSocket(fd, net.Domain.AF_UNIX, net.SockType.SOCK_STREAM,
                            net.Protocol.IPPROTO_IP)
     try:
@@ -242,6 +373,27 @@ proc maybeRunFakeQemu() =
     try: client.close()
     except CatchableError: discard
 
+  # One loop over both control sockets, plus the reboot clock. A real QEMU
+  # serves whichever the harness connects to next; the harness's own calls are
+  # sequential, so serving one client at a time is faithful.
+  while true:
+    if nextRebootAt > 0.0 and epochTime() >= nextRebootAt:
+      simulateGuestReboot()
+    var readable: TFdSet
+    FD_ZERO(readable)
+    FD_SET(cint(monitor.getFd()), readable)
+    var maxFd = cint(monitor.getFd())
+    if qmpListener != nil:
+      FD_SET(cint(qmpListener.getFd()), readable)
+      maxFd = max(maxFd, cint(qmpListener.getFd()))
+    var tv = Timeval(tv_sec: posix.Time(0), tv_usec: Suseconds(200_000))
+    if posix.select(maxFd + 1, addr readable, nil, nil, addr tv) <= 0:
+      continue
+    if qmpListener != nil and FD_ISSET(cint(qmpListener.getFd()), readable) != 0:
+      serveQmpClient()
+    if FD_ISSET(cint(monitor.getFd()), readable) != 0:
+      serveMonitorClient()
+
 maybeRunFakeQemu()
 
 proc writeExecutable(path, body: string) =
@@ -292,6 +444,17 @@ if [ -n "${VMH_GOLDEN_FAKE_SSH_LOG:-}" ]; then
   printf '%s\n' "$last" >> "$VMH_GOLDEN_FAKE_SSH_LOG"
 fi
 case "$last" in
+  *"echo ready"*)
+    # The per-job readiness probe. Gated on a flag the fake QEMU creates
+    # AFTER its simulated reboot, because that is when the real guest's
+    # FirstLogonCommands start sshd -- a probe that answered before the
+    # reboot would make the whole reboot question invisible.
+    if [ -f "$VMH_GOLDEN_FAKE_SSH_DIR/ssh-ready" ]; then
+      echo "ready"
+      exit 0
+    fi
+    exit 1
+    ;;
   *VMH-SYSPREP-RUNNING*)
     # The "is sysprep still alive?" probe. Gated on a file so a test can say
     # which answer it wants -- the whole point of the check is that a launch
@@ -321,7 +484,13 @@ esac
 exit 1
 """)
 
-proc goldenBackend(tmp: string; qemuCmd = ""): QemuWindowsArmBackend =
+proc goldenBackend(tmp: string; qemuCmd = "";
+                   sshReadyTimeoutSec = 300): QemuWindowsArmBackend =
+  ## ``sshReadyTimeoutSec`` is shortened only by the per-job tests, and only
+  ## so a BROKEN per-job argv fails this suite in seconds instead of sitting
+  ## out the production deadline — which is what the run path itself does
+  ## today against a QEMU that has already exited (MA8). The shipped default
+  ## is pinned in "the shipped SSH-ready deadline is the production one".
   let swtpm = tmp / "swtpm"
   let sshpass = tmp / "sshpass"
   writeFakeSwtpm(swtpm)
@@ -331,7 +500,8 @@ proc goldenBackend(tmp: string; qemuCmd = ""): QemuWindowsArmBackend =
     swtpmCmd = swtpm,
     sshpassCmd = sshpass,
     stateDir = tmp / "state",
-    sshPort = 0)
+    sshPort = 0,
+    sshReadyTimeoutSec = sshReadyTimeoutSec)
 
 # ---------------------------------------------------------------------------
 # Moved intact from tests/unit/t_qemu_windows_arm_backend.nim.
@@ -413,6 +583,12 @@ suite "QemuWindowsArmBackend golden build":
     # Windows setup reboots several times before OOBE. Exiting on the first
     # one leaves a half-installed disk that looks like a hung build.
     check "-no-reboot" notin args
+    # And it never stops being rebootable, so it needs no way to revoke that
+    # at runtime. Keeping the QMP socket OUT of this vector is what keeps the
+    # golden on disk reproducible from this source: the argv that built it
+    # did not have one.
+    check "-qmp" notin args
+    check not args.anyIt("vmh-qwa-qmp" in it)
 
     # The install writes the base disk directly; overlays are a per-job
     # concern and must not appear here.
@@ -424,25 +600,44 @@ suite "QemuWindowsArmBackend golden build":
     check args[args.find("-display") + 1] == "none"
     check args.anyIt(it.startsWith("file:") and it.endsWith("serial.log"))
 
-  test "the per-job boot keeps -no-reboot and its own boot order":
-    ## WARNING, ADDED IN REVIEW 2026-09-15: the ``-no-reboot`` assertion below
-    ## PINS A DEFECT, and is left in place only because changing the deployed
-    ## per-job argv is not this slice's to make. MEASURED on m3 against the
-    ## real golden: a ``/generalize``d image reboots once between its
-    ## specialize and oobeSystem passes (``repro-sysprep.xml``, and the recipe
-    ## README §7 says so), ``sshd`` is started by the FirstLogonCommands that
-    ## run AFTER that reboot, so ``-no-reboot`` makes QEMU exit rc=0 at ~38s
-    ## and ``revertToBaseline`` NEVER reaches SSH. Removing ``-no-reboot`` and
-    ## changing nothing else reached SSH in 67s on the same golden. So this
-    ## file's argv assertions say the vector is UNCHANGED; they do not and
-    ## cannot say it is CORRECT. See "Open: the per-job boot cannot boot a
-    ## generalized golden" in docs/windows-arm-headless-golden.md.
+  test "the per-job boot allows its one mandatory reboot, and can revoke it":
+    ## THIS TEST USED TO PIN THE DEFECT. Until 2026-09-15 it asserted
+    ## ``-no-reboot`` was PRESENT, and it was: a ``/generalize``d golden
+    ## reboots once between its specialize and oobeSystem passes
+    ## (``repro-sysprep.xml``, and the recipe README §7 says so), ``sshd`` is
+    ## started by the FirstLogonCommands that run AFTER that reboot, so
+    ## ``-no-reboot`` made QEMU exit rc=0 at ~38s and ``revertToBaseline``
+    ## NEVER reached SSH. The gate certified the vector as unchanged three
+    ## times while it was byte-identically unbootable.
+    ##
+    ## So the assertions here are now about the SHAPE the boot needs, in both
+    ## directions: the reboot is allowed at start-time, AND the channel that
+    ## can revoke it at runtime is present. "The argv is byte-identical to
+    ## HEAD" is not a correctness claim and never was; the claim that the
+    ## per-job boot WORKS belongs to the host tier
+    ## (``tests/e2e/t_qemu_windows_arm_per_job_boot_host.nim``) and to the
+    ## end-to-end test in "The per-job boot: the reboot lifecycle" below.
     let tmp = createTempDir("vmh-qemu-win-arm-runargv-", "")
     defer: removeDir(tmp)
     writeFile(tmp / "windows.qcow2", "")
 
     let args = buildQemuWindowsArmArgs(tmp, 2241)
-    check "-no-reboot" in args
+    # Not -no-reboot, which is -action reboot=shutdown by another name.
+    check "-no-reboot" notin args
+    check "-action" in args
+    check args[args.find("-action") + 1] ==
+      "reboot=" & QwaFirstBootRebootAction
+    check QwaFirstBootRebootAction == "reset"
+    # And the runtime channel that takes it back once SSH is reached. HMP has
+    # no set-action, so this has to be a SECOND socket and a different one
+    # from the monitor.
+    check "-qmp" in args
+    check args[args.find("-qmp") + 1] ==
+      "unix:" & qwaQmpSocketPath(tmp) & ",server=on,wait=off"
+    check qwaQmpSocketPath(tmp) != qwaMonitorSocketPath(tmp)
+    check "-monitor" in args
+    check args[args.find("-monitor") + 1] ==
+      "unix:" & qwaMonitorSocketPath(tmp) & ",server=on,wait=off"
     check "nvme,drive=disk0,serial=winarm0,bootindex=1" in args
     check not args.anyIt("usb-storage" in it)
     # And no keyboard, and no xHCI to hang one off. This argument vector is
@@ -1396,6 +1591,212 @@ suite "Golden build: the manifest":
     check machineSidFromUserSid("not-a-sid") == ""
     check machineSidFromUserSid("") == ""
     check machineSidFromUserSid("S-1-5") == ""
+
+suite "The per-job boot: the reboot lifecycle":
+  ## Runner-Fleet-M3-ARM-Wave MA4. The defect this suite exists for was NOT a
+  ## regression: ``-no-reboot`` has been on the per-job vector since the
+  ## backend was written, and it was harmless for as long as the fleet's
+  ## Windows goldens were not sysprepped. A ``/generalize``d golden MUST
+  ## reboot once, so the flag turned every per-job boot into a QEMU that
+  ## exited rc=0 at ~38s with no SSH ever.
+  ##
+  ## WHAT THIS TIER CAN AND CANNOT SAY. The unit tier could not previously
+  ## tell a bootable argument vector from an unbootable one — it asserted
+  ## identity with HEAD, and HEAD was broken. It can now, in one specific and
+  ## limited sense: the fake QEMU PERFORMS the mandatory reboot and takes
+  ## QEMU's own decision on it from the argv it was handed, so restoring
+  ## ``-no-reboot`` to production code makes the end-to-end tests below fail.
+  ## What it still cannot say is that a real Windows guest reaches sshd; that
+  ## is ``tests/e2e/t_qemu_windows_arm_per_job_boot_host.nim``, and it is the
+  ## gate that should have caught this in the first place.
+
+  setup:
+    delEnv(FakeQemuEnv)
+    delEnv(FakeSshDirEnv)
+    delEnv(FakeFirstBootRebootEnv)
+    delEnv(FakeBootLoopEnv)
+    delEnv(FakeQmpRefuseEnv)
+
+  teardown:
+    delEnv(FakeQemuEnv)
+    delEnv(FakeSshDirEnv)
+    delEnv(FakeFirstBootRebootEnv)
+    delEnv(FakeBootLoopEnv)
+    delEnv(FakeQmpRefuseEnv)
+
+  test "firmware boots are counted off the serial console":
+    let tmp = createTempDir("vmh-qwa-bootcount-", "")
+    defer: removeDir(tmp)
+    let serial = tmp / QwaSerialLogName
+
+    # No log at all is "the firmware has not spoken yet", not an error.
+    check qwaFirmwareBootCount(serial) == 0
+    check qwaFirmwareBootCount("") == 0
+
+    writeFile(serial, FakeFirmwareBanner & "SyncPcrAllocations!\n")
+    check qwaFirmwareBootCount(serial) == 1
+    # A guest reset appends; the chardev stays open across it.
+    let f = open(serial, fmAppend)
+    f.write("BdsDxe: starting Boot0003\n" & FakeFirmwareBanner)
+    f.close()
+    check qwaFirmwareBootCount(serial) == 2
+    # And the marker is the one the REAL firmware prints, not a paraphrase.
+    check QwaFirmwareBannerMarker in
+      readFile(currentSourcePath().parentDir.parentDir.parentDir /
+               "src" / "vm_harness" / "backends" / "qemu_windows_arm.nim")
+
+  test "the shipped reboot allowance is the measured one, doubled":
+    # MEASURED on m3 2026-09-15: a healthy first boot of the real golden
+    # shows EXACTLY TWO banners, and SSH answered at 52s.
+    check QwaFirstBootMaxFirmwareBoots == 4
+    check QwaFirstBootRebootAction == "reset"
+    check QwaOneShotRebootAction == "shutdown"
+
+  test "the shipped SSH-ready deadline is the production one":
+    # The per-job end-to-end tests below shorten this deliberately. The
+    # default a real instance gets must not move with them.
+    check newQemuWindowsArmBackend().sshReadyTimeoutSec == 300
+
+  test "a guest that keeps rebooting is named, not waited out":
+    ## The failure mode that allowing reboots at all introduces, and the
+    ## reason the window is bounded rather than simply opened.
+    let tmp = createTempDir("vmh-qwa-loop-", "")
+    defer: removeDir(tmp)
+    let b = goldenBackend(tmp)
+    let serial = tmp / QwaSerialLogName
+    var banners = ""
+    for _ in 1 .. QwaFirstBootMaxFirmwareBoots + 1:
+      banners.add(FakeFirmwareBanner)
+    writeFile(serial, banners)
+    createDir(tmp / "ssh")
+    putEnv(FakeSshDirEnv, tmp / "ssh")   # no ssh-ready flag: SSH never comes
+
+    # A deadline far longer than this may take: the point is that the boot
+    # allowance ends it, not the clock.
+    let started = epochTime()
+    let outcome = b.waitForFirstBootSshReady(0, 120, serial)
+    check outcome.outcome == fbRebootLoop
+    check outcome.firmwareBoots == QwaFirstBootMaxFirmwareBoots + 1
+    check epochTime() - started < 30.0
+
+  test "an unbounded wait still ends at its deadline":
+    let tmp = createTempDir("vmh-qwa-loopoff-", "")
+    defer: removeDir(tmp)
+    let b = goldenBackend(tmp)
+    let serial = tmp / QwaSerialLogName
+    var banners = ""
+    for _ in 1 .. 20:
+      banners.add(FakeFirmwareBanner)
+    writeFile(serial, banners)
+    createDir(tmp / "ssh")
+    putEnv(FakeSshDirEnv, tmp / "ssh")
+
+    # maxFirmwareBoots <= 0 disables the bound; the deadline is then the only
+    # limit, and it is honoured.
+    let started = epochTime()
+    let outcome = b.waitForFirstBootSshReady(1, 1, serial,
+                                             maxFirmwareBoots = 0)
+    check outcome.outcome == fbSshTimedOut
+    check epochTime() - started < 30.0
+
+  test "a generalized golden's mandatory reboot is survived, then revoked":
+    ## THE END-TO-END GATE FOR MA4'S BLOCKER, at the unit tier: the real
+    ## ``revertToBaseline``, the real per-job argv, a real ``qemu-img``
+    ## overlay, and a fake QEMU that reboots once before SSH exists exactly
+    ## as a generalized guest does.
+    ##
+    ## Two things are asserted and both are load-bearing. The instance comes
+    ## up AT ALL — with ``-no-reboot`` the fake QEMU exits at the reboot and
+    ## this fails. And ``set-action reboot=shutdown`` really reached QEMU
+    ## before the handle was returned, which is where the one-shot lifecycle
+    ## guarantee now lives.
+    let tmp = createTempDir("vmh-qwa-perjob-ok-", "")
+    defer: removeDir(tmp)
+    let b = goldenBackend(tmp, sshReadyTimeoutSec = 45)
+    createDir(tmp / "ssh")
+    putEnv(FakeSshDirEnv, tmp / "ssh")
+    putEnv(FakeQemuEnv, "1")
+    putEnv(FakeFirstBootRebootEnv, "1")
+
+    # A real golden: a real qcow2 and the manifest that makes it admissible.
+    let golden = tmp / "win-arm-runner-0400"
+    createDir(golden)
+    createGoldenDisk("qemu-img", golden, 1)
+    writeFile(golden / "QEMU_EFI.fd", "efi code")
+    writeFile(golden / "QEMU_VARS.fd", "efi vars")
+    writeFile(golden / QwaGoldenManifestName, "{}")
+
+    b.provisionBaseline(BaselineSpec(name: "win-arm-runner",
+                                     sourceImage: golden, cpus: 1,
+                                     memoryMB: 64))
+    let vm = b.revertToBaseline("win-arm-runner")
+    let vmDir = vm.extra["vmDir"]
+    try:
+      # It rebooted, and the harness saw both boots.
+      check qwaFirmwareBootCount(vmDir / QwaSerialLogName) == 2
+      check vm.extra["firmwareBoots"] == "2"
+      # One-shot semantics were restored over QMP, with the right value, and
+      # the handle says so.
+      check vm.extra["rebootAction"] == QwaOneShotRebootAction
+      check vm.extra["qmpSocket"] == qwaQmpSocketPath(vmDir)
+      let qmpLog = readFile(vmDir / QmpLogName)
+      check "qmp_capabilities" in qmpLog
+      check "set-action" in qmpLog
+      check "\"reboot\":\"" & QwaOneShotRebootAction & "\"" in
+        qmpLog.replace(" ", "")
+      # And the negotiation came FIRST. A real QMP monitor refuses every
+      # command until it has, so a client that got this order wrong would
+      # work against a lenient fake and fail on m3.
+      check qmpLog.find("qmp_capabilities") < qmpLog.find("set-action")
+    finally:
+      b.stopAndCleanup(vm, deleteVm = true)
+    check not dirExists(vmDir)
+
+  test "a QEMU that will not take set-action fails the instance":
+    ## The refusal path, which is the whole reason the transition is checked
+    ## rather than fired and forgotten: a guest that answered SSH but can
+    ## still reboot itself must NOT be handed to a job.
+    let tmp = createTempDir("vmh-qwa-perjob-refuse-", "")
+    defer: removeDir(tmp)
+    let b = goldenBackend(tmp, sshReadyTimeoutSec = 45)
+    createDir(tmp / "ssh")
+    putEnv(FakeSshDirEnv, tmp / "ssh")
+    putEnv(FakeQemuEnv, "1")
+    putEnv(FakeFirstBootRebootEnv, "1")
+    putEnv(FakeQmpRefuseEnv, "1")
+
+    let golden = tmp / "win-arm-runner-0401"
+    createDir(golden)
+    createGoldenDisk("qemu-img", golden, 1)
+    writeFile(golden / "QEMU_EFI.fd", "efi code")
+    writeFile(golden / "QEMU_VARS.fd", "efi vars")
+    writeFile(golden / QwaGoldenManifestName, "{}")
+
+    b.provisionBaseline(BaselineSpec(name: "win-arm-runner",
+                                     sourceImage: golden, cpus: 1,
+                                     memoryMB: 64))
+    var raised = false
+    var handedOut: VmHandle = nil
+    try:
+      handedOut = b.revertToBaseline("win-arm-runner")
+    except GuestBootFailureError as e:
+      raised = true
+      check "one-shot reboot semantics could not be restored" in e.msg
+      check "refused" in e.msg
+    if handedOut != nil:
+      # Only reachable when the refusal has been IGNORED, i.e. under a
+      # falsification of this very assertion. Reap it anyway: a leaked fake
+      # QEMU inherits this process's stdout and keeps it open forever, so a
+      # falsified build would hang the suite instead of failing it.
+      b.stopAndCleanup(handedOut, deleteVm = true)
+    check raised
+    # And it was torn down, not leaked: nothing may survive a refusal.
+    check dirExists(b.stateDir / "instances")
+    var leftovers = 0
+    for kind, _ in walkDir(b.stateDir / "instances"):
+      if kind == pcDir:
+        inc leftovers
+    check leftovers == 0
 
 suite "Golden build: only a FINISHED golden is admissible":
   ## MEASURED on m3 2026-09-15, and the reason this suite exists: after MA4's
