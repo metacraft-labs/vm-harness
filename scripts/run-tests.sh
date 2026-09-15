@@ -25,6 +25,16 @@ run_nim r --hints:off tests/unit/t_utm_parsers.nim
 run_nim r --hints:off tests/unit/t_tart_shared_dirs.nim
 run_nim r --hints:off tests/unit/t_qemu_windows_arm_backend.nim
 run_nim r --hints:off tests/unit/t_qemu_windows_arm_overlay.nim
+# Runner-Fleet-M3-ARM-Wave MA3 gate: t_qemu_windows_arm_golden_build, UNIT
+# TIER — the install argv, the rebuild-safety guards, the free-space
+# precondition, and the install -> sysprep -> power-off -> finalize ->
+# manifest orchestration driven end to end against a fake QEMU that binds the
+# real forwarded port and serves a real monitor socket. The HOST tier (a real
+# Windows install, and two clones with distinct machine SIDs) is
+# tests/e2e/t_qemu_windows_arm_golden_build_host.nim, run by
+# scripts/run-host-tests.sh; it skips with an explicit message naming every
+# precondition it lacks.
+run_nim r --hints:off tests/unit/t_qemu_windows_arm_golden_build.nim
 run_nim r --hints:off tests/unit/t_qemu_boot_backend.nim
 run_nim r --hints:off tests/unit/t_tpm_device_args.nim
 run_nim r --hints:off tests/unit/t_windows_golden_recipe_hardening.nim

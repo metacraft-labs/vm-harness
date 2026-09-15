@@ -7,7 +7,7 @@
 ## host port forwarding. It exists as an unblock path when UTM's control plane
 ## cannot enumerate or clone registered bundles.
 
-import std/[algorithm, hashes, net, options, os, osproc, streams,
+import std/[algorithm, hashes, json, net, options, os, osproc, streams,
             strutils, tables, times]
 when defined(posix):
   import std/posix
@@ -83,6 +83,43 @@ const
     ## 3 Linux at ~8 GB, 2 Windows overlays at ~10 GB. A golden build shares
     ## the disk with all of it, and observed free space swings by that much
     ## over a day.
+
+  # ---- Golden build orchestration (Runner-Fleet-M3-ARM-Wave MA3) ----------
+  QwaInstallSentinelPath* = "C:\\Windows\\Temp\\repro-install-done"
+    ## The install-completion sentinel. This is NOT invented here: it is the
+    ## file ``guest-recipes/windows-arm-base/autounattend.xml`` writes from
+    ## the LAST of its ``FirstLogonCommands``, and only after OpenSSH has
+    ## been confirmed installed and ``sshd`` confirmed running. Polling for
+    ## it is therefore a statement about the whole answer-file chain having
+    ## completed, not merely about Windows having booted.
+  QwaInstallDoneMarker* = "VMH-INSTALL-DONE"
+    ## What the sentinel probe PRINTS when the sentinel is present.
+    ## Deliberately different from the sentinel's own name: an ssh wrapper
+    ## that echoes back the command it was given must not be able to look
+    ## like a finished install.
+  QwaSysprepExePath* = "C:\\Windows\\System32\\Sysprep\\sysprep.exe"
+  QwaSysprepAnswerGuestPath* = "C:\\repro-sysprep.xml"
+    ## Where ``autounattend.xml`` copies ``repro-sysprep.xml`` to, from the
+    ## answer-file ISO, in its ``FirstLogonCommands``. Sysprep is invoked
+    ## with ``/unattend:`` pointing here, so the two must agree.
+  QwaGoldenManifestName* = "golden-manifest.json"
+  QwaGoldenManifestSchema* = "vm-harness/qemu-windows-arm-golden/1"
+  QwaVmHarnessVersion* = "0.1.0"
+    ## Recorded in each golden's manifest. Kept in step with the ``version``
+    ## field of ``vm_harness.nimble``, which the unit gate compares against.
+  QwaDefaultGoldenDeadlineSec* = 90 * 60
+    ## One deadline for the whole run. The recipe README budgets 15-30 min
+    ## for the install, 1-3 for OpenSSH and 10-20 for sysprep/generalize, so
+    ## 90 minutes is generous; the point of the bound is that a guest stuck
+    ## at an OOBE prompt has no SSH and no console and would otherwise wait
+    ## forever.
+  QwaSentinelPollMs* = 15_000
+  QwaPowerOffPollMs* = 2_000
+  QwaRecipeAnswerFiles* = ["autounattend.xml", "repro-sysprep.xml",
+                           "provision-openssh.ps1"]
+    ## The checked-in recipe inputs whose digests go into a golden's
+    ## manifest. Together with the ISO hash they are what makes a golden of
+    ## unknown provenance identifiable as one.
 
 type
   PortAllocationLock* = object
@@ -312,6 +349,15 @@ proc releasePortAllocationLock*(allocationLock: var PortAllocationLock) =
 proc shortSocketPath(prefix, vmDir: string): string =
   "/tmp" / (prefix & "-" & $abs(hash(vmDir)) & ".sock")
 
+proc qwaMonitorSocketPath*(vmDir: string): string =
+  ## The QEMU monitor socket published by the machine argv for ``vmDir``.
+  ##
+  ## Exported because the golden build watches for guest power-off HERE and
+  ## not over SSH: ``sysprep /shutdown`` kills the guest, and with it every
+  ## SSH session that could have reported the fact. Derived from the same
+  ## expression the argv uses so the two cannot drift.
+  shortSocketPath("vmh-qwa-mon", vmDir)
+
 proc pathExists(path: string): bool =
   try:
     discard getFileInfo(path, followSymlink = false)
@@ -362,7 +408,7 @@ proc qwaMachineArgs(vmDir, disk: string, sshPort, cpus, memoryMB,
   ## unattended install possible without UTM or a console session.
   let tpmSock = shortSocketPath("vmh-qwa-tpm", vmDir)
   let serialLog = vmDir / "serial.log"
-  let monitorSock = shortSocketPath("vmh-qwa-mon", vmDir)
+  let monitorSock = qwaMonitorSocketPath(vmDir)
   @[
     "-accel", "hvf",
     "-machine", "virt,highmem=on",
@@ -739,15 +785,19 @@ proc startSwtpmInBackground*(b: QemuWindowsArmBackend, vmDir: string): int =
   raise newVmHarnessError($b.id, lpStartup,
     "QemuWindowsArmBackend: swtpm did not create socket " & sock)
 
-proc startQemuInBackground*(b: QemuWindowsArmBackend, vmDir: string,
-                            sshPort, cpus, memoryMB: int): int =
-  let args = buildQemuWindowsArmArgs(vmDir, sshPort, cpus, memoryMB)
+proc startQemuArgvInBackground*(b: QemuWindowsArmBackend, vmDir: string,
+                                args: seq[string]): int =
   var p = startProcess(b.qemuCmd, args = args,
                        # Keep QEMU as our direct child so the PID stored in the
                        # VmHandle is the process stopAndCleanup must terminate.
                        options = {poUsePath, poParentStreams},
                        workingDir = vmDir)
   result = p.processID
+
+proc startQemuInBackground*(b: QemuWindowsArmBackend, vmDir: string,
+                            sshPort, cpus, memoryMB: int): int =
+  b.startQemuArgvInBackground(vmDir,
+    buildQemuWindowsArmArgs(vmDir, sshPort, cpus, memoryMB))
 
 proc childProcessExited(pid: int): bool =
   when defined(posix):
@@ -788,19 +838,24 @@ proc waitForTcpPortClaim(pid, port, timeoutMs: int): bool =
     sleep(25)
   false
 
-proc startQemuWithAllocatedPort*(b: QemuWindowsArmBackend, vmDir: string,
-                                 cpus, memoryMB: int):
-                                 tuple[sshPort: int, pid: int] =
+proc startQemuWithAllocatedPortUsing*(b: QemuWindowsArmBackend, vmDir: string,
+                                      makeArgs: proc (port: int): seq[string]):
+                                      tuple[sshPort: int, pid: int] =
   ## Keep the inter-process allocation lock until QEMU has claimed the chosen
   ## port. This closes the race between probing a free port and QEMU binding
   ## it when multiple ephemeral guests start at the same time.
+  ##
+  ## Parameterised by the argument vector so the golden install boot — which
+  ## differs from the per-job boot only in its media and boot order — shares
+  ## this allocation, rather than growing a second one that could hand the
+  ## same port to a concurrent CI instance.
   var allocationLock = acquirePortAllocationLock(b.stateDir)
   defer: releasePortAllocationLock(allocationLock)
 
   for attempt in 0 ..< QemuPortAllocationAttempts:
     let preferred = if attempt == 0: b.sshPort else: 0
     let port = pickTcpPort(preferred)
-    let pid = b.startQemuInBackground(vmDir, port, cpus, memoryMB)
+    let pid = b.startQemuArgvInBackground(vmDir, makeArgs(port))
     if waitForTcpPortClaim(pid, port, QemuPortClaimTimeoutMs):
       return (sshPort: port, pid: pid)
     stopStartedProcess(pid)
@@ -808,6 +863,547 @@ proc startQemuWithAllocatedPort*(b: QemuWindowsArmBackend, vmDir: string,
   raise newVmHarnessError($b.id, lpStartup,
     "QemuWindowsArmBackend: QEMU failed to claim an allocated SSH port after " &
     $QemuPortAllocationAttempts & " attempts")
+
+proc startQemuWithAllocatedPort*(b: QemuWindowsArmBackend, vmDir: string,
+                                 cpus, memoryMB: int):
+                                 tuple[sshPort: int, pid: int] =
+  b.startQemuWithAllocatedPortUsing(vmDir,
+    proc (port: int): seq[string] =
+      buildQemuWindowsArmArgs(vmDir, port, cpus, memoryMB))
+
+# ---------------------------------------------------------------------------
+# Golden build orchestration — Runner-Fleet-M3-ARM-Wave MA3.
+#
+# Everything below drives an unattended Windows ARM64 install to a validated,
+# self-describing golden directory. The argument vector, the rebuild-safety
+# guard, the disk allocation and the free-space precondition are above; this
+# is the part that actually runs them, in order, under one deadline.
+# ---------------------------------------------------------------------------
+
+proc qemuProcessGone*(pid: int): bool =
+  ## True once the QEMU we started is no longer running. ``childProcessExited``
+  ## reaps a direct child, so a zombie is not mistaken for a live guest;
+  ## ``pidAlive`` covers a pid we did not fork.
+  if pid <= 0:
+    return true
+  childProcessExited(pid) or not pidAlive(pid)
+
+proc queryQemuMonitor*(monitorPath, command: string,
+                       timeoutMs: int = 2000): string =
+  ## Send one command to QEMU's monitor socket and return what it says.
+  ##
+  ## Returns "" when the socket is absent or unusable. That is not an error
+  ## condition to the caller: QEMU's default action on a guest power-off is
+  ## to EXIT, which takes the socket with it, so a vanished socket is itself
+  ## part of the signal this exists to read.
+  when defined(posix):
+    if monitorPath.len == 0 or not pathExists(monitorPath):
+      return ""
+    var sock: Socket
+    try:
+      sock = newSocket(net.Domain.AF_UNIX, net.SockType.SOCK_STREAM,
+                       net.Protocol.IPPROTO_IP)
+    except CatchableError:
+      return ""
+    try:
+      sock.connectUnix(monitorPath)
+    except CatchableError:
+      try: sock.close()
+      except CatchableError: discard
+      return ""
+    defer:
+      try: sock.close()
+      except CatchableError: discard
+    var text = ""
+    let deadline = epochTime() + timeoutMs.float / 1000.0
+    try:
+      # Ask FIRST, then read lines.
+      #
+      # The monitor greets with a banner that ends in a bare ``(qemu) ``
+      # prompt carrying no newline, so there is nothing to "drain" before
+      # asking — a reader that waited for the greeting to finish would wait
+      # for output that only arrives once something has been asked. Reading
+      # is line-oriented on purpose: ``recv`` with a byte count and a timeout
+      # insists on filling the WHOLE buffer before it returns, so asking it
+      # for 4 KiB of a 40-byte reply times out on a perfectly healthy
+      # monitor — which reads exactly like a dead guest.
+      sock.send(command & "\n")
+      var emptyLines = 0
+      while epochTime() < deadline:
+        let remainingMs = max(1, int((deadline - epochTime()) * 1000.0))
+        var line = ""
+        sock.readLine(line, timeout = remainingMs)
+        if line.len == 0:
+          inc emptyLines
+          if emptyLines >= 3:
+            break   # the peer went away
+          continue
+        emptyLines = 0
+        text.add(line)
+        text.add("\n")
+        if "VM status:" in line:
+          break
+    except CatchableError:
+      discard
+    text
+  else:
+    ""
+
+proc monitorTextSaysPoweredOff*(text: string): bool =
+  ## Read a QEMU monitor ``info status`` reply.
+  ##
+  ## The monitor answers ``VM status: running`` while the guest is up. A
+  ## guest that has powered itself off is reported as ``paused (shutdown)``
+  ## when QEMU was told to stay alive across it. Only the status LINE is
+  ## examined: the greeting banner and the echoed command share the stream,
+  ## and "shutdown" appears in the command we just sent to nothing of the
+  ## sort.
+  if text.len == 0:
+    return false
+  let lower = text.toLowerAscii()
+  let idx = lower.rfind("vm status:")
+  if idx < 0:
+    return false
+  let line = lower[idx + len("vm status:") .. ^1].split('\n')[0]
+  "shutdown" in line
+
+proc guestPoweredOff*(monitorPath: string, qemuPid: int): bool =
+  ## One power-off observation, taken through the monitor socket and NEVER
+  ## over SSH. ``sysprep /shutdown`` powers the guest off underneath every
+  ## SSH session it has, so SSH cannot report the event it causes.
+  let text = queryQemuMonitor(monitorPath, "info status")
+  if text.len > 0 and "vm status:" in text.toLowerAscii():
+    return monitorTextSaysPoweredOff(text)
+  # No monitor to ask. QEMU exits on guest power-off unless told otherwise,
+  # so a gone socket plus a gone process is the same event seen from outside.
+  qemuProcessGone(qemuPid)
+
+proc sleepUntilNextPoll(deadline: float, pollMs: int): bool =
+  ## Sleep for at most ``pollMs``, and never past ``deadline``. Returns false
+  ## once the deadline has arrived, so a caller's bound is the deadline it was
+  ## given rather than "the deadline, rounded up to the next poll".
+  let remainingSec = deadline - epochTime()
+  if remainingSec <= 0:
+    return false
+  sleep(min(pollMs, int(remainingSec * 1000.0) + 1))
+  true
+
+proc waitForGuestPowerOff*(monitorPath: string, qemuPid: int,
+                           deadline: float,
+                           pollMs: int = QwaPowerOffPollMs): bool =
+  ## Poll for power-off until ``deadline`` (an absolute ``epochTime``).
+  while true:
+    if guestPoweredOff(monitorPath, qemuPid):
+      return true
+    if not sleepUntilNextPoll(deadline, pollMs):
+      return false
+
+proc buildInstallSentinelProbe*(): string =
+  ## A remote command that prints ``QwaInstallDoneMarker`` exactly when the
+  ## sentinel ``autounattend.xml`` writes from its last FirstLogonCommand is
+  ## present, and fails otherwise.
+  "powershell.exe -NoLogo -NoProfile -Command \"if (Test-Path -LiteralPath '" &
+    QwaInstallSentinelPath & "') { Write-Output '" & QwaInstallDoneMarker &
+    "'; exit 0 } else { exit 1 }\""
+
+proc installSentinelPresent*(b: QemuWindowsArmBackend, port: int): bool =
+  ## One probe. Requires BOTH a zero exit and the marker on stdout: an ssh
+  ## transport that succeeds without running anything must not read as a
+  ## finished install.
+  let pwdFile = writePasswordFile(b.sshPassword)
+  defer:
+    try: removeFile(pwdFile)
+    except CatchableError: discard
+  let cmd = b.buildSshpassSshArgs(pwdFile, port, buildInstallSentinelProbe())
+  let r = runProcessCapture(cmd, timeoutSec = 60)
+  r.exitCode == 0 and QwaInstallDoneMarker in r.stdout
+
+proc waitForInstallSentinel*(b: QemuWindowsArmBackend, port: int,
+                             deadline: float,
+                             pollMs: int = QwaSentinelPollMs): bool =
+  ## Wait for the unattended install to declare itself finished.
+  ##
+  ## Not "wait for SSH": OpenSSH comes up partway through the
+  ## FirstLogonCommands chain, so a guest that answers SSH may still be
+  ## installing Git, PowerShell 7 and the NetKVM driver. The sentinel is
+  ## written last, and only if sshd is genuinely running.
+  while true:
+    if b.installSentinelPresent(port):
+      return true
+    if not sleepUntilNextPoll(deadline, pollMs):
+      return false
+
+proc buildSysprepCommand*(modeVm: bool = true): seq[string] =
+  ## ``/generalize`` is load-bearing and must never be dropped: without it
+  ## every ephemeral clone of the golden shares one machine SID.
+  ##
+  ## ``/mode:vm`` matches what the checked-in recipe README documents as the
+  ## invocation that produced a working golden. It skips the first-boot
+  ## hardware-detection pass, which is sound here precisely because every
+  ## instance boots the identical QEMU machine shape this file builds.
+  result = @[QwaSysprepExePath, "/generalize", "/oobe", "/shutdown"]
+  if modeVm:
+    result.add("/mode:vm")
+  result.add("/unattend:" & QwaSysprepAnswerGuestPath)
+
+proc buildSysprepRemoteCommand*(modeVm: bool = true): string =
+  ## Launch sysprep DETACHED from the SSH channel that starts it.
+  ##
+  ## ``/shutdown`` powers the guest off under that channel, and a generalize
+  ## takes 10-20 minutes, so a channel-bound invocation is one host-side
+  ## timeout away from killing sysprep partway and leaving a half-generalized
+  ## disk that still looks like a golden. Start it and let go; the power-off
+  ## is observed on the monitor socket instead.
+  let argv = buildSysprepCommand(modeVm)
+  var quoted: seq[string]
+  for a in argv[1 .. ^1]:
+    quoted.add(powershellLiteral(a))
+  "powershell.exe -NoLogo -NoProfile -Command \"Start-Process -FilePath " &
+    powershellLiteral(argv[0]) & " -ArgumentList " & quoted.join(",") &
+    "; exit 0\""
+
+proc runGuestSysprep*(b: QemuWindowsArmBackend, port: int,
+                      modeVm: bool = true): ExecResult =
+  ## Kick sysprep off. The returned status says whether the LAUNCH was
+  ## accepted, not whether the golden generalized — that is what the power-off
+  ## observation is for.
+  let pwdFile = writePasswordFile(b.sshPassword)
+  defer:
+    try: removeFile(pwdFile)
+    except CatchableError: discard
+  let cmd = b.buildSshpassSshArgs(pwdFile, port,
+                                  buildSysprepRemoteCommand(modeVm))
+  var last = ExecResult(exitCode: -1)
+  for attempt in 1 .. QemuSshAttempts:
+    last = runProcessCapture(cmd, timeoutSec = 300)
+    if not transientSshFailure(last) or attempt == QemuSshAttempts:
+      return last
+    sleep(QemuSshRetryDelayMs)
+  last
+
+proc machineSidFromUserSid*(sid: string): string =
+  ## The machine SID is an account SID with its trailing RID removed.
+  ##
+  ## Two clones of a golden that was NOT generalized report the same value
+  ## here, which is the whole point of gating on ``/generalize``. Returns ""
+  ## for anything that is not a well-formed ``S-1-5-21-…-RID``.
+  let parts = sid.strip().split('-')
+  if parts.len < 5 or not parts[0].toLowerAscii().startsWith("s"):
+    return ""
+  for p in parts[1 .. ^1]:
+    if p.len == 0:
+      return ""
+    for c in p:
+      if c notin {'0' .. '9'}:
+        return ""
+  parts[0 .. ^2].join("-")
+
+proc qwaFirmwareSearchDirs(): seq[string] =
+  ## ``VMH_QEMU_FIRMWARE_DIR`` REPLACES the well-known list rather than being
+  ## prepended to it, so an operator who names a firmware directory gets that
+  ## firmware and not whatever a package manager happens to have installed.
+  let explicit = getEnv("VMH_QEMU_FIRMWARE_DIR")
+  if explicit.len > 0:
+    return @[explicit]
+  @["/opt/homebrew/share/qemu", "/usr/local/share/qemu",
+    "/usr/share/qemu", "/usr/share/AAVMF",
+    "/usr/share/edk2/aarch64", "/usr/share/edk2-armvirt"]
+
+proc findFirmwareFile(names: openArray[string]): string =
+  for dir in qwaFirmwareSearchDirs():
+    for n in names:
+      let c = dir / n
+      if fileExists(c):
+        return c
+  ""
+
+proc stageGoldenFirmware*(buildDir: string) =
+  ## Give the build its own UEFI code + vars pair inside ``buildDir``.
+  ##
+  ## ``qemuFirmwareArgs`` resolves firmware from the VM directory, and a
+  ## fresh golden directory has none. The vars file must be per-build and
+  ## writable — Windows Setup writes its boot entry into it — so it is copied
+  ## in rather than referenced in place.
+  let codeDest = buildDir / "QEMU_EFI.fd"
+  let varsDest = buildDir / "QEMU_VARS.fd"
+  if not fileExists(codeDest):
+    var code = getEnv("VMH_QEMU_EFI_CODE_TEMPLATE")
+    if code.len == 0 or not fileExists(code):
+      code = getEnv("VMH_QEMU_EFI_CODE")
+    if code.len == 0 or not fileExists(code):
+      code = findFirmwareFile(["edk2-aarch64-code.fd", "QEMU_EFI.fd",
+                               "AAVMF_CODE.fd"])
+    if code.len == 0:
+      raise newVmHarnessError($biQemuWindowsArm, lpProvisioning,
+        "no aarch64 UEFI firmware found for the golden build. Set " &
+        "VMH_QEMU_EFI_CODE_TEMPLATE (or VMH_QEMU_FIRMWARE_DIR) to a " &
+        "directory holding edk2-aarch64-code.fd; without firmware QEMU " &
+        "boots nothing and the install hangs with no diagnostic.")
+    copyFile(code, codeDest)
+  if not fileExists(varsDest):
+    var vars = getEnv("VMH_QEMU_EFI_VARS_TEMPLATE")
+    if vars.len == 0 or not fileExists(vars):
+      vars = findFirmwareFile(["edk2-arm-vars.fd", "QEMU_VARS.fd",
+                               "AAVMF_VARS.fd"])
+    if vars.len == 0:
+      raise newVmHarnessError($biQemuWindowsArm, lpProvisioning,
+        "no aarch64 UEFI variable-store template found for the golden " &
+        "build. Set VMH_QEMU_EFI_VARS_TEMPLATE (or VMH_QEMU_FIRMWARE_DIR) " &
+        "to a directory holding edk2-arm-vars.fd.")
+    copyFile(vars, varsDest)
+  try:
+    setFilePermissions(varsDest, {fpUserRead, fpUserWrite})
+  except CatchableError:
+    discard
+
+proc finalizeGoldenDir*(buildDir: string): string =
+  ## Turn a finished install directory into a golden, and prove it is one.
+  ##
+  ## Dropping the CD-ROMs is the point: the install media are build INPUTS,
+  ## not part of the artifact, and will not be present when the golden is
+  ## consumed. The per-job argument vector for this directory is rebuilt here
+  ## and asserted to attach none of them, so a change that made the run path
+  ## depend on the ISOs fails the BUILD instead of the next cold boot on m3.
+  for leftover in [QwaOverlayDiskName, QwaInstanceLockName]:
+    try: removeFile(buildDir / leftover)
+    except CatchableError: discard
+  try: removeFile(buildDir / "tpm" / ".lock")
+  except CatchableError: discard
+  for a in buildQemuWindowsArmArgs(buildDir, 0):
+    if "media=cdrom" in a or "usb-storage" in a:
+      raise newVmHarnessError($biQemuWindowsArm, lpProvisioning,
+        "the golden at " & buildDir & " would still boot with install " &
+        "media attached (" & a & "). The ISOs are build inputs and are not " &
+        "part of the artifact.")
+  try:
+    result = validateWindowsArmVmDir(buildDir)
+  except ValueError as e:
+    raise newVmHarnessError($biQemuWindowsArm, lpProvisioning,
+      "the golden build did not produce a directory the consuming path " &
+      "accepts: " & e.msg)
+
+proc fileSha256*(path: string): string =
+  ## Content digest via the platform's coreutils. Nim's stdlib ships only
+  ## SHA-1, and a provenance record is exactly the place not to use it.
+  for cmd in [@["shasum", "-a", "256", path], @["sha256sum", path]]:
+    var r = ExecResult(exitCode: -1)
+    try:
+      r = runProcessCapture(cmd, timeoutSec = 900, mergeStderr = false)
+    except CatchableError:
+      continue
+    if r.exitCode == 0:
+      let fields = r.stdout.strip().splitWhitespace()
+      if fields.len > 0 and fields[0].len == 64:
+        return fields[0].toLowerAscii()
+  raise newVmHarnessError($biQemuWindowsArm, lpProvisioning,
+    "cannot compute a SHA-256 for " & path &
+    ": neither shasum nor sha256sum produced a digest")
+
+proc recipeCommitOf*(dir: string): tuple[commit: string, dirty: bool] =
+  ## The recipe's git provenance, best effort. An unknown commit is recorded
+  ## as "" rather than guessed — a manifest that lies about where a golden
+  ## came from is worse than one that admits it does not know.
+  result = (commit: "", dirty: false)
+  if dir.len == 0 or not dirExists(dir):
+    return
+  try:
+    let rev = runProcessCapture(@["git", "-C", dir, "rev-parse", "HEAD"],
+                                timeoutSec = 30, mergeStderr = false)
+    if rev.exitCode != 0:
+      return
+    result.commit = rev.stdout.strip()
+    let st = runProcessCapture(
+      @["git", "-C", dir, "status", "--porcelain", "--", dir],
+      timeoutSec = 120, mergeStderr = false)
+    result.dirty = st.exitCode == 0 and st.stdout.strip().len > 0
+  except CatchableError:
+    discard
+
+type
+  GoldenManifestInputs* = object
+    ## Everything a golden of unknown provenance needs in order to say what
+    ## it is. The artifact this work replaces had none of it, which is why
+    ## nobody could tell what had been lost.
+    baseline*: string
+    buildDir*: string
+    diskGB*: int
+    windowsIso*: string
+    autounattendIso*: string
+    recipeDir*: string
+    builtAt*: string
+      ## RFC3339 UTC. Injectable so the record itself can be asserted on.
+
+proc goldenManifestJson*(inp: GoldenManifestInputs): JsonNode =
+  let recipe = recipeCommitOf(inp.recipeDir)
+  var answerFiles = newJObject()
+  for name in QwaRecipeAnswerFiles:
+    let p = inp.recipeDir / name
+    if fileExists(p):
+      answerFiles[name] = %fileSha256(p)
+  result = %*{
+    "schema": QwaGoldenManifestSchema,
+    "baseline": inp.baseline,
+    "builtAt": (if inp.builtAt.len > 0: inp.builtAt
+                else: now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")),
+    "vmHarnessVersion": QwaVmHarnessVersion,
+    "diskGB": inp.diskGB,
+    "windowsIso": {
+      "path": inp.windowsIso,
+      "sha256": (if fileExists(inp.windowsIso): fileSha256(inp.windowsIso)
+                 else: "")
+    },
+    "autounattendIso": {
+      "path": inp.autounattendIso,
+      "sha256": (if fileExists(inp.autounattendIso):
+                   fileSha256(inp.autounattendIso)
+                 else: "")
+    },
+    "recipe": {
+      "dir": inp.recipeDir,
+      "commit": recipe.commit,
+      "dirty": recipe.dirty
+    },
+    "answerFiles": answerFiles
+  }
+
+proc writeGoldenManifest*(inp: GoldenManifestInputs): string =
+  let path = inp.buildDir / QwaGoldenManifestName
+  writeFile(path, pretty(goldenManifestJson(inp)) & "\n")
+  path
+
+type
+  GoldenBuildSpec* = object
+    buildDir*: string
+      ## A NEW versioned directory. Never an existing golden — see
+      ## ``prepareGoldenBuildDir``.
+    baseline*: string
+    windowsIso*: string
+    autounattendIso*: string
+    recipeDir*: string
+    diskGB*: int
+    cpus*: int
+    memoryMB*: int
+    deadlineSec*: int
+    sysprepModeVm*: bool
+
+proc newGoldenBuildSpec*(buildDir, windowsIso, autounattendIso: string,
+                         baseline = "win-arm-runner",
+                         recipeDir = "",
+                         diskGB = QwaDefaultGoldenDiskGB,
+                         cpus = 4, memoryMB = 8192,
+                         deadlineSec = QwaDefaultGoldenDeadlineSec,
+                         sysprepModeVm = true): GoldenBuildSpec =
+  GoldenBuildSpec(buildDir: buildDir, baseline: baseline,
+                  windowsIso: windowsIso, autounattendIso: autounattendIso,
+                  recipeDir: recipeDir, diskGB: diskGB, cpus: cpus,
+                  memoryMB: memoryMB, deadlineSec: deadlineSec,
+                  sysprepModeVm: sysprepModeVm)
+
+proc goldenBuildDiagnostics*(buildDir: string): string =
+  ## The tail every golden-build failure carries. A Windows install that goes
+  ## wrong has no console and no SSH, so the serial log and QEMU's own log
+  ## are the entire diagnostic surface — and they are only useful if the
+  ## failure path says where they are and leaves them there.
+  " Diagnostics retained: " & (buildDir / "serial.log") &
+  " (guest serial console) and " & (buildDir / "qemu.log") & "; " &
+  buildDir & " is left in place. Start the next attempt in a NEW versioned " &
+  "directory — never reuse this one, and never rebuild over a live golden."
+
+proc goldenBuildFailure*(buildDir, msg: string): ref VmHarnessError =
+  newVmHarnessError($biQemuWindowsArm, lpProvisioning,
+                    msg & goldenBuildDiagnostics(buildDir))
+
+proc buildWindowsArmGolden*(b: QemuWindowsArmBackend,
+                            spec: GoldenBuildSpec): string =
+  ## Drive an unattended Windows ARM64 install to a validated golden and
+  ## return the directory holding it.
+  ##
+  ## The run is bounded by ONE deadline covering install, sysprep and
+  ## power-off, and every exit that is not a finished golden leaves the build
+  ## directory and both logs behind. The directory is inert until something
+  ## points at it, so a failed build costs disk and nothing else: adoption is
+  ## a separate pointer flip, never an overwrite.
+  if spec.buildDir.len == 0:
+    raise newVmHarnessError($b.id, lpProvisioning,
+      "golden build: buildDir is empty")
+  if not fileExists(spec.windowsIso):
+    raise newVmHarnessError($b.id, lpProvisioning,
+      "golden build: Windows ARM64 ISO not found: " & spec.windowsIso &
+      ". The ISO is an operator-supplied input; the harness never " &
+      "downloads it.")
+  if not fileExists(spec.autounattendIso):
+    raise newVmHarnessError($b.id, lpProvisioning,
+      "golden build: answer-file ISO not found: " & spec.autounattendIso &
+      ". Build it with guest-recipes/windows-arm-base/" &
+      "build-autounattend-iso.sh.")
+  let diskGB = if spec.diskGB > 0: spec.diskGB else: QwaDefaultGoldenDiskGB
+  let cpus = if spec.cpus > 0: spec.cpus else: 4
+  let memoryMB = if spec.memoryMB > 0: spec.memoryMB else: 8192
+  let deadlineSec =
+    if spec.deadlineSec > 0: spec.deadlineSec else: QwaDefaultGoldenDeadlineSec
+
+  let warning = checkGoldenBuildSpace(parentDir(absolutePath(spec.buildDir)),
+                                      diskGB)
+  if warning.len > 0:
+    stderr.writeLine("[vm-harness] " & warning)
+
+  prepareGoldenBuildDir(spec.buildDir)
+  let buildDir = absolutePath(spec.buildDir)
+  stageGoldenFirmware(buildDir)
+  createGoldenDisk(b.qemuImgCmd, buildDir, diskGB)
+
+  let deadline = epochTime() + deadlineSec.float
+  var swtpmPid = 0
+  var qemuPid = 0
+  try:
+    swtpmPid = b.startSwtpmInBackground(buildDir)
+    var started: tuple[sshPort: int, pid: int]
+    try:
+      started = b.startQemuWithAllocatedPortUsing(buildDir,
+        proc (port: int): seq[string] =
+          buildQemuWindowsArmInstallArgs(buildDir, spec.windowsIso,
+                                         spec.autounattendIso, port,
+                                         cpus, memoryMB))
+    except CatchableError as e:
+      raise goldenBuildFailure(buildDir,
+        "the golden install boot did not start: " & e.msg & ".")
+    qemuPid = started.pid
+
+    if not b.waitForInstallSentinel(started.sshPort, deadline):
+      raise goldenBuildFailure(buildDir,
+        "the unattended install did not reach " & QwaInstallSentinelPath &
+        " within " & $deadlineSec & "s. The sentinel is written by the LAST " &
+        "FirstLogonCommand in autounattend.xml and only once sshd is " &
+        "running, so a guest stuck at OOBE, a rejected answer file or a " &
+        "failed OpenSSH provisioning all land here.")
+
+    let sysprep = b.runGuestSysprep(started.sshPort, spec.sysprepModeVm)
+    if sysprep.exitCode != 0 and not transientSshFailure(sysprep):
+      raise goldenBuildFailure(buildDir,
+        "sysprep could not be launched in the guest (exit " &
+        $sysprep.exitCode & "): " & sysprep.stdout & sysprep.stderr & ".")
+
+    if not waitForGuestPowerOff(qwaMonitorSocketPath(buildDir), qemuPid,
+                                deadline):
+      raise goldenBuildFailure(buildDir,
+        "sysprep /generalize /shutdown did not power the guest off before " &
+        "the " & $deadlineSec & "s deadline. A guest still running here has " &
+        "NOT been generalized, and every clone of the resulting disk would " &
+        "share one machine SID.")
+  finally:
+    if qemuPid > 0:
+      stopStartedProcess(qemuPid)
+    if swtpmPid > 0:
+      stopStartedProcess(swtpmPid)
+
+  try:
+    result = finalizeGoldenDir(buildDir)
+  except VmHarnessError as e:
+    raise goldenBuildFailure(buildDir, e.msg)
+  discard writeGoldenManifest(GoldenManifestInputs(
+    baseline: spec.baseline, buildDir: buildDir, diskGB: diskGB,
+    windowsIso: spec.windowsIso, autounattendIso: spec.autounattendIso,
+    recipeDir: spec.recipeDir))
 
 method probeAvailability*(b: QemuWindowsArmBackend): bool =
   when defined(macosx):

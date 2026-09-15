@@ -24,16 +24,17 @@ the checked-in answer files.
 |---|---|---|
 | `provisionBaseline` (validate existing golden) | ✓ | Already shipped; unchanged by this work. |
 | Headless install boot — argument vector | ✓ | `buildQemuWindowsArmInstallArgs`. |
-| Headless install boot — orchestration | ☐ | Phase 1 remainder: launch, then wait. |
-| Install-completion detection | ☐ | Phase 1. |
+| Headless install boot — orchestration | ✓ | `buildWindowsArmGolden`; UEFI staged by `stageGoldenFirmware`. |
+| Install-completion detection | ✓ | `waitForInstallSentinel` over the `repro-install-done` sentinel. |
 | Rebuild safety guard (never build in place) | ✓ | `prepareGoldenBuildDir`. |
 | Overlay backing-path symlink resolution | ✓ | Prerequisite for a safe flip; landed early with the guard. |
 | Golden disk allocation | ✓ | `createGoldenDisk`. |
 | Free-space precondition | ✓ | `checkGoldenBuildSpace`; floor refuses, comfort band warns. |
-| Sysprep + generalize | ☐ | Phase 2. |
-| Golden finalize + promote | ☐ | Phase 2. Versioned dir + pointer flip; never in place. |
-| Previous-golden retention + reclaim | ☐ | Phase 2. Gated on the per-instance advisory lock. |
-| Build manifest | ☐ | Phase 2. Identifies a golden's provenance. |
+| Sysprep + generalize | ✓ | `runGuestSysprep` + `waitForGuestPowerOff` on the monitor socket. |
+| Golden finalize | ✓ | `finalizeGoldenDir`: drops build leftovers, refuses a golden whose per-job boot would still reference the install media, then `validateWindowsArmVmDir`. |
+| Golden promote (pointer flip) | ☐ | Phase 3; belongs with the nix-side wiring so the flip is a declared, not a hand, operation. |
+| Previous-golden retention + reclaim | ☐ | Phase 3. Gated on the per-instance advisory lock. |
+| Build manifest | ✓ | `writeGoldenManifest`: ISO SHA-256, recipe commit + dirty flag, answer-file digests, timestamp, vm-harness version. |
 | `vm-harness provision --backend qemu-windows-arm` entrypoint | ☐ | Phase 3. |
 | Nix-side golden provisioning on m3 | ☐ | Phase 3; `metacraft-labs/infra`. |
 | Retire the UTM recipe path | ☐ | Phase 4, once Phase 3 has produced a golden twice. |
@@ -156,7 +157,10 @@ vm-harness provision --backend qemu-windows-arm \
 4. Poll for install completion by SSHing to the forwarded port and testing
    for `C:\Windows\Temp\repro-install-done` — the sentinel
    `autounattend.xml` already writes from `FirstLogonCommands` after
-   OpenSSH and NetKVM are confirmed up. This reuses `waitForSshReady`.
+   OpenSSH and NetKVM are confirmed up. ~~This reuses `waitForSshReady`.~~
+   *(Superseded — see "As implemented" below. It deliberately does not:
+   OpenSSH comes up partway through the chain, so a guest that answers SSH
+   may still be installing Git, PowerShell 7 and NetKVM.)*
 5. Bounded by a single overall deadline (default 90 min; the README budgets
    15–30 min for install plus 1–3 for OpenSSH, so this is generous).
 
@@ -165,7 +169,9 @@ carries almost no new Windows-side logic.
 
 ### Phase 2 — sysprep and finalize
 
-6. Copy `repro-sysprep.xml` to `C:\` and invoke
+6. ~~Copy `repro-sysprep.xml` to `C:\`~~ *(superseded — `autounattend.xml`
+   already copies it there from the answer-file ISO; see "As implemented")*
+   and invoke
    `sysprep /generalize /oobe /shutdown /unattend:C:\repro-sysprep.xml`
    over SSH.
 7. Wait for the guest to power off, observed through the QMP socket rather
@@ -203,6 +209,86 @@ equivalent check.
 The unit layer must not claim coverage of the e2e layer. Following this
 repo's existing convention, a missing ISO or a non-macOS host **skips with an
 explicit message** rather than passing quietly.
+
+### As implemented
+
+Both tiers carry the same greppable gate name, `t_qemu_windows_arm_golden_build`:
+
+| Tier | File | Wired into |
+|---|---|---|
+| unit (runs anywhere) | `tests/unit/t_qemu_windows_arm_golden_build.nim` | `scripts/run-tests.sh`, `repro.nim` |
+| host (opt-in) | `tests/e2e/t_qemu_windows_arm_golden_build_host.nim` | `scripts/run-host-tests.sh` |
+
+The unit tier drives the *whole* orchestration — install wait, sysprep,
+power-off, finalize, manifest — against a fake QEMU that binds the real
+forwarded SSH port and serves a real unix monitor socket, so the port-claim
+handshake and the monitor conversation under test are genuine and only the
+guest is absent. It deliberately does not claim the host tier's coverage: no
+unit test can say that Windows Setup accepted the answer file, that HVF
+tolerated the reboot sequence, or that `/generalize` re-minted the SID.
+
+The host tier requires `VMH_WINDOWS_ARM_GOLDEN_HOST_TEST=1`,
+`VMH_WINDOWS_ARM_ISO` and `VMH_WINDOWS_ARM_AUTOUNATTEND_ISO`, and names each
+missing one in the skip message.
+
+Five points where the implementation departs from the text above, all
+deliberate:
+
+- **It is the monitor socket, not QMP.** `qwaMachineArgs` publishes
+  `-monitor unix:…` (the human monitor), not `-qmp`. Power-off is therefore
+  read from an `info status` reply rather than a QMP event. Adding a QMP
+  socket would change the per-job argument vector that is already deployed,
+  for no gain: the property that matters — *observed off-band from SSH,
+  because SSH dies with the guest* — is the same either way. The fallback arm
+  is also part of the contract: QEMU's default action on a guest power-off is
+  to **exit**, so a vanished socket plus a gone process is the same event seen
+  from outside, and `guestPoweredOff` treats it as such.
+- **Sysprep is launched detached, and carries `/mode:vm`.** `/shutdown`
+  powers the guest off underneath the SSH channel that issued it, and a
+  generalize runs 10–20 minutes, so a channel-bound invocation is one
+  host-side timeout away from a half-generalized disk that still looks like a
+  golden. `buildSysprepRemoteCommand` wraps it in `Start-Process` and lets go.
+  `/mode:vm` matches the invocation the recipe README documents as the one
+  that produced a working golden; it is sound here precisely because every
+  instance boots the identical machine shape this backend builds.
+- **UEFI firmware is staged, not assumed.** A fresh golden directory has no
+  firmware, and `qemuFirmwareArgs` resolves it from the VM directory, so
+  `stageGoldenFirmware` copies a code/vars pair in — giving the build its own
+  writable variable store, since Windows Setup writes its boot entry there.
+  `VMH_QEMU_FIRMWARE_DIR` *replaces* the well-known search list rather than
+  being prepended to it.
+- **Step 4 does not reuse `waitForSshReady`.** OpenSSH comes up *partway
+  through* the `FirstLogonCommands` chain, so a guest that answers SSH may
+  still be installing Git, PowerShell 7 and the NetKVM driver. Waiting on SSH
+  would therefore declare an unfinished install finished, and sysprep would
+  generalize a half-provisioned disk. `waitForInstallSentinel` waits for the
+  sentinel the *last* FirstLogonCommand writes, and only once `sshd` is
+  confirmed running — the one signal that means "finished".
+- **Step 6 does not copy `repro-sysprep.xml` to `C:\`.** `autounattend.xml`
+  already does it from the answer-file ISO (`FirstLogonCommands`, Order 6),
+  so the harness copying it again would be a second source of truth for a
+  path that must match `/unattend:`. The gate asserts instead that the two
+  sides agree: the constant the harness names is the destination the recipe
+  copies to.
+
+### Promotion is not implemented here, and that is on purpose
+
+`buildWindowsArmGolden` returns the path of a **validated, inert, versioned
+directory**. It never writes `golden/win-arm-runner`, and there is no
+"promote" verb in this repository.
+
+That is the shape Phase 3 needs. Promotion is a pointer flip plus a retention
+decision about the previous golden, and both are configuration, not a host
+action: the build takes `--output-dir` (today `GoldenBuildSpec.buildDir`,
+which the host gate reads from `VMH_WINDOWS_ARM_GOLDEN_OUT`), so a nix module
+can point it at
+`/private/var/lib/vm-harness/qemu-windows-arm/golden/win-arm-runner-<build-id>`
+and own the symlink declaratively. Nothing in the build path requires an
+operator to copy, rename or `install -d` anything.
+
+The one step that cannot be declared away is the **ISO**: it stays an
+operator-supplied input, pinned by hash in the manifest, because Microsoft's
+download is manual and unversioned.
 
 ## Risks
 

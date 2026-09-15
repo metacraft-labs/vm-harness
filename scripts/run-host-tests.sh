@@ -36,6 +36,12 @@ run_nim r --hints:off tests/e2e/t_vm_harness_tart_cleanup_on_failure.nim
 # golden; set VMH_TART_SERVE_MACOS=1 for the macOS golden. Self-skips off-macOS
 # / without tart+sshpass.
 run_nim r --hints:off tests/e2e/t_vmharness_serve_macos_tart.nim
+
+# Runner-Fleet-M3-ARM-Wave MA3 gate: t_qemu_windows_arm_golden_build, HOST
+# TIER. Opt-in behind VMH_WINDOWS_ARM_GOLDEN_HOST_TEST=1 plus the two ISO
+# paths, because one run is a real ~60 minute Windows install. With any
+# precondition missing it SKIPS and names each one; it never passes quietly.
+run_nim r --hints:off tests/e2e/t_qemu_windows_arm_golden_build_host.nim
 run_nim r --hints:off tests/integration/t_utm_lifecycle.nim
 run_nim r --hints:off tests/e2e/t_vm_harness_utm_windows_arm_smoke.nim
 run_nim r --hints:off tests/e2e/t_vm_harness_utm_windows_dism_works_under_prism.nim
