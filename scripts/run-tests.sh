@@ -35,6 +35,15 @@ run_nim r --hints:off tests/unit/t_qemu_windows_arm_overlay.nim
 # scripts/run-host-tests.sh; it skips with an explicit message naming every
 # precondition it lacks.
 run_nim r --hints:off tests/unit/t_qemu_windows_arm_golden_build.nim
+# Runner-Fleet-M3-ARM-Wave MA8 gate: t_qemu_windows_arm_dead_guest_is_named,
+# UNIT TIER — a per-job boot whose QEMU exits before SSH is reached fails in
+# SECONDS naming the exited process and its exit status, instead of being
+# polled to the 300s SSH deadline and then blamed on sshd. Shares MA3/MA4's
+# fake QEMU (tests/unit/qwa_fake_qemu.nim). The HOST tier restores -no-reboot
+# on a real golden -- the known reproducer, measured at 5m38s before this --
+# and is tests/e2e/t_qemu_windows_arm_dead_guest_is_named_host.nim, run by
+# scripts/run-host-tests.sh.
+run_nim r --hints:off tests/unit/t_qemu_windows_arm_dead_guest_is_named.nim
 run_nim r --hints:off tests/unit/t_qemu_boot_backend.nim
 run_nim r --hints:off tests/unit/t_tpm_device_args.nim
 run_nim r --hints:off tests/unit/t_windows_golden_recipe_hardening.nim

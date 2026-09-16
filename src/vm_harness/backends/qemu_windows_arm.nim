@@ -1043,6 +1043,109 @@ proc releaseInstanceLock*(b: QemuWindowsArmBackend, name: string) =
       discard posix.close(fd)
       b.instanceLockFds.del(name)
 
+# ---------------------------------------------------------------------------
+# Process liveness — Runner-Fleet-M3-ARM-Wave MA8.
+#
+# These used to live further down, next to the golden BUILD orchestration that
+# was the only thing consulting them. That placement was the defect: the
+# install path grew a liveness check and the per-job RUN path never got one, so
+# a QEMU that exited at t=38s was polled over SSH until t=301s and then blamed
+# on sshd. They are primitives shared by both paths, so they sit above both.
+# ---------------------------------------------------------------------------
+
+type
+  ChildExitInfo* = object
+    ## What ``waitpid`` said about a process we started.
+    ##
+    ## ``statusKnown`` is a separate field on purpose: a pid that was reaped by
+    ## somebody else, or that was never our child, is still observably GONE
+    ## even though its exit status is no longer recoverable. Reporting "the
+    ## process exited" without a status is far better than reporting nothing,
+    ## and conflating the two would make the message lie in the other
+    ## direction.
+    exited*: bool
+    statusKnown*: bool
+    exitCode*: int      ## valid when ``statusKnown`` and ``termSignal == 0``
+    termSignal*: int    ## non-zero when the process was killed by a signal
+
+var reapedChildStatus: Table[int, cint]
+  ## ``waitpid`` may only succeed ONCE per child. Every later call returns -1,
+  ## which is why the pre-MA8 ``childProcessExited`` fell back to ``kill(pid,
+  ## 0)`` and threw the exit status away. The status is exactly what a dead
+  ## guest's failure message needs, so the first reap records it here and
+  ## later callers read it back. Entries are dropped by ``stopStartedProcess``
+  ## (and pre-emptively when a pid is handed out again), so a recycled pid
+  ## cannot inherit a stale status.
+
+proc forgetChildExit*(pid: int) =
+  if pid > 0 and reapedChildStatus.hasKey(pid):
+    reapedChildStatus.del(pid)
+
+proc decodeWaitStatus(status: cint): ChildExitInfo =
+  when defined(posix):
+    if WIFSIGNALED(status):
+      ChildExitInfo(exited: true, statusKnown: true, exitCode: -1,
+                    termSignal: int(WTERMSIG(status)))
+    elif WIFEXITED(status):
+      ChildExitInfo(exited: true, statusKnown: true,
+                    exitCode: int(WEXITSTATUS(status)), termSignal: 0)
+    else:
+      # Stopped/continued: not an exit at all.
+      ChildExitInfo(exited: false)
+  else:
+    ChildExitInfo(exited: false)
+
+proc childExitInfo*(pid: int): ChildExitInfo =
+  ## Reap ``pid`` if it is a finished direct child, and say what happened.
+  ##
+  ## Semantics are exactly those of the pre-MA8 ``childProcessExited`` — a
+  ## reaped child is gone, a pid that is not ours is gone iff ``kill(pid, 0)``
+  ## fails, anything else is still running — plus the exit status, which that
+  ## proc computed and discarded.
+  if pid <= 0:
+    return ChildExitInfo(exited: true, statusKnown: false)
+  when defined(posix):
+    if reapedChildStatus.hasKey(pid):
+      return decodeWaitStatus(reapedChildStatus[pid])
+    var status: cint
+    let waited = posix.waitpid(Pid(pid), status, WNOHANG)
+    if waited == Pid(pid):
+      reapedChildStatus[pid] = status
+      return decodeWaitStatus(status)
+    if waited < Pid(0):
+      # Not our child any more (already reaped, or never was). Fall back to a
+      # signal-0 probe: it answers "is it there", never "how did it end".
+      return ChildExitInfo(exited: posix.kill(Pid(pid), cint(0)) != 0,
+                           statusKnown: false)
+    ChildExitInfo(exited: false)
+  else:
+    ChildExitInfo(exited: false)
+
+proc childProcessExited(pid: int): bool =
+  childExitInfo(pid).exited
+
+proc qemuProcessGone*(pid: int): bool =
+  ## True once the QEMU we started is no longer running. ``childExitInfo``
+  ## reaps a direct child, so a zombie is not mistaken for a live guest;
+  ## ``pidAlive`` covers a pid we did not fork.
+  ##
+  ## The zombie case is not hypothetical here: nothing waits on the per-job
+  ## QEMU until teardown, so a QEMU that exits mid-boot sits as a zombie and a
+  ## naive ``pidAlive`` reports the dead guest alive.
+  if pid <= 0:
+    return true
+  childProcessExited(pid) or not pidAlive(pid)
+
+proc describeChildExit*(info: ChildExitInfo): string =
+  ## How a dead process is named in an operator-facing message.
+  if not info.exited:
+    return "still running"
+  if info.statusKnown and info.termSignal != 0:
+    return "killed by signal " & $info.termSignal
+  if info.statusKnown:
+    return "exit status " & $info.exitCode
+  "exit status unavailable (the process had already been reaped)"
+
 proc qwaFirmwareBootCount*(serialPath: string): int =
   ## How many times the guest's FIRMWARE has started, counted off the serial
   ## console. EDK2 prints ``QwaFirmwareBannerMarker`` as its first line on
@@ -1069,29 +1172,53 @@ type
     fbSshReady           ## SSH answered the readiness probe.
     fbSshTimedOut        ## the SSH deadline expired.
     fbRebootLoop         ## the firmware kept restarting past its allowance.
+    fbQemuExited         ## the QEMU process we started is gone (MA8).
 
   FirstBootResult* = object
     outcome*: FirstBootOutcome
     firmwareBoots*: int    ## banners seen on the serial console
     elapsedSec*: float
+    qemuExit*: ChildExitInfo
+      ## Populated on ``fbQemuExited``: how the guest's QEMU ended, so the
+      ## failure can name the cause instead of the symptom.
 
 proc waitForFirstBootSshReady*(b: QemuWindowsArmBackend, port: int,
                                timeoutSec: int, serialPath: string = "",
                                maxFirmwareBoots: int =
                                  QwaFirstBootMaxFirmwareBoots,
-                               pollMs: int = 3000): FirstBootResult =
+                               pollMs: int = 3000,
+                               qemuPid: int = 0): FirstBootResult =
   ## Wait for the first SSH of a freshly-created instance, tolerating the ONE
   ## reboot a ``/generalize``d golden has to perform — and bounding it.
   ##
-  ## The bound is the point. Allowing reboots is what makes the boot work at
-  ## all (``QwaFirstBootRebootAction``), and it also introduces a failure mode
-  ## ``-no-reboot`` could not have: a guest that restarts forever instead of
-  ## dying. Counting firmware banners turns that into a fast, named failure
-  ## rather than the whole ``sshReadyTimeoutSec`` spent in silence.
+  ## THREE INDEPENDENT BOUNDS, and each catches something the others cannot:
   ##
-  ## ``serialPath = ""`` or ``maxFirmwareBoots <= 0`` disables the bound and
-  ## leaves the deadline as the only limit, which is what a caller with no
-  ## serial console to read asks for.
+  ## * ``qemuPid`` — the guest's PROCESS IS GONE (MA8). Checked every poll,
+  ##   so a QEMU that exits answers in seconds. The two bounds below cannot
+  ##   substitute for it: a process that EXITS leaves the firmware banner
+  ##   count FROZEN, not growing, so the reboot bound never trips, and the
+  ##   deadline is the whole ``sshReadyTimeoutSec``. MEASURED on m3
+  ##   2026-09-15 with ``-no-reboot`` on the per-job argv: QEMU exited rc=0 at
+  ##   38s, the harness failed at 301s, and it blamed SSH.
+  ##
+  ##   The check is strictly "the process WE started is gone" and never "SSH
+  ##   is slow", so it cannot turn a working boot into a failing one. It is
+  ##   consulted AFTER the readiness probe, so a guest that answers and then
+  ##   exits in the same instant is still reported ready rather than dead.
+  ##   ``qemuPid = 0`` disables it, for a caller that did not start the
+  ##   process and therefore cannot speak for it.
+  ##
+  ## * ``maxFirmwareBoots`` — the guest RESTARTS FOREVER. Allowing reboots at
+  ##   all (``QwaFirstBootRebootAction``) is what makes the boot work, and it
+  ##   introduces a failure mode ``-no-reboot`` could not have. Counting
+  ##   firmware banners turns that into a fast, named failure rather than the
+  ##   whole ``sshReadyTimeoutSec`` spent in silence. ``serialPath = ""`` or
+  ##   ``maxFirmwareBoots <= 0`` disables it, which is what a caller with no
+  ##   serial console to read asks for.
+  ##
+  ## * ``timeoutSec`` — the guest is ALIVE, rebooting within its allowance,
+  ##   and simply never reaches sshd. The residual case, and the only one for
+  ##   which waiting out the deadline is the right answer.
   let start = epochTime()
   let deadline = start + timeoutSec.float
   let pwdFile = writePasswordFile(b.sshPassword)
@@ -1108,6 +1235,13 @@ proc waitForFirstBootSshReady*(b: QemuWindowsArmBackend, port: int,
       result.outcome = fbSshReady
       result.elapsedSec = epochTime() - start
       return
+    if qemuPid > 0:
+      let exitInfo = childExitInfo(qemuPid)
+      if exitInfo.exited or not pidAlive(qemuPid):
+        result.outcome = fbQemuExited
+        result.qemuExit = exitInfo
+        result.elapsedSec = epochTime() - start
+        return
     if maxFirmwareBoots > 0 and result.firmwareBoots > maxFirmwareBoots:
       result.outcome = fbRebootLoop
       result.elapsedSec = epochTime() - start
@@ -1120,11 +1254,23 @@ proc waitForFirstBootSshReady*(b: QemuWindowsArmBackend, port: int,
   result.elapsedSec = epochTime() - start
 
 proc waitForSshReady*(b: QemuWindowsArmBackend, port: int,
-                    timeoutSec: int): bool =
+                    timeoutSec: int, qemuPid: int = 0): bool =
   ## The plain "did SSH come up" question, with no reboot accounting. Kept
   ## for callers that have no serial console to count boots on;
   ## ``revertToBaseline`` uses ``waitForFirstBootSshReady`` because it does.
-  b.waitForFirstBootSshReady(port, timeoutSec).outcome == fbSshReady
+  ##
+  ## WHY THIS SURVIVES MA8 RATHER THAN BEING DEPRECATED. It has no in-tree
+  ## caller — ``revertToBaseline`` is the only per-job wait and it needs the
+  ## three-way outcome — but it is public API of a library other repos build
+  ## against, and collapsing three outcomes into a ``bool`` is a legitimate
+  ## thing for an out-of-tree caller to want. What it must NOT be is a way to
+  ## opt out of the liveness check by accident, so it takes ``qemuPid`` too
+  ## and forwards it. The default of 0 keeps every existing call
+  ## byte-compatible AND honest: a caller that does not name a process gets
+  ## the deadline as its only bound, exactly as before, and the doc says so
+  ## rather than leaving it to be discovered at 301 seconds.
+  b.waitForFirstBootSshReady(port, timeoutSec,
+                             qemuPid = qemuPid).outcome == fbSshReady
 
 proc startSwtpmInBackground*(b: QemuWindowsArmBackend, vmDir: string): int =
   let tpmDir = vmDir / "tpm"
@@ -1145,6 +1291,7 @@ proc startSwtpmInBackground*(b: QemuWindowsArmBackend, vmDir: string): int =
                        options = {poUsePath, poParentStreams},
                        workingDir = vmDir)
   result = p.processID
+  forgetChildExit(result)
   let deadline = epochTime() + 3.0
   while epochTime() < deadline:
     if pathExists(sock):
@@ -1164,25 +1311,16 @@ proc startQemuArgvInBackground*(b: QemuWindowsArmBackend, vmDir: string,
                        options = {poUsePath, poParentStreams},
                        workingDir = vmDir)
   result = p.processID
+  # A recycled pid must not inherit the exit status of whatever held it last.
+  forgetChildExit(result)
 
 proc startQemuInBackground*(b: QemuWindowsArmBackend, vmDir: string,
                             sshPort, cpus, memoryMB: int): int =
   b.startQemuArgvInBackground(vmDir,
     buildQemuWindowsArmArgs(vmDir, sshPort, cpus, memoryMB))
 
-proc childProcessExited(pid: int): bool =
-  when defined(posix):
-    var status: cint
-    let waited = posix.waitpid(Pid(pid), status, WNOHANG)
-    if waited == Pid(pid):
-      return true
-    if waited < Pid(0):
-      return posix.kill(Pid(pid), cint(0)) != 0
-    false
-  else:
-    false
-
 proc stopStartedProcess(pid: int) =
+  defer: forgetChildExit(pid)
   when defined(posix):
     discard posix.kill(Pid(pid), SIGTERM)
     let deadline = epochTime() + 2.0
@@ -1250,14 +1388,6 @@ proc startQemuWithAllocatedPort*(b: QemuWindowsArmBackend, vmDir: string,
 # guard, the disk allocation and the free-space precondition are above; this
 # is the part that actually runs them, in order, under one deadline.
 # ---------------------------------------------------------------------------
-
-proc qemuProcessGone*(pid: int): bool =
-  ## True once the QEMU we started is no longer running. ``childProcessExited``
-  ## reaps a direct child, so a zombie is not mistaken for a live guest;
-  ## ``pidAlive`` covers a pid we did not fork.
-  if pid <= 0:
-    return true
-  childProcessExited(pid) or not pidAlive(pid)
 
 proc queryQemuMonitor*(monitorPath, command: string,
                        timeoutMs: int = 2000): string =
@@ -2145,6 +2275,79 @@ proc goldenBuildFailure*(buildDir, msg: string): ref VmHarnessError =
   newVmHarnessError($biQemuWindowsArm, lpProvisioning,
                     msg & goldenBuildDiagnostics(buildDir))
 
+const
+  QwaFailedBootDirName* = "failed-boots"
+    ## Where a failed PER-JOB boot's diagnostics are kept — Runner-Fleet-M3-
+    ## ARM-Wave MA8.
+    ##
+    ## A failed golden BUILD leaves its whole directory in place and says so.
+    ## A failed per-job boot cannot: the instance directory carries a qcow2
+    ## overlay and ``stopAndCleanup`` has always deleted it, which is right —
+    ## MA4's review measured ~3.5 create-fail-reap cycles an HOUR against the
+    ## broken argv, and retaining a disk image per cycle is how a CI host runs
+    ## out of space overnight. So the three SMALL files are copied out first
+    ## and the directory still goes.
+    ##
+    ## Before this, the failure message named ``<vmDir>/serial.log`` — a path
+    ## ``stopAndCleanup`` had just deleted. Naming a file that is not there is
+    ## worse than naming none.
+  QwaRetainedFailedBoots* = 10
+    ## How many failed per-job boots keep their diagnostics. Bounded on
+    ## purpose: an unbounded pile of small files under the state directory is
+    ## the same class of residue MA7 had to write a reaper for.
+
+proc retainFailedBootDiagnostics*(stateDir, instanceName, vmDir: string):
+                                  string =
+  ## Copy a doomed instance's diagnostics somewhere that outlives it, and
+  ## return the directory. Returns "" when there was nothing to keep or the
+  ## state directory would not take it — a diagnostics failure must never
+  ## replace the failure being diagnosed.
+  if stateDir.len == 0 or vmDir.len == 0:
+    return ""
+  try:
+    let root = stateDir / QwaFailedBootDirName
+    let dest = root / instanceName
+    createDir(dest)
+    var kept = 0
+    for name in [QwaSerialLogName, "qemu.log", QwaGoldenScreenshotName]:
+      if fileExists(vmDir / name):
+        copyFile(vmDir / name, dest / name)
+        inc kept
+    if kept == 0:
+      try: removeDir(dest)
+      except CatchableError: discard
+      return ""
+    # Keep the newest QwaRetainedFailedBoots and no more.
+    var existing: seq[string] = @[]
+    for kind, path in walkDir(root):
+      if kind == pcDir:
+        existing.add(path)
+    if existing.len > QwaRetainedFailedBoots:
+      # The instance name embeds the creation epoch in milliseconds
+      # (``ephemeralName``), so lexicographic order is chronological order.
+      existing.sort()
+      for i in 0 ..< existing.len - QwaRetainedFailedBoots:
+        try: removeDir(existing[i])
+        except CatchableError: discard
+    dest
+  except CatchableError:
+    ""
+
+proc qwaPerJobDiagnostics*(diagDir: string): string =
+  ## The tail every failed per-job boot carries, shaped like
+  ## ``goldenBuildDiagnostics`` so an operator reads the same sentence on
+  ## both paths.
+  if diagDir.len == 0:
+    return " No diagnostics could be retained for this instance."
+  result = " Diagnostics retained in " & diagDir & ": " &
+    QwaSerialLogName & " (guest serial console) and qemu.log"
+  if fileExists(diagDir / QwaGoldenScreenshotName):
+    result.add(" and " & QwaGoldenScreenshotName &
+      " (guest framebuffer at the moment of failure — read this FIRST; a " &
+      "Windows guest is silent on the serial port once the firmware hands " &
+      "over, so the screen is the only thing that says where it stopped)")
+  result.add(". The instance directory itself was reaped; only these are kept.")
+
 proc buildWindowsArmGolden*(b: QemuWindowsArmBackend,
                             spec: GoldenBuildSpec): string =
   ## Drive an unattended Windows ARM64 install to a validated golden and
@@ -2407,6 +2610,12 @@ method revertToBaseline*(b: QemuWindowsArmBackend, baselineName: string): VmHand
   let qmpPath = qwaQmpSocketPath(vmDir)
 
   proc failStartup(reason: string) =
+    # Grab the framebuffer BEFORE the teardown, exactly as
+    # ``goldenBuildFailure`` does: once QEMU exits there is no screen to dump.
+    # Best effort on purpose — a guest whose QEMU has ALREADY gone (the MA8
+    # case) has no monitor to ask, and that is not a second failure.
+    discard captureGuestScreen(qwaMonitorSocketPath(vmDir), vmDir)
+    let diagDir = retainFailedBootDiagnostics(b.stateDir, name, vmDir)
     let vm = VmHandle(backend: b, name: name, baseline: baselineName,
                       ipAddress: some("127.0.0.1"), sshPort: port,
                       sshUser: b.sshUser,
@@ -2416,26 +2625,43 @@ method revertToBaseline*(b: QemuWindowsArmBackend, baselineName: string): VmHand
                               "swtpmPid": $swtpmPid}.toTable)
     b.stopAndCleanup(vm, deleteVm = true)
     raise (ref GuestBootFailureError)(
-      msg: "QemuWindowsArmBackend: " & reason,
+      msg: "QemuWindowsArmBackend: " & reason & qwaPerJobDiagnostics(diagDir),
       backend: $b.id, phase: lpStartup)
 
   # The first boot of an instance is allowed its ONE mandatory reboot and no
-  # more; see buildQemuWindowsArmArgs.
+  # more; see buildQemuWindowsArmArgs. The QEMU pid is passed because the wait
+  # must be able to tell "sshd is not up yet" from "there is no guest" — see
+  # waitForFirstBootSshReady and Runner-Fleet-M3-ARM-Wave MA8.
   let firstBoot = b.waitForFirstBootSshReady(port, b.sshReadyTimeoutSec,
-                                             serialPath)
+                                             serialPath, qemuPid = pid)
   case firstBoot.outcome
+  of fbQemuExited:
+    # NAME THE PROCESS, NOT THE SYMPTOM. Everything below this line used to be
+    # reported as "SSH did not become ready ... within 300s", five minutes
+    # after the fact, and every diagnosis then started at "why is sshd not
+    # answering" when the answer was "there is no guest".
+    failStartup("the guest's QEMU process (pid " & $pid & ") EXITED after " &
+      $int(firstBoot.elapsedSec) & "s, before SSH became ready on " &
+      "127.0.0.1:" & $port & " — " & describeChildExit(firstBoot.qemuExit) &
+      ". This is not an SSH problem: there is no guest. The firmware had " &
+      "started " & $firstBoot.firmwareBoots & " time(s). A QEMU that exits " &
+      "on its own during the first boot usually means the guest asked for a " &
+      "reboot the argv forbade (see buildQemuWindowsArmArgs and " &
+      "QwaFirstBootRebootAction) or that QEMU itself failed to start the " &
+      "machine.")
   of fbRebootLoop:
     failStartup("the guest's firmware started " & $firstBoot.firmwareBoots &
       " times without SSH becoming ready on 127.0.0.1:" & $port &
       " (allowance " & $QwaFirstBootMaxFirmwareBoots & ", reached after " &
       $int(firstBoot.elapsedSec) & "s). A generalized golden reboots EXACTLY " &
       "ONCE, between its specialize and oobeSystem passes; more than that is " &
-      "a boot loop, not a slow boot. Guest serial console: " & serialPath)
+      "a boot loop, not a slow boot.")
   of fbSshTimedOut:
     failStartup("SSH did not become ready on 127.0.0.1:" & $port &
-      " within " & $b.sshReadyTimeoutSec & "s (the guest's firmware started " &
+      " within " & $b.sshReadyTimeoutSec & "s. The guest's QEMU (pid " & $pid &
+      ") is STILL RUNNING and its firmware started " &
       $firstBoot.firmwareBoots & " time(s); a healthy first boot of a " &
-      "generalized golden shows two). Guest serial console: " & serialPath)
+      "generalized golden shows two.")
   of fbSshReady:
     discard
 

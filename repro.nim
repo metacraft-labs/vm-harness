@@ -90,6 +90,14 @@ const posixTestSpecs: seq[VmHarnessTestSpec] = @[
   # scripts/run-host-tests.sh.
   VmHarnessTestSpec(source: "tests/unit/t_qemu_windows_arm_golden_build.nim",
     binary: "t_qemu_windows_arm_golden_build"),
+  # Runner-Fleet-M3-ARM-Wave MA8 gate:
+  # t_qemu_windows_arm_dead_guest_is_named, unit tier. POSIX-only for the same
+  # reasons as the gate above, plus waitpid: the whole point is reading a
+  # child's exit status. The host tier lives in tests/e2e/ and is run by
+  # scripts/run-host-tests.sh.
+  VmHarnessTestSpec(
+    source: "tests/unit/t_qemu_windows_arm_dead_guest_is_named.nim",
+    binary: "t_qemu_windows_arm_dead_guest_is_named"),
   # Runner-Fleet-M3-ARM-Wave MA7 (hygiene half) gate:
   # t_m3_tart_orphan_dirs_reclaimed. POSIX-only: it stands its fake `tart` up
   # as a shell script and redirects the process's real stdout fd to assert the

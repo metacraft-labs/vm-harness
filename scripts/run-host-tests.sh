@@ -49,6 +49,14 @@ run_nim r --hints:off tests/e2e/t_qemu_windows_arm_golden_build_host.nim
 # making every per-job instance die 38s in. Skips loudly, naming the golden
 # path it looked at, when there is none.
 run_nim r --hints:off tests/e2e/t_qemu_windows_arm_per_job_boot_host.nim
+# Runner-Fleet-M3-ARM-Wave MA8 gate: t_qemu_windows_arm_dead_guest_is_named,
+# HOST TIER. Boots the same existing golden with the KNOWN REPRODUCER on the
+# argv -- the pre-MA4 vector, reconstructed from the shipped one, which makes a
+# generalized golden's QEMU exit rc=0 ~38s in -- and requires the harness to
+# report a dead PROCESS in seconds. The same reproducer took 5m38s and blamed
+# SSH before MA8. ~1 minute, no opt-in flag; skips loudly when there is no
+# golden.
+run_nim r --hints:off tests/e2e/t_qemu_windows_arm_dead_guest_is_named_host.nim
 run_nim r --hints:off tests/integration/t_utm_lifecycle.nim
 run_nim r --hints:off tests/e2e/t_vm_harness_utm_windows_arm_smoke.nim
 run_nim r --hints:off tests/e2e/t_vm_harness_utm_windows_dism_works_under_prism.nim

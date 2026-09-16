@@ -30,6 +30,7 @@ the checked-in answer files.
 | A golden actually built on m3 | ✓ | 2026-09-15, `win-arm-runner-20260915T154742Z`: 35.1 min wall clock, 13.81 GiB, passes `requireWindowsArmGolden`. NOT promoted. |
 | The golden boots and runs a command | ✓ | Verified in review 2026-09-15: SSH in 48–67 s, two independent overlays, DISTINCT machine SIDs — and since the reboot fix, through the per-job path itself (row below). |
 | A per-job instance created from the golden | ✓ | **FIXED 2026-09-15.** `buildQemuWindowsArmArgs` used to pass `-no-reboot`, so a generalized image's mandatory reboot ended QEMU ~38 s in and `revertToBaseline` always failed. It now starts the guest with `-action reboot=reset` plus a QMP socket, and `revertToBaseline` puts the one-shot semantics back with `set-action reboot=shutdown` the moment SSH is first reached. Measured end to end through `provisionBaseline` → `revertToBaseline`: SSH at **47 s and 53 s**, two firmware boots each, distinct machine SIDs, real commands answered. See "Closed: the per-job boot could not boot a generalized golden". |
+| A dead per-job guest is reported as one | ✓ | **FIXED 2026-09-16 (MA8).** The run path had no liveness check on the QEMU process, so a guest that exited at 38 s was polled to the 300 s SSH deadline and then blamed on sshd. `waitForFirstBootSshReady` now takes the pid; measured on the same reproducer, **34 s** and the message names the process and its exit status. See "Closed by MA8: the run path now knows when there is no guest". |
 | Rebuild safety guard (never build in place) | ✓ | `prepareGoldenBuildDir`. |
 | Overlay backing-path symlink resolution | ✓ | Prerequisite for a safe flip; landed early with the guard. |
 | Golden disk allocation | ✓ | `createGoldenDisk`. |
@@ -220,6 +221,8 @@ equivalent check.
 | Full install → sysprep → golden | host e2e, opt-in | macOS ARM host with the ISO |
 | Two clones of the golden have distinct machine SIDs | host e2e, opt-in | macOS ARM host with a golden |
 | **The per-job path boots a real golden, reaches SSH and runs a command** (`t_qemu_windows_arm_per_job_boot`) | host e2e | macOS ARM host with a golden; ~2 min |
+| A per-job boot whose QEMU exits is reported as a dead **process**, with its exit status, in seconds rather than at the SSH deadline (`t_qemu_windows_arm_dead_guest_is_named`) | unit (fake QEMU with a death clock) | anywhere |
+| **The same, on the real reproducer**: the pre-MA4 vector against a real golden fails in ~34 s of a 300 s deadline (`t_qemu_windows_arm_dead_guest_is_named`, host) | host e2e | macOS ARM host with a golden; ~2 min |
 
 The unit layer must not claim coverage of the e2e layer. Following this
 repo's existing convention, a missing ISO or a non-macOS host **skips with an
@@ -643,11 +646,68 @@ it was protecting had never booted a generalized golden. Two things changed:
   change to `buildQemuWindowsArmArgs`, `waitForFirstBootSshReady` or
   `revertToBaseline`.
 
-**Still open, and filed as MA8.** The run path has no liveness check:
-`waitForSshReady` never consults the QEMU pid, so a guest that dies for any
-*other* reason is still polled until the SSH deadline and then reported as an
-SSH failure. Allowing the reboot removes the one cause that was making that
-happen on every instance; it does not add the watchdog.
+### Closed by MA8: the run path now knows when there is no guest
+
+The run path used to have **no liveness check on the QEMU process at all**.
+`waitForFirstBootSshReady` polled SSH and counted firmware banners and never
+consulted the pid it had just been handed, so a QEMU that exited kept a port
+nobody was listening on being polled until the whole `sshReadyTimeoutSec` ran
+out. Measured twice on m3, both times against a real golden:
+
+| When | What happened | What the harness said, and after how long |
+|---|---|---|
+| 2026-09-15 | `-no-reboot` on the per-job argv; QEMU exits rc=0 at **38 s** | `SSH did not become ready … within 300s`, at **301 s** |
+| 2026-09-16 | the same reproducer, restored by MA4's review to falsify its host gate | the gate failed correctly, but took **5 m 38 s** and still *led* with SSH |
+| 2026-09-16, after MA8 | the same reproducer, `t_qemu_windows_arm_dead_guest_is_named` host tier | `fbQemuExited` after **34 s**, `exit status 0`, 1 firmware boot |
+
+The asymmetry was the tell. The *install* path grew exactly this capability
+(`qemuProcessGone`, consulted by `answerInstallMediaKeyPrompt` and the freeze
+watchdog); the *run* path simply never called it. So `waitForFirstBootSshReady`
+now takes the pid and has **three independent bounds**, none of which
+substitutes for another:
+
+- **the process is gone** — checked every poll, answers in seconds. Checked
+  *after* the readiness probe, so a guest that answers and dies in the same
+  instant is still reported ready: the check is "the process we started is
+  gone", never "SSH is slow", and so it cannot turn a working boot into a
+  failing one.
+- **the firmware-boot allowance** — a guest that restarts *forever*. Not a
+  substitute for the first: a process that **exits** leaves the banner count
+  **frozen**, not growing, so this bound never trips on a dead QEMU.
+- **the deadline** — the residual case, a live guest that simply never
+  reaches sshd. The only one for which waiting it out is the right answer.
+
+`qemuProcessGone` reaps the child (`childExitInfo`) rather than probing with
+`kill(pid, 0)`, which matters here: nothing waits on the per-job QEMU until
+teardown, so a QEMU that exits mid-boot sits as a **zombie** and a naive
+liveness probe reports the dead guest alive. The reap also keeps the exit
+status — `waitpid` may only succeed once per child, and the message needs what
+it said — so the failure reads *"the guest's QEMU process (pid N) EXITED after
+34s … exit status 0. This is not an SSH problem: there is no guest."*
+
+**The diagnostics it names now exist.** The old message pointed at
+`<vmDir>/serial.log`, a path `stopAndCleanup` had just deleted. A failed
+per-job boot cannot keep its whole directory the way a failed *build* does —
+that directory holds a qcow2 overlay, and MA4 measured ~3.5 create→fail→reap
+cycles an hour against the broken argv — so `serial.log`, `qemu.log` and the
+`screendump` are copied to `<state dir>/failed-boots/<instance>/` before the
+instance is reaped, newest `QwaRetainedFailedBoots` kept. `captureGuestScreen`,
+MA4's single highest-value diagnostic, is fired on the per-job failure path
+too; a guest whose QEMU has *already* gone has no framebuffer to dump, and
+that is not a second failure.
+
+Gates: `tests/unit/t_qemu_windows_arm_dead_guest_is_named.nim` (unit, shares
+MA3/MA4's fake QEMU via `tests/unit/qwa_fake_qemu.nim`) and
+`tests/e2e/t_qemu_windows_arm_dead_guest_is_named_host.nim` (host, rebuilds
+the pre-MA4 vector *from the shipped one* so the reproducer stays honest and
+production code stays untouched).
+
+**Still open elsewhere.** The `tart` backends have the same shape:
+`revertToBaseline` records the `tart run` child's pid in `ephemeralPids` and
+then calls `waitForSshReady(ip, sshReadyTimeoutSec)`, which never looks at it.
+It is not fixed here because the fix is not the same size — `tart run` is
+deliberately never reaped, so it needs its own exit-status plumbing, and that
+is the live macOS lane.
 
 
 ### Two traps the runs left behind, and what now stops them
